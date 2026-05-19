@@ -1,56 +1,44 @@
-# Neuruh Workers
+# Neuruh Workers 1-3
 
-Python CLI workers for Notion-backed IP registry operations.
+Notion API automation scripts for the Neuruh IP Registry.
 
 ## Workers
 
-- **Worker 1 — IP Logger** (`worker_1_ip_logger.py`): Files new IP assets to the Neuruh IP Registry with auto-generated Asset IDs.
-- **Worker 2 — Build Status Updater** (`worker_2_build_status.py`): Flips Build State on an IP Registry entry by Asset ID.
-- **Worker 3 — Context Loader** (`worker_3_context_loader.py`): Queries active (In Progress / Blocked / Needs Review) IP and writes a session brief to `~/neuruh/session-context.md`.
+- **Worker 1 — IP Logger** (`worker_1_ip_logger.py`): Upsert assets into IP Registry
+- **Worker 2 — Build Status** (`worker_2_build_status.py`): Update build status + append build log
+- **Worker 3 — Context Loader** (`worker_3_context_loader.py`): Load active session context at session start
 
 ## Setup
 
 ```bash
-git clone git@github.com:NeuruhAI/neuruh-workers.git ~/neuruh/workers
-cd ~/neuruh/workers
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env with your Notion integration token + database IDs
+# Edit .env with your Notion token
 ```
-
-## Get a Notion integration token
-
-1. https://www.notion.so/profile/integrations → + New integration
-2. Name it "Neuruh Workers", internal integration
-3. Copy the token into `.env` as `NOTION_API_KEY`
-4. Open each target database (IP Registry, Dev Log, Session Log) → ••• menu → Connections → add "Neuruh Workers"
 
 ## Usage
 
 ```bash
-# File a new IP asset
-python3 worker_1_ip_logger.py "My New Framework" AI FW "What it does in one sentence."
+# Get session context
+python worker_3_context_loader.py
 
-# Update build state
-python3 worker_2_build_status.py AI-FW-017 "In Progress"
+# Log new IP
+python worker_1_ip_logger.py --asset-id AI-CB-010 --title "New Framework" --vertical "AI Platform Core" --status "In Progress"
 
-# Load session context
-python3 worker_3_context_loader.py
-cat ~/neuruh/session-context.md
+# Update build status
+python worker_2_build_status.py --asset-id AI-CB-010 --status "Built" --log "Phase 1 complete"
 ```
 
-## Shell alias
+## Integration with AXON
 
-Add to your `~/.zshrc`:
+See `axon_integration.ts` for registering workers as AXON Phase 2 tools.
 
-```bash
-alias ctx='cd ~/neuruh/workers && source .venv/bin/activate && python3 worker_3_context_loader.py && cat ~/neuruh/session-context.md'
-```
+## IP Registry DB ID
 
-Now `ctx` loads your session context from any terminal.
+`3c48ca3132574937a3f3d729a93eb578`
 
-## License
+---
 
-MIT
+*Neuruh LLC — Sovereign AI Execution Infrastructure*
