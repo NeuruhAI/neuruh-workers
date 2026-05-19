@@ -30,7 +30,7 @@ def find_by_asset_id(asset_id):
 
 def create_entry(asset_id, title, vertical, status, github="", notes=""):
     props = {
-        "Name": {"title":[{"text":{"content":title}}]},
+        "IP Title": {"title":[{"text":{"content":title}}]},
         "Asset ID": {"rich_text":[{"text":{"content":asset_id}}]},
         "Status": {"select":{"name":status}},
     }
@@ -45,7 +45,7 @@ def create_entry(asset_id, title, vertical, status, github="", notes=""):
 
 def update_entry(page_id, updates):
     props = {}
-    if "title" in updates: props["Name"] = {"title":[{"text":{"content":updates["title"]}}]}
+    if "title" in updates: props["IP Title"] = {"title":[{"text":{"content":updates["title"]}}]}
     if "status" in updates: props["Status"] = {"select":{"name":updates["status"]}}
     if "vertical" in updates: props["Vertical"] = {"select":{"name":updates["vertical"]}}
     if "github" in updates: props["GitHub Repo"] = {"url":updates["github"]}
