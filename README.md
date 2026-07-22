@@ -31,6 +31,14 @@ python worker_1_ip_logger.py --asset-id AI-CB-010 --title "New Framework" --vert
 python worker_2_build_status.py --asset-id AI-CB-010 --status "Built" --log "Phase 1 complete"
 ```
 
+## Autonomous Workflows v1
+
+The `neuruh_workers` package adds governed multi-step workflows: declarative
+definitions, a hash-chained append-only receipt ledger, deterministic job IDs,
+idempotent steps, retry/backoff, timeouts, pause/resume, human approval gates,
+dry-run, and six read-only sample workflows. External actions are structurally
+disabled. See `WORKFLOWS.md`.
+
 ## Integration with AXON
 
 See `axon_integration.ts` for registering workers as AXON Phase 2 tools.
