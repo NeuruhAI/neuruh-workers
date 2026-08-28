@@ -1,0 +1,29 @@
+{
+  "fixture_kind": "sentinel-court-outcome",
+  "reconstruction": "Operator states Sentinel independently closed T07 after T07_RECEIPT.txt was written. SENTINEL_CLOSURE=PENDING in that receipt is NOT a PASS. Switchboard must not treat PRIME_VERDICT=PASS as court.passed. This file is the injected court.passed fixture keyed to that receipt.",
+  "mission_id": "NEURUH_GROK_SOVEREIGN_BINDING_V4",
+  "stage_id": "T07_LOCAL_GROK_OBSERVER_BIND",
+  "task_id": "T07_LOCAL_GROK_OBSERVER_BIND",
+  "repo": "NeuruhAI/neuruh-axon",
+  "source_head": "7461eb835b3f979a8243f9f70da634a4e5ab62fc",
+  "verdict": "PASS",
+  "summary": {
+    "pass_count": 35,
+    "fail_count": 0,
+    "local_observer_bind": "PROVEN",
+    "remote_grok_bind": "NOT_PROVEN",
+    "bind": "127.0.0.1:18321",
+    "pid": 6670,
+    "observer_tools": ["file_read", "web_fetch", "bonsai_inference"],
+    "mutations": "denied"
+  },
+  "secret_pointer": "/Users/jeramiehicks/.neuruh-receipts/grok-sovereign-v4/T07_OBSERVER_COURT.secret",
+  "honey_pot_expected": {
+    "repo": "NeuruhAI/neuruh-axon",
+    "branch": "feat/grok-sovereign-mcp-v4-20260827",
+    "head": "7461eb835b3f979a8243f9f70da634a4e5ab62fc",
+    "pr_number": "4",
+    "pr_url": "https://github.com/NeuruhAI/neuruh-axon/pull/4",
+    "pr_draft": "YES"
+  }
+}

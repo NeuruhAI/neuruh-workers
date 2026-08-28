@@ -28,6 +28,8 @@ from .events import (
 )
 from .ledger import Clock, ExecutionLedger, utc_clock
 from .prime_receipts import (
+    contains_secret_shape,
+    looks_like_path,
     parse_prime_receipt,
     redact_secrets,
     validate_prime_receipt,
@@ -56,6 +58,9 @@ CONSUMER_HANDLER_VERSION = "switchboard-first-seam-v1"
 T07_MISSION = "NEURUH_GROK_SOVEREIGN_BINDING_V4"
 T07_STAGE = "T07_LOCAL_GROK_OBSERVER_BIND"
 T07_HEAD = "7461eb835b3f979a8243f9f70da634a4e5ab62fc"
+T07_AXON_PR = "4"
+T07_AXON_PR_URL = "https://github.com/NeuruhAI/neuruh-axon/pull/4"
+T07_AXON_BRANCH = "feat/grok-sovereign-mcp-v4-20260827"
 
 DEFAULT_MISSIONS = frozenset({T07_MISSION})
 
@@ -247,6 +252,7 @@ class Switchboard:
         source_repo: str,
         receipt_ref: str,
         verdict_note: str = "",
+        extra_payload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Ingest Sentinel's independent verdict.  Switchboard does not PASS."""
         event_type = EventType.COURT_PASSED if passed else EventType.COURT_FAILED
@@ -258,6 +264,8 @@ class Switchboard:
             "note": verdict_note or (
                 "independent Sentinel verdict ingested; Switchboard did not judge"),
         }
+        if extra_payload:
+            payload.update(dict(extra_payload))
         envelope = self._emit(
             event_type,
             mission_id=mission_id,
@@ -275,6 +283,79 @@ class Switchboard:
         )
         self._save_cursor()
         return envelope
+
+    def ingest_court_fixture(self, path: str) -> dict[str, Any]:
+        """Inject an independent Sentinel verdict.  Never opens SECRET_POINTER."""
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        pointer = data.get("secret_pointer")
+        if pointer is not None:
+            if not isinstance(pointer, str) or not looks_like_path(pointer):
+                raise SwitchboardError(
+                    "secret_pointer must be a path string only")
+            # Path only.  Do not stat, open, log, or copy the secret file.
+        dumped = json.dumps(data)
+        scanned = dumped.replace(pointer, "") if isinstance(pointer, str) else dumped
+        if contains_secret_shape(scanned):
+            raise SwitchboardError(
+                "court fixture must not carry secret file contents")
+        if data.get("verdict") not in {"PASS", "FAIL"}:
+            raise SwitchboardError("court fixture verdict must be PASS or FAIL")
+        mission_id = str(data.get("mission_id", ""))
+        stage_id = str(data.get("stage_id", ""))
+        source_head = str(data.get("source_head", "")).lower()
+        sealed = None
+        for envelope in self.events(EventType.RECEIPT_SEALED):
+            if (envelope.get("mission_id") == mission_id
+                    and envelope.get("plan_id") == stage_id
+                    and envelope.get("source_head") == source_head):
+                sealed = envelope
+        if sealed is None:
+            raise SwitchboardError(
+                "court fixture has no matching sealed receipt on the chain")
+        court_events = [
+            e for e in self.events(EventType.COURT_REQUESTED)
+            if e.get("correlation_id") == sealed["correlation_id"]
+        ]
+        if not court_events:
+            raise SwitchboardError(
+                "court fixture requires a prior court.requested job artifact")
+        court = court_events[-1]
+        summary = data.get("summary") or {}
+        expected = data.get("honey_pot_expected") or {}
+        return self.record_court_outcome(
+            passed=data["verdict"] == "PASS",
+            court_job_id=court["payload_ref_or_payload"]["court_job_id"],
+            mission_id=sealed["mission_id"],
+            plan_id=sealed["plan_id"],
+            task_id=sealed["task_id"],
+            correlation_id=sealed["correlation_id"],
+            causation_id=court["event_id"],
+            source_head=sealed["source_head"],
+            authority_ref=sealed["authority_ref"],
+            source_repo=str(data.get("repo") or sealed["source_repo"]),
+            receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
+            verdict_note=(
+                "independent Sentinel close injected from court fixture; "
+                "Switchboard did not judge; SENTINEL_CLOSURE in the PRIME "
+                "receipt was not treated as PASS"
+            ),
+        extra_payload={
+                "summary": {
+                    "pass_count": summary.get("pass_count"),
+                    "fail_count": summary.get("fail_count"),
+                    "local_observer_bind": summary.get("local_observer_bind"),
+                    "remote_grok_bind": summary.get("remote_grok_bind"),
+                    "bind": summary.get("bind"),
+                    "pid": summary.get("pid"),
+                    "observer_tools": summary.get("observer_tools"),
+                    "mutations": summary.get("mutations"),
+                },
+                "secret_pointer": pointer,
+                "honey_pot_expected": expected,
+                "secret_file_ingested": False,
+            },
+        )
 
     def ingest_raw(self, record: Mapping[str, Any]) -> dict[str, Any]:
         """Ingest a caller-supplied envelope.  Invalid schema is deadlettered."""
@@ -321,7 +402,9 @@ class Switchboard:
         names = sorted(
             n for n in os.listdir(self.receipts_dir)
             if os.path.isfile(os.path.join(self.receipts_dir, n))
+            and n.endswith(".txt")
             and not n.startswith(".")
+            and not n.endswith(".secret")
         )
         observed = self._cursor.setdefault("observed", {})
         for name in names:
@@ -340,14 +423,13 @@ class Switchboard:
                     },
                     reason=DeadletterReason.BROKEN_HASH,
                     detail="receipt file changed after observation",
-                    mission_id=receipt.get("MISSION") or "UNKNOWN",
-                    plan_id=receipt.get("STAGE") or "UNKNOWN",
-                    task_id=receipt.get("TASK_ID") or name,
+                    mission_id=receipt.mission or "UNKNOWN",
+                    plan_id=receipt.stage or "UNKNOWN",
+                    task_id=receipt.task_id or name,
                     correlation_id=prior.get("correlation_id", "UNKNOWN"),
                     causation_id="",
-                    source_head=receipt.get("HEAD") if _looks_head(
-                        receipt.get("HEAD")) else "0" * 40,
-                    authority_ref=receipt.get("AUTHORITY_REF") or "deadletter",
+                    source_head=receipt.head if _looks_head(receipt.head) else "0" * 40,
+                    authority_ref=receipt.authority_ref or "deadletter",
                 )
                 report.deadlettered.append(name)
                 continue
@@ -355,10 +437,10 @@ class Switchboard:
             self._admit_receipt(receipt, name, report)
 
     def _admit_receipt(self, receipt, name: str, report: TickReport) -> None:
-        mission = receipt.get("MISSION") or "UNKNOWN"
-        stage = receipt.get("STAGE") or "UNKNOWN"
-        task_id = receipt.get("TASK_ID") or stage
-        head = receipt.get("HEAD").lower() if _looks_head(receipt.get("HEAD")) else "0" * 40
+        mission = receipt.mission or "UNKNOWN"
+        stage = receipt.stage or "UNKNOWN"
+        task_id = receipt.task_id or stage
+        head = receipt.head if _looks_head(receipt.head) else "0" * 40
         correlation_id = "corr-" + content_sha(
             {"mission": mission, "stage": stage, "head": head})[:24]
         created = self._emit(
@@ -368,15 +450,17 @@ class Switchboard:
             task_id=task_id,
             correlation_id=correlation_id,
             causation_id="",
-            source_role=receipt.get("SOURCE_ROLE") or SOURCE_ROLE,
+            source_role="PRIME" if "PRIME" in receipt.source_role.upper() else SOURCE_ROLE,
             source_component=receipt.get("SOURCE_COMPONENT") or "prime-receipt",
-            source_repo=receipt.get("REPO") or SOURCE_REPO,
+            source_repo=receipt.repo or SOURCE_REPO,
             source_head=head,
-            authority_ref=receipt.get("AUTHORITY_REF") or "unsigned",
+            authority_ref=receipt.authority_ref or "unsigned",
             payload={
                 "receipt_ref": receipt.path,
                 "receipt_sha": receipt.content_sha,
-                "reconstruction": receipt.get("RECONSTRUCTION", ""),
+                "sentinel_closure_in_receipt": receipt.get("SENTINEL_CLOSURE"),
+                "prime_verdict_in_receipt": receipt.get("PRIME_VERDICT"),
+                "clipboard_defect": receipt.clipboard_defect,
             },
             idempotency_key=f"receipt.created|{receipt.content_sha}",
         )
@@ -398,7 +482,7 @@ class Switchboard:
                 source_component=SOURCE_COMPONENT,
                 source_repo=SOURCE_REPO,
                 source_head=head,
-                authority_ref=receipt.get("AUTHORITY_REF") or "unsigned",
+                authority_ref=receipt.authority_ref or "unsigned",
                 payload={
                     "receipt_ref": receipt.path,
                     "receipt_sha": receipt.content_sha,
@@ -424,7 +508,7 @@ class Switchboard:
                 correlation_id=correlation_id,
                 causation_id=rejected["event_id"],
                 source_head=head,
-                authority_ref=receipt.get("AUTHORITY_REF") or "deadletter",
+                authority_ref=receipt.authority_ref or "deadletter",
             )
             report.deadlettered.append(name)
             return
@@ -437,29 +521,34 @@ class Switchboard:
             causation_id=created["event_id"],
             source_role="PRIME",
             source_component=receipt.get("SOURCE_COMPONENT") or "prime-builder",
-            source_repo=receipt.get("REPO") or SOURCE_REPO,
+            source_repo=receipt.repo or SOURCE_REPO,
             source_head=head,
-            authority_ref=receipt.get("AUTHORITY_REF"),
+            authority_ref=receipt.authority_ref,
             payload={
                 "receipt_ref": receipt.path,
                 "receipt_sha": receipt.content_sha,
                 "mission": mission,
                 "stage": stage,
-                "claimer": receipt.get("CLAIMANT") or "PRIME",
-                "repo": receipt.get("REPO"),
-                "worktree": receipt.get("WORKTREE"),
-                "branch": receipt.get("BRANCH"),
+                "claimer": receipt.claimer or "PRIME",
+                "repo": receipt.repo,
+                "worktree": receipt.worktree,
+                "branch": receipt.branch,
                 "head": head,
-                "remote": receipt.get("REMOTE"),
-                "expected_pr": receipt.get("EXPECTED_GIT_OUTCOME_PR"),
-                "bind": receipt.get("BIND"),
+                "remote": receipt.remote,
+                "expected_pr": receipt.expected_pr,
+                "expected_pr_url": receipt.expected_pr_url,
+                "expected_pr_draft": receipt.expected_pr_draft,
+                "bind": receipt.bind,
+                "sentinel_closure_in_receipt": receipt.get("SENTINEL_CLOSURE"),
+                "clipboard_defect": receipt.clipboard_defect,
                 "required_invariants": [
                     "envelope.valid",
-                    "hash.matches",
+                    "hash.matches_if_provided",
                     "source_identity.coherent",
                     "mission_stage.unambiguous",
                     "authority.present",
                     "loopback_only",
+                    "sentinel_closure_in_receipt_is_not_pass",
                 ],
             },
             idempotency_key=f"receipt.sealed|{receipt.content_sha}",
@@ -654,18 +743,21 @@ class Switchboard:
             raise SwitchboardError("missing sealed receipt")
         src = sealed["payload_ref_or_payload"]
         court = envelope["payload_ref_or_payload"]
+        expected = court.get("honey_pot_expected") or {}
         params = {
             "mission_id": envelope["mission_id"],
             "task_id": envelope["task_id"],
-            "repo": src.get("repo", ""),
+            "repo": expected.get("repo") or src.get("repo", ""),
             "worktree": src.get("worktree", ""),
-            "branch": src.get("branch", ""),
-            "head": src.get("head", envelope["source_head"]),
+            "branch": expected.get("branch") or src.get("branch", ""),
+            "head": expected.get("head") or src.get("head", envelope["source_head"]),
             "remote": src.get("remote", "origin"),
             "court_receipt": court.get("court_job_id", envelope["causation_id"]),
             "authority_ref": envelope["authority_ref"],
             "idempotency_key": f"candidate.push.requested|{src.get('receipt_sha')}",
-            "expected_pr": src.get("expected_pr") or None,
+            "expected_pr": expected.get("pr_number") or src.get("expected_pr") or None,
+            "expected_pr_url": expected.get("pr_url") or src.get("expected_pr_url") or None,
+            "expected_pr_draft": expected.get("pr_draft") or src.get("expected_pr_draft") or None,
         }
         if params["expected_pr"] == "":
             params["expected_pr"] = None

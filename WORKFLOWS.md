@@ -96,6 +96,12 @@ Git Custodian `candidate.push.requested` artifact.  No git push.  Sentinel
 model execution is `BLOCKED`.  `OrganRegistrationSeam.activate()` still
 refuses.  Loopback/file observation only.
 
+The live T07 pair is checked in at `tests/fixtures/t07/`: `T07_RECEIPT.txt`
+(operator receipt, including the clipboard defect `EVENT_IMPLEMENTATION_STATUS=NOT_PROVEN`)
+and `T07_OBSERVER_COURT.json` (injected Sentinel PASS; `SECRET_POINTER` is a
+path only).  Honey Pot expected output is existing axon PR #4; this wrap does
+not mutate `neuruh-axon`.
+
 ```bash
 python3 scripts/run_switchboard.py tick --receipts <dir> --root .neuruh/switchboard
 ```

@@ -1,33 +1,38 @@
-# RECONSTRUCTION — not the live operator file.
-# Live path on the operator machine: ~/.neuruh-receipts/grok-sovereign-v4/T07_RECEIPT.txt
-# That file was not present in this workspace. Fields below are reconstructed from
-# MISSION / STAGE / HEAD plus the 2026-08-27 Autonomous Spine, Switchboard, and
-# Git Custodian canon (isolated MCP 127.0.0.1:18321, remote AXON head, PUSHED=NO).
-# Honey Pot expected-output fixture: existing GitHub PR #4 for the T07 git outcome.
-# This wrap must not perform additional git mutation.
-RECONSTRUCTION=YES
-SCHEMA=nrh.prime_receipt.v1
-MISSION=NEURUH_GROK_SOVEREIGN_BINDING_V4
-STAGE=T07_LOCAL_GROK_OBSERVER_BIND
-PLAN_ID=T07_LOCAL_GROK_OBSERVER_BIND
-TASK_ID=t07-local-grok-observer-bind
+MISSION_ID=NEURUH_GROK_SOVEREIGN_BINDING_V4
+TASK_ID=T07_LOCAL_GROK_OBSERVER_BIND
+PARENT_TASK_ID=T06_CAPABILITY_MEMBRANE_EXECUTION
+STAGE_ID=T07_LOCAL_GROK_OBSERVER_BIND
+OWNER_ROLE=ENG-00_NEURUH_PRIME
+TIMESTAMP=2026-08-27T22:26:00-04:00
+CLAIMER=NEURUH_PRIME
+EVENT_TARGET=receipt.sealed
+EVENT_IMPLEMENTATION_STATUS=NOT_PROVEN
+TRANSPORT=receipt_file + We_Vibin_COURT_REQUEST
+OBJECTIVE=Bind a LOCAL Grok-compatible MCP client to isolated AXON MCP without widening authority or network exposure.
 REPO=NeuruhAI/neuruh-axon
-WORKTREE=/opt/neuruh/worktrees/neuruh-axon-grok-v4
-BRANCH=feature/t07-local-grok-observer-bind
-HEAD=7461eb835b3f979a8243f9f70da634a4e5ab62fc
-REMOTE=origin
-REMOTE_HEAD=0b131308ebfdbd47d013ea2ff600a8e2f001f5f9
-SOURCE_ROLE=PRIME
-SOURCE_COMPONENT=prime-builder
-SEALED=YES
-AUTHORITY_REF=agc:r0:t07-local-observer-bind
-BIND=127.0.0.1:18321
-PROFILE=grok_observer
-TOOLS=file_read,web_fetch,bonsai_inference
-PUSHED=NO
-PR_CREATED=NO
+WORKTREE=/Users/jeramiehicks/neuruh-worktrees/grok-sovereign-mcp-v4-20260827/neuruh-axon
+BRANCH=feat/grok-sovereign-mcp-v4-20260827
+SOURCE_HEAD=7461eb835b3f979a8243f9f70da634a4e5ab62fc
+REMOTE=origin https://github.com/NeuruhAI/neuruh-axon.git
+REMOTE_HEAD_MAIN=0b131308ebfdbd47d013ea2ff600a8e2f001f5f9
+REMOTE_HEAD_FEATURE=7461eb835b3f979a8243f9f70da634a4e5ab62fc
+CAPABILITY_PROFILE=grok_observer
+NETWORK_POLICY=127.0.0.1:18321 only
+AUTHORITY_REFERENCE=FOUNDER_T07_GRANT + SENTINEL_T06_CLOSURE ALLOW_T07_LOCAL_GROK_OBSERVER_BIND + ALLOW_CANDIDATE_FEATURE_BRANCH_PUSH_AND_PR
+AUTHORITY_TIER=CANDIDATE
+LOCAL_COMMIT=YES CLASS=PROVEN
+FEATURE_BRANCH_PUSH=YES CLASS=PROVEN
+PR=YES CLASS=PROVEN NUMBER=4 URL=https://github.com/NeuruhAI/neuruh-axon/pull/4 DRAFT=YES
+DIRECT_MAIN_PUSH=NO
+FORCE_PUSH=NO
 MERGED=NO
+CANONICAL_PROMOTION=NO
 DEPLOYED=NO
-EXPECTED_GIT_OUTCOME_PR=4
-CLAIMANT=PRIME
-PAYLOAD_HASH=b7e0a923a78864c1db6ef3dc205418a8fbdea5a8c281b39693feb6d5e0b89755
+PUBLIC_EXPOSURE=NO CLASS=PROVEN
+CHECKS=35/35 PASS after rate-window reconnect
+PRIME_VERDICT=PASS
+SENTINEL_CLOSURE=PENDING
+NEXT_RECOMMENDED_STAGE=T08_REMOTE_GROK_BIND_DESIGN_ONLY
+NEXT_STATE=CANDIDATE
+PERMITTED=SENTINEL T07 court; CI observe; PR comment
+NOT_PERMITTED=merge, deploy, public bind, remote Grok-cloud, operator/privileged default, canonical restart

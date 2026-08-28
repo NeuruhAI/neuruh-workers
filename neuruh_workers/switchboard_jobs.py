@@ -63,6 +63,8 @@ def materialize_candidate_push(ctx: StepContext, params: Mapping[str, Any]) -> d
         "authority_ref": params["authority_ref"],
         "idempotency_key": params["idempotency_key"],
         "expected_pr": params.get("expected_pr"),
+        "expected_pr_url": params.get("expected_pr_url"),
+        "expected_pr_draft": params.get("expected_pr_draft"),
         "note": "job artifact only; no git mutation was performed",
     }
 

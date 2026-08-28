@@ -15,7 +15,10 @@ from neuruh_workers import (
 )
 from neuruh_workers.events import AckState, DeadletterReason, EventType, SCHEMA_VERSION
 from neuruh_workers.prime_receipts import seal_receipt_text
-from neuruh_workers.switchboard import T07_HEAD, T07_MISSION, T07_STAGE, _CrashSimulated
+from neuruh_workers.switchboard import (
+    T07_AXON_BRANCH, T07_AXON_PR, T07_AXON_PR_URL, T07_HEAD, T07_MISSION,
+    T07_STAGE, _CrashSimulated,
+)
 from neuruh_workers.switchboard_jobs import (
     GIT_PUSH, HONEY_POT_WORKFLOW, REMEDIATION_WORKFLOW, SENTINEL_MODEL_EXECUTION,
     SENTINEL_WORKFLOW, materialize_candidate_push, materialize_court_artifact,
@@ -24,6 +27,10 @@ from tests.helpers import fixed_clock, make_stack
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 T07_FIXTURE = os.path.join(REPO_ROOT, "tests", "fixtures", "t07", "T07_RECEIPT.txt")
+T07_COURT_FIXTURE = os.path.join(
+    REPO_ROOT, "tests", "fixtures", "t07", "T07_OBSERVER_COURT.json")
+T07_WORKTREE = (
+    "/Users/jeramiehicks/neuruh-worktrees/grok-sovereign-mcp-v4-20260827/neuruh-axon")
 SYNTHETIC_MISSION = "NEURUH_SWITCHAROO_SYNTHETIC_SEAM_V1"
 SYNTHETIC_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -107,6 +114,15 @@ class T07FirstSeamTests(unittest.TestCase):
         self.assertEqual(len(created), 1)
         self.assertEqual(len(sealed), 1)
         self.assertEqual(len(court), 1)
+        # Clipboard defect: receipt claims sealed but transport was human/file.
+        defect = sealed[0]["payload_ref_or_payload"]["clipboard_defect"]
+        self.assertEqual(defect["event_target"], "receipt.sealed")
+        self.assertEqual(defect["event_implementation_status"], "NOT_PROVEN")
+        self.assertIn("receipt_file", defect["transport"])
+        self.assertEqual(defect["sentinel_closure_in_receipt"], "PENDING")
+        # SENTINEL_CLOSURE=PENDING and PRIME_VERDICT=PASS are not a court PASS.
+        self.assertEqual(len(self.board.events(EventType.COURT_PASSED)), 0)
+        self.assertEqual(len(self.board.events(EventType.CANDIDATE_PUSH_REQUESTED)), 0)
         jobs = self.board.jobs_for(SENTINEL_WORKFLOW)
         self.assertEqual(len(jobs), 1)
         state = self.board.queue.load(jobs[0])
@@ -120,6 +136,7 @@ class T07FirstSeamTests(unittest.TestCase):
         self.assertEqual(payload["mission"], T07_MISSION)
         self.assertEqual(payload["stage"], T07_STAGE)
         self.assertEqual(payload["source_head"], T07_HEAD)
+        self.assertEqual(payload["claimer"], "NEURUH_PRIME")
         self.assertEqual(payload["court_job_id"], jobs[0])
         self.board.tick()
         self.assertEqual(len(self.board.events(EventType.COURT_REQUESTED)), 1)
@@ -127,8 +144,16 @@ class T07FirstSeamTests(unittest.TestCase):
 
     def test_sentinel_pass_materialises_exactly_one_honey_pot_no_git_push(self):
         self.board.tick()
-        _ingest_pass(self.board, passed=True)
+        self.board.ingest_court_fixture(T07_COURT_FIXTURE)
         report = self.board.tick()
+        passed = self.board.events(EventType.COURT_PASSED)
+        self.assertEqual(len(passed), 1)
+        self.assertEqual(passed[0]["payload_ref_or_payload"]["summary"]["pass_count"], 35)
+        self.assertEqual(passed[0]["payload_ref_or_payload"]["summary"]["fail_count"], 0)
+        self.assertFalse(passed[0]["payload_ref_or_payload"]["secret_file_ingested"])
+        pointer = passed[0]["payload_ref_or_payload"]["secret_pointer"]
+        self.assertTrue(pointer.endswith("T07_OBSERVER_COURT.secret"))
+        self.assertTrue(pointer.startswith("/") or pointer.startswith("~"))
         pushes = self.board.events(EventType.CANDIDATE_PUSH_REQUESTED)
         self.assertEqual(len(pushes), 1)
         jobs = self.board.jobs_for(HONEY_POT_WORKFLOW)
@@ -136,9 +161,13 @@ class T07FirstSeamTests(unittest.TestCase):
         self.assertIn(jobs[0], report.jobs_created)
         artifact = self.board.queue.load(jobs[0]).step_results["materialize"]
         self.assertEqual(artifact["git_push"], GIT_PUSH)
-        self.assertEqual(artifact["expected_pr"], "4")
+        self.assertEqual(artifact["expected_pr"], T07_AXON_PR)
+        self.assertEqual(artifact["expected_pr_url"], T07_AXON_PR_URL)
+        self.assertEqual(artifact["expected_pr_draft"], "YES")
         self.assertEqual(artifact["head"], T07_HEAD)
         self.assertEqual(artifact["repo"], "NeuruhAI/neuruh-axon")
+        self.assertEqual(artifact["branch"], T07_AXON_BRANCH)
+        self.assertEqual(artifact["worktree"], T07_WORKTREE)
         for key in ("mission_id", "task_id", "repo", "worktree", "branch", "head",
                     "remote", "court_receipt", "authority_ref", "idempotency_key"):
             self.assertIn(key, artifact)
@@ -150,7 +179,7 @@ class T07FirstSeamTests(unittest.TestCase):
 
     def test_chain_preserves_correlation_and_causation(self):
         self.board.tick()
-        _ingest_pass(self.board, passed=True)
+        self.board.ingest_court_fixture(T07_COURT_FIXTURE)
         self.board.tick()
         created = self.board.events(EventType.RECEIPT_CREATED)[0]
         sealed = self.board.events(EventType.RECEIPT_SEALED)[0]
@@ -344,15 +373,39 @@ class FailClosedTests(unittest.TestCase):
         self.assertIn("no network listener", str(caught.exception))
         self.assertEqual(board.bind_host, "127.0.0.1")
 
-    def test_t07_fixture_is_documented_reconstruction(self):
+    def test_t07_live_fixture_and_secret_pointer_is_path_only(self):
         with open(T07_FIXTURE, encoding="utf-8") as fh:
             text = fh.read()
-        self.assertIn("RECONSTRUCTION", text)
-        self.assertIn(T07_MISSION, text)
-        self.assertIn(T07_STAGE, text)
+        self.assertIn("MISSION_ID=NEURUH_GROK_SOVEREIGN_BINDING_V4", text)
+        self.assertIn("STAGE_ID=T07_LOCAL_GROK_OBSERVER_BIND", text)
         self.assertIn(T07_HEAD, text)
-        self.assertIn("EXPECTED_GIT_OUTCOME_PR=4", text)
-        self.assertIn("~/.neuruh-receipts/grok-sovereign-v4/T07_RECEIPT.txt", text)
+        self.assertIn("EVENT_TARGET=receipt.sealed", text)
+        self.assertIn("EVENT_IMPLEMENTATION_STATUS=NOT_PROVEN", text)
+        self.assertIn("SENTINEL_CLOSURE=PENDING", text)
+        self.assertIn("NUMBER=4", text)
+        self.assertIn(T07_AXON_PR_URL, text)
+        self.assertIn(T07_AXON_BRANCH, text)
+        self.assertNotIn("RECONSTRUCTION=YES", text)
+        with open(T07_COURT_FIXTURE, encoding="utf-8") as fh:
+            court = fh.read()
+        self.assertIn("secret_pointer", court)
+        self.assertIn("T07_OBSERVER_COURT.secret", court)
+        self.assertNotIn("secret_", court.replace("secret_pointer", ""))
+        board = _board(self)
+        shutil.copy(T07_FIXTURE, os.path.join(board.receipts_dir, "T07_RECEIPT.txt"))
+        shutil.copy(T07_COURT_FIXTURE, os.path.join(board.receipts_dir,
+                                                    "T07_OBSERVER_COURT.json"))
+        observed = board.tick().observed
+        self.assertEqual(observed, ["T07_RECEIPT.txt"])
+        self.assertEqual(board.tick().observed, [])
+        self.assertFalse(os.path.exists(
+            "/Users/jeramiehicks/.neuruh-receipts/grok-sovereign-v4/"
+            "T07_OBSERVER_COURT.secret"))
+        board.ingest_court_fixture(T07_COURT_FIXTURE)
+        with open(board.event_ledger._path) as fh:
+            ledger = fh.read()
+        self.assertNotIn("BEGIN ", ledger)
+        self.assertIn("secret_pointer", ledger)
 
 
 if __name__ == "__main__":
