@@ -87,6 +87,14 @@ class ReceiptType(str, Enum):
     EXTERNAL_ACTION_DENIED = "external.action_denied"
     SEAM_DECLARED = "seam.declared"
     SEAM_ACTIVATION_REFUSED = "seam.activation_refused"
+    # Switchboard V1 observation types. These are not workflow-job state
+    # transitions; they live on dedicated job ids (see switchboard.py).
+    # Named bus events receipt.sealed / candidate.push.ready remain
+    # TARGET_CONTRACT until a live bus exists — do not treat these as Ether.
+    PRIME_RECEIPT_SEALED = "prime.receipt_sealed"
+    SENTINEL_VERIFICATION_PASS = "sentinel.verification_pass"
+    SWITCHBOARD_JOB_CREATED = "switchboard.job_created"
+    SWITCHBOARD_JOB_ALREADY_EXISTED = "switchboard.job_already_existed"
 
 
 # --------------------------------------------------------------------------- #

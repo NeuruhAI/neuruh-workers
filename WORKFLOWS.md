@@ -49,6 +49,15 @@ WorkerRegistry (capability declarations: read_only / external)
 - **Mother/AXON seam** — `OrganRegistrationSeam` accepts typed declarations
   (loopback endpoint + exact 40-hex source SHA) and receipts them
   `PENDING_AUTHORIZATION`; activation refuses unconditionally in v1.
+- **Switchboard V1** — a loopback wrap of the same ledger + queue. It polls
+  the JSONL file with an idempotent cursor and, when a sealed Prime receipt
+  (`prime.receipt_sealed`, the V1 stand-in for the `receipt.sealed` target
+  contract) appears, enqueues a `sentinel-verify` job. A Sentinel PASS
+  (`sentinel.verification_pass`, or `job.succeeded` on that sentinel job)
+  enqueues a payload-only `git-custody` job. Switchboard writes its own
+  `switchboard.job_created` / `switchboard.job_already_existed` receipts.
+  It does not activate organ seams, does not stand up Ether, and does not
+  push git. See `neuruh_workers/switchboard.py` (`EVENT_IMPLEMENTATION_STATUS`).
 
 ## Sample read-only workflows
 
@@ -81,6 +90,8 @@ python3 -m unittest discover -s tests -t .
 python3 scripts/secret_scan.py
 ```
 
-Covers: unit (definitions/ledger/queue/runner), replay + idempotency,
-crash recovery, adversarial approvals, external-action lockout, seam
-refusal, and a secret scan of every tracked file.
+Covers: unit (definitions/ledger/queue/runner/switchboard), replay +
+idempotency, crash recovery, adversarial approvals, external-action lockout,
+seam refusal, Switchboard V1 (Prime sealed receipt → Sentinel job, no
+double-enqueue, unsealed ignore, replay cursor, path refusal), and a secret
+scan of every tracked file.

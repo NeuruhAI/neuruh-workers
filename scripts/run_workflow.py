@@ -25,7 +25,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neuruh_workers import ExecutionLedger, JobQueue, WorkflowRunner  # noqa: E402
+from neuruh_workers import ExecutionLedger, JobQueue, ReceiptType, WorkflowRunner  # noqa: E402
 from neuruh_workers.workflows import build_catalog, build_registry  # noqa: E402
 
 LEDGER_PATH = os.path.join(
@@ -94,7 +94,8 @@ def main() -> int:
         print(json.dumps(ledger.verify(), indent=2))
     elif args.command == "jobs":
         for job_id in queue.job_ids():
-            if job_id == "seam-registry":
+            receipts = ledger.receipts(job_id)
+            if not any(r.receipt_type == ReceiptType.JOB_ENQUEUED for r in receipts):
                 continue
             state = queue.load(job_id)
             print(f"{job_id}  {state.status.value:>20}  {state.workflow}")
