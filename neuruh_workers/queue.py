@@ -109,6 +109,17 @@ def replay_job(receipts) -> JobState:
             pass
         elif rt == ReceiptType.EXTERNAL_ACTION_DENIED:
             pass
+        elif rt in (ReceiptType.SEAM_DECLARED,
+                    ReceiptType.SEAM_ACTIVATION_REFUSED):
+            pass
+        elif rt in (ReceiptType.CANDIDATE_PUSH_REQUESTED,
+                    ReceiptType.CANDIDATE_BRANCH_PUSHED,
+                    ReceiptType.CANDIDATE_PR_OPENED,
+                    ReceiptType.CI_STARTED,
+                    ReceiptType.CI_PASSED,
+                    ReceiptType.CI_FAILED,
+                    ReceiptType.PROMOTION_READY):
+            pass
         elif rt == ReceiptType.JOB_SUCCEEDED:
             state.status = JobStatus.SUCCEEDED
         elif rt == ReceiptType.JOB_FAILED:
