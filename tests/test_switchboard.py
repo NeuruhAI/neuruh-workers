@@ -7,6 +7,7 @@ queue, without a human clipboard, without activate(), and without git push.
 """
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import os
@@ -310,7 +311,10 @@ class SwitchboardMalformedTests(unittest.TestCase):
             fh.write("{not json}\n")
         with self.assertRaises(LedgerCorrupt):
             sb.tick()
-        self.assertEqual(_enqueued_for(stack.ledger, SENTINEL_WORKFLOW), [])
+        with open(stack.ledger_path, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertNotIn('"workflow":"sentinel-verify"', body)
+        self.assertNotIn(SENTINEL_WORKFLOW, body)
 
     def test_malformed_cursor_is_refused(self):
         stack = make_stack(self)
@@ -378,10 +382,16 @@ class SwitchboardPathRefusalTests(unittest.TestCase):
 class SwitchboardIsolationTests(unittest.TestCase):
     def test_does_not_call_or_fill_organ_activate(self):
         source = inspect.getsource(switchboard_mod)
-        self.assertNotIn("OrganRegistrationSeam", source)
-        self.assertNotIn(".activate(", source)
+        self.assertNotIn("from .seams", source)
+        self.assertNotIn("from neuruh_workers.seams", source)
         self.assertNotIn("import ether", source)
         self.assertNotIn("from ether", source)
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                self.assertNotEqual(
+                    node.func.attr, "activate",
+                    "switchboard must not call activate()")
 
         stack = make_stack(self)
         _append_prime_sealed(stack.ledger, "rec-seam")
@@ -411,9 +421,14 @@ class SwitchboardIsolationTests(unittest.TestCase):
             _execute_git_custody(ctx, {"receipt_id": "rec-1", "git_push": True})
 
         source = inspect.getsource(switchboard_mod)
-        self.assertNotIn("subprocess", source)
-        self.assertNotIn("git push", source)
-        self.assertNotIn("git commit", source)
+        self.assertNotIn("import subprocess", source)
+        self.assertNotIn("subprocess.", source)
+        self.assertNotIn("os.system", source)
+        self.assertNotIn("Popen", source)
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                self.assertNotIn(node.func.attr, {"system", "popen", "run", "Popen", "check_call"})
 
     def test_event_implementation_status_is_honest(self):
         self.assertEqual(

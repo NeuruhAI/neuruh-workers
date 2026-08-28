@@ -402,6 +402,12 @@ class Switchboard:
             report.scanned += 1
             self._route(receipt, report)
             self._save_cursor(receipt.seq)
+        # Receipts we appended while routing (job.enqueued, switchboard.*)
+        # are not new Prime/Sentinel signals; park the cursor at the tail so
+        # a retick is a true no-op.
+        tail = self._ledger.verify()["receipts"]
+        if tail > self._cursor_seq:
+            self._save_cursor(tail)
         report.cursor_seq = self._cursor_seq
         return report
 
