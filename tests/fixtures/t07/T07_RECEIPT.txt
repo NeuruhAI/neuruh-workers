@@ -1,0 +1,33 @@
+# RECONSTRUCTION — not the live operator file.
+# Live path on the operator machine: ~/.neuruh-receipts/grok-sovereign-v4/T07_RECEIPT.txt
+# That file was not present in this workspace. Fields below are reconstructed from
+# MISSION / STAGE / HEAD plus the 2026-08-27 Autonomous Spine, Switchboard, and
+# Git Custodian canon (isolated MCP 127.0.0.1:18321, remote AXON head, PUSHED=NO).
+# Honey Pot expected-output fixture: existing GitHub PR #4 for the T07 git outcome.
+# This wrap must not perform additional git mutation.
+RECONSTRUCTION=YES
+SCHEMA=nrh.prime_receipt.v1
+MISSION=NEURUH_GROK_SOVEREIGN_BINDING_V4
+STAGE=T07_LOCAL_GROK_OBSERVER_BIND
+PLAN_ID=T07_LOCAL_GROK_OBSERVER_BIND
+TASK_ID=t07-local-grok-observer-bind
+REPO=NeuruhAI/neuruh-axon
+WORKTREE=/opt/neuruh/worktrees/neuruh-axon-grok-v4
+BRANCH=feature/t07-local-grok-observer-bind
+HEAD=7461eb835b3f979a8243f9f70da634a4e5ab62fc
+REMOTE=origin
+REMOTE_HEAD=0b131308ebfdbd47d013ea2ff600a8e2f001f5f9
+SOURCE_ROLE=PRIME
+SOURCE_COMPONENT=prime-builder
+SEALED=YES
+AUTHORITY_REF=agc:r0:t07-local-observer-bind
+BIND=127.0.0.1:18321
+PROFILE=grok_observer
+TOOLS=file_read,web_fetch,bonsai_inference
+PUSHED=NO
+PR_CREATED=NO
+MERGED=NO
+DEPLOYED=NO
+EXPECTED_GIT_OUTCOME_PR=4
+CLAIMANT=PRIME
+PAYLOAD_HASH=b7e0a923a78864c1db6ef3dc205418a8fbdea5a8c281b39693feb6d5e0b89755

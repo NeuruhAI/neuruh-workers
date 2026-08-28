@@ -83,4 +83,19 @@ python3 scripts/secret_scan.py
 
 Covers: unit (definitions/ledger/queue/runner), replay + idempotency,
 crash recovery, adversarial approvals, external-action lockout, seam
-refusal, and a secret scan of every tracked file.
+refusal, Switchboard first seam (observe → court job → honey-pot artifact),
+and a secret scan of every tracked file.
+
+## Switchboard first seam (SWITCHAROO)
+
+A thin wrap around the existing ledger + job queue.  A sealed PRIME receipt
+file is observed once, the envelope is validated (Switchboard does **not**
+declare PASS), and exactly one Sentinel `court.requested` **job artifact** is
+enqueued.  An ingested `court.passed` materialises exactly one Honey Pot /
+Git Custodian `candidate.push.requested` artifact.  No git push.  Sentinel
+model execution is `BLOCKED`.  `OrganRegistrationSeam.activate()` still
+refuses.  Loopback/file observation only.
+
+```bash
+python3 scripts/run_switchboard.py tick --receipts <dir> --root .neuruh/switchboard
+```

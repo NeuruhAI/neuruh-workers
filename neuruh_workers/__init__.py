@@ -28,15 +28,16 @@ from .queue import JobQueue, JobState
 from .registry import Capability, StepContext, WorkerDeclaration, WorkerRegistry
 from .runner import WorkflowRunner
 from .seams import OrganRegistrationSeam, OrganSeamDeclaration
+from .switchboard import Switchboard
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "ApprovalInvalid", "Capability", "CapabilityUnknown", "CapabilityViolation",
     "DefinitionError", "ExecutionLedger", "ExternalActionDenied", "JobQueue",
     "JobState", "JobStateInvalid", "JobStatus", "LedgerCorrupt", "OrganRegistrationSeam",
     "OrganSeamDeclaration", "ReceiptType", "RetryPolicy", "SeamNotAuthorized",
-    "StepContext", "StepDefinition", "StepTimeout", "WorkerDeclaration",
+    "StepContext", "StepDefinition", "StepTimeout", "Switchboard", "WorkerDeclaration",
     "WorkerRegistry", "WorkflowCatalog", "WorkflowDefinition", "WorkflowError",
     "WorkflowRunner", "deterministic_job_id",
 ]
