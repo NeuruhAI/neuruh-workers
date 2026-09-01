@@ -9,6 +9,7 @@ on:
       - 'tests/**'
       - 'scripts/**'
       - 'JGI_FOUNDER_RUNTIME_V0.md'
+      - 'docs/receipts/**'
       - '.github/workflows/jgi-founder-runtime.yml'
   pull_request:
     paths:
@@ -16,6 +17,7 @@ on:
       - 'tests/**'
       - 'scripts/**'
       - 'JGI_FOUNDER_RUNTIME_V0.md'
+      - 'docs/receipts/**'
       - '.github/workflows/jgi-founder-runtime.yml'
 
 permissions:

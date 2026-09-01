@@ -2,6 +2,13 @@ import os
 import tempfile
 import unittest
 
+from neuruh_workers.convergence import (
+    THIS_PR_MAY_OWN,
+    THIS_PR_MUST_NOT_OWN,
+    owner_of,
+    this_pr_must_not_own,
+    this_pr_owns,
+)
 from neuruh_workers.founder_runtime import (
     FounderRuntime,
     IntelligenceLayer,
@@ -83,8 +90,11 @@ class FounderRuntimeCourt(unittest.TestCase):
     def test_material_authority_gate_never_enqueues(self):
         candidate = self.property_candidate(production_mutation=True)
         result = self.runtime.dispatch(self.mission(), [candidate])
-        self.assertEqual(result.status, RuntimeStatus.FOUNDER_GATE_REQUIRED)
+        self.assertEqual(result.status, RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED)
         self.assertIn("PRODUCTION_MUTATION", result.founder_gate_reasons)
+        self.assertEqual(result.authority_path, "governance->sentinel->axon")
+        self.assertEqual(result.broker_bind["authorized"], False)
+        self.assertEqual(result.broker_bind["executed"], False)
         self.assertIsNone(result.job_id)
         self.assertEqual(self.ledger.verify()["receipts"], 0)
 
@@ -98,6 +108,11 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(result.status, RuntimeStatus.REASONING_BROKER_REQUIRED)
         self.assertIsNone(result.job_id)
         self.assertEqual(self.ledger.verify()["receipts"], 0)
+        self.assertEqual(result.broker_bind["module"], "revenue_factory/authorization.py")
+        self.assertEqual(result.broker_bind["symbol"], "InferenceAuthorization")
+        self.assertEqual(result.broker_bind["authorized"], False)
+        self.assertEqual(result.broker_bind["model_call"], False)
+        self.assertIsNone(result.broker_bind["required_authorization_id"])
 
     def test_economic_rank_can_choose_cheaper_path_without_model_bias(self):
         cheap = self.property_candidate(candidate_id="cheap", estimated_latency_minutes=2)
@@ -124,6 +139,33 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertNotIn("chat_history", packet)
         self.assertNotIn("transcript", packet)
         self.assertEqual(packet["jeramie_manual_handoffs_target"], 0)
+        self.assertEqual(packet["authority_path"], "governance->sentinel->axon")
+        self.assertEqual(packet["reasoning_broker"], "revenue_factory.authorization+aegis.iar")
+
+    def test_parent_resume_is_named_not_automatic(self):
+        result = self.runtime.dispatch(
+            self.mission(parent_mission_id="JGI-PARENT-001"),
+            [self.property_candidate()],
+        )
+        self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
+        self.assertEqual(result.parent_resume["automatic"], False)
+        self.assertEqual(result.parent_resume["status"], "PARENT_RESUME_NOT_IMPLEMENTED")
+        self.assertEqual(result.parent_resume["parent_mission_id"], "JGI-PARENT-001")
+
+    def test_ownership_seam_does_not_claim_foreign_organs(self):
+        for organ in THIS_PR_MAY_OWN:
+            self.assertTrue(this_pr_owns(organ), organ)
+        for organ in THIS_PR_MUST_NOT_OWN:
+            self.assertTrue(this_pr_must_not_own(organ), organ)
+            self.assertFalse(this_pr_owns(organ), organ)
+        self.assertIn("neuruh-workers#3", owner_of("SWITCHBOARD")["owner"])
+        self.assertIn("git_custodian", owner_of("GIT_CUSTODIAN")["owner"])
+        self.assertIn("authorization.py", owner_of("REVENUE_FACTORY")["owner"] + owner_of("CHEAPEST_CAPABLE_ROUTER_L2_L4")["owner"])
+        self.assertIn("aegis", owner_of("IAR")["owner"])
+        self.assertIn("autonomous-governance-core", owner_of("GOVERNANCE")["owner"])
+        self.assertIn("neuruh-axon", owner_of("AXON")["owner"])
+        self.assertEqual(owner_of("AUTOMATIC_PARENT_RESUME")["role"], "ABSENT")
+        self.assertEqual(owner_of("MISSION_RECOVERY")["role"], "PARTIAL")
 
 
 if __name__ == "__main__":

@@ -15,12 +15,18 @@ V0 autonomy boundary:
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from enum import Enum
 from math import isfinite
 from typing import Any, Mapping, Sequence
 
 from .contracts import JobStatus, canonical_json, content_sha
+from .convergence import (
+    GSA_AUTHORITY_PATH,
+    gsa_bind,
+    parent_resume_pointer,
+    reasoning_broker_bind,
+)
 from .definitions import WorkflowCatalog
 from .queue import JobQueue
 from .runner import WorkflowRunner
@@ -50,6 +56,7 @@ class RuntimeStatus(str, Enum):
     ALREADY_SUCCEEDED = "ALREADY_SUCCEEDED"
     APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
     FOUNDER_GATE_REQUIRED = "FOUNDER_GATE_REQUIRED"
+    GOVERNANCE_SENTINEL_AXON_REQUIRED = "GOVERNANCE_SENTINEL_AXON_REQUIRED"
     REASONING_BROKER_REQUIRED = "REASONING_BROKER_REQUIRED"
     BLOCKED = "BLOCKED"
 
@@ -141,6 +148,9 @@ class RuntimeResult:
     job_status: str | None = None
     ledger_tail_sha: str | None = None
     note: str = ""
+    authority_path: str = ""
+    broker_bind: Mapping[str, Any] | None = None
+    parent_resume: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -227,6 +237,8 @@ def compile_context(
         "constraints": list(mission.constraints[-8:]),
         "state_delta": dict(state_delta or {}),
         "jeramie_manual_handoffs_target": 0,
+        "authority_path": GSA_AUTHORITY_PATH,
+        "reasoning_broker": "revenue_factory.authorization+aegis.iar",
     }
     # Trim pointer arrays before ever truncating semantic mission/task fields.
     trim_order = ["canonical_refs", "evidence_refs", "known_failures", "blockers", "do_not_rebuild", "constraints"]
@@ -272,7 +284,7 @@ class FounderRuntime:
         if gates:
             return RuntimeResult(
                 mission_id=mission.mission_id,
-                status=RuntimeStatus.FOUNDER_GATE_REQUIRED,
+                status=RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED,
                 candidate_id=candidate.candidate_id,
                 workflow_name=candidate.workflow_name,
                 layer=candidate.layer.value,
@@ -280,10 +292,13 @@ class FounderRuntime:
                 founder_gate_reasons=gates,
                 context_digest=context_digest,
                 compiled_context=context,
-                note="material authority gate; no job enqueued",
+                authority_path=GSA_AUTHORITY_PATH,
+                broker_bind=gsa_bind(reasons=gates),
+                note="consequential action; Governance → Sentinel → AXON required; no job enqueued",
             )
 
         if candidate.layer in {IntelligenceLayer.L2, IntelligenceLayer.L3, IntelligenceLayer.L4}:
+            bind = reasoning_broker_bind(context_digest=context_digest)
             return RuntimeResult(
                 mission_id=mission.mission_id,
                 status=RuntimeStatus.REASONING_BROKER_REQUIRED,
@@ -294,22 +309,27 @@ class FounderRuntime:
                 founder_gate_reasons=(),
                 context_digest=context_digest,
                 compiled_context=context,
-                note="model routing selected; this workflow layer does not self-authorize inference",
+                authority_path="revenue_factory.authorization->aegis.iar",
+                broker_bind=bind,
+                note="L2/L3/L4 must consume existing Revenue Factory InferenceAuthorization; this layer does not issue or call models",
             )
 
         definition = self.catalog.get(candidate.workflow_name)
         if not definition.read_only:
+            reasons = ("NON_READ_ONLY_WORKFLOW",)
             return RuntimeResult(
                 mission_id=mission.mission_id,
-                status=RuntimeStatus.FOUNDER_GATE_REQUIRED,
+                status=RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED,
                 candidate_id=candidate.candidate_id,
                 workflow_name=candidate.workflow_name,
                 layer=candidate.layer.value,
                 utility_usd=score.utility_usd,
-                founder_gate_reasons=("NON_READ_ONLY_WORKFLOW",),
+                founder_gate_reasons=reasons,
                 context_digest=context_digest,
                 compiled_context=context,
-                note="v0 autonomous dispatch is read-only only",
+                authority_path=GSA_AUTHORITY_PATH,
+                broker_bind=gsa_bind(reasons=reasons),
+                note="non-read-only work is consequential; Governance → Sentinel → AXON required",
             )
 
         dedupe_key = content_sha({
@@ -353,5 +373,7 @@ class FounderRuntime:
             job_id=job_id,
             job_status=state.status.value,
             ledger_tail_sha=chain["tail_sha"],
+            authority_path="workflow_runner->execution_ledger",
+            parent_resume=parent_resume_pointer(mission.parent_mission_id),
             note="existing deterministic workflow reused; queue/runner/ledger remain canonical",
         )

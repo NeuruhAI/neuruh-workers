@@ -3,6 +3,7 @@
 **Mission:** JGI-FOUNDER-RUNTIME-V0-001  
 **Repo:** `NeuruhAI/neuruh-workers`  
 **State:** candidate PR only; not canonical/live until convergence + court.  
+**Convergence court:** `docs/receipts/NEURUH-JGI-CONVERGENCE-001.md` — **HOLD**.  
 **Production mutations:** 0.
 
 This is the first executable slice of the larger Jeramie General Intelligence control plane.
@@ -24,8 +25,8 @@ It does **not** create another workflow engine. It sits above the workflow layer
 1. ranks candidate execution paths by expected economic utility;
 2. prefers cheaper paths when value/success are equivalent;
 3. compiles a <=4 KiB pointer-heavy context packet instead of replaying a chat transcript;
-4. stops true founder-only gates (money, external message, production mutation, irreversible action, private-IP risk);
-5. refuses to self-authorize L2/L3/L4 inference and returns `REASONING_BROKER_REQUIRED`;
+4. stops consequential gates (money, external message, production mutation, irreversible action, private-IP risk) as `GOVERNANCE_SENTINEL_AXON_REQUIRED` — founder is not the executor;
+5. refuses to self-authorize L2/L3/L4 inference and returns `REASONING_BROKER_REQUIRED` bound to Revenue Factory `InferenceAuthorization` + Aegis IAR;
 6. for safe L0/L1 read-only work, reuses the existing queue/runner and **autonomously enqueues + executes** the workflow;
 7. relies on the existing hash-chained ledger for execution receipts and idempotent replay;
 8. repeated identical dispatch resolves to the same job and does not re-run completed work.
@@ -40,8 +41,8 @@ Jeramie intent
   -> candidate paths
   -> cheapest/value-aware route
   -> compact context
-  -> founder gate? -------- yes -> stop with exact reasons
-  -> model required? ------ yes -> reasoning broker required
+  -> consequential? ------- yes -> Governance → Sentinel → AXON required
+  -> model required? ------ yes -> Revenue Factory / IAR authorization required
   -> existing read-only workflow
   -> deterministic JobQueue
   -> WorkflowRunner
