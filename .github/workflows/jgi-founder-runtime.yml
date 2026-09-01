@@ -1,0 +1,30 @@
+name: JGI Founder Runtime court
+
+on:
+  pull_request:
+    paths:
+      - 'neuruh_workers/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'JGI_FOUNDER_RUNTIME_V0.md'
+      - '.github/workflows/jgi-founder-runtime.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  court:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Full unittest court
+        run: python3 -m unittest discover -s tests -t .
+      - name: Secret scan
+        run: python3 scripts/secret_scan.py
+      - name: JGI deterministic demo
+        run: |
+          tmpdir="$(mktemp -d)"
+          python3 scripts/run_jgi_demo.py --ledger "$tmpdir/jgi-demo.jsonl"
