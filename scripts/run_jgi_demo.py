@@ -9,6 +9,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
+
+# Direct execution (`python scripts/run_jgi_demo.py`) makes `scripts/` the first
+# import root. Add the repository root explicitly so the demo is portable in CI
+# and from a clean checkout without requiring package installation.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from neuruh_workers.founder_runtime import (
     FounderRuntime,
