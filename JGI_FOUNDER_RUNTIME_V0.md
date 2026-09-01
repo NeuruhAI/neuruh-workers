@@ -1,9 +1,8 @@
 # JGI Founder Runtime v0 — executable candidate
 
-**Mission:** JGI-FOUNDER-RUNTIME-V0-001  
+**Mission:** JGI-FOUNDER-RUNTIME-V0-001 / NEURUH-JGI-CONVERGENCE-001 Lane B  
 **Repo:** `NeuruhAI/neuruh-workers`  
-**State:** candidate PR only; not canonical/live until convergence + court.  
-**Convergence court:** `docs/receipts/NEURUH-JGI-CONVERGENCE-001.md` — **HOLD**.  
+**State:** candidate PR #5 only; draft; not merged; not live; not Sentinel PASS.  
 **Production mutations:** 0.
 
 This is the first executable slice of the larger Jeramie General Intelligence control plane.
@@ -17,19 +16,47 @@ It does **not** create another workflow engine. It sits above the workflow layer
 - `ExecutionLedger`
 - existing content-bound approval gates
 - existing external-action lockout
+- existing `job.recovered` / `JobQueue.resume` for parent resume
+
+It consumes, and does not vendor, sibling/foreign organs:
+
+- SWITCHAROO / Switchboard (`neuruh-workers#3`) — import-if-present
+- Git Custodian / HONEY POT (`neuruh-workers#4`) — import-if-present
+- IAR (`NeuruhAI/aegis` `iar_v2`, loopback `127.0.0.1:8090` health JSON)
+- Revenue Factory `InferenceAuthorization`
+- Governance (`NeuruhAI/autonomous-governance-core` evaluate+consume)
+- Sentinel (independent court organ; not a CI job name)
+- AXON (`NeuruhAI/neuruh-axon` ToolRegistry/guards/receipts)
+
+## Bound vs fail-closed (Lane B corrective)
+
+| Spine step | Bound now | Still fail-closed |
+|---|---|---|
+| INTENT | `MissionIntent` on this PR | — |
+| CONTEXT COMPILER | pointer packet, no chat/transcript | — |
+| CHEAPEST CAPABLE ROUTER (L0/L1) | layer/latency **pre-filter only**; no hardcoded USD spend | does not authorize spend or model calls |
+| CHEAPEST CAPABLE ROUTER (L2/L3/L4) | probes IAR health + RF import | no organ → no enqueue, no model call, no local auth |
+| WORKER | existing `JobQueue` + `WorkflowRunner` | material flags still fail closed before enqueue |
+| COURT | emits `court.requested` packet with evidence SHAs | Sentinel organ absent; CI `court` job is unittest only; verdict stays `None` |
+| RECEIPT | existing `ExecutionLedger` | — |
+| `receipt.sealed` | emitted after receipted worker result; PRIME observe file if `receipts_dir` set | Switchboard module not on this branch → `SWITCHBOARD_ABSENT_FAIL_CLOSED` (no vendored `switchboard.py`) |
+| AUTOMATIC PARENT RESUME | child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing on ledger → `PARENT_JOB_ABSENT_IN_LEDGER` |
+| Governance → Sentinel → AXON | named path; evaluate+consume if importable; caller never `approved=true` | organs absent → consequential work not enqueued |
+| HONEY POT | import-if-present consumer | custodian not copied; custody stays on PR #4 |
 
 ## What v0 actually does
 
 `MissionIntent` + candidate paths enter the Founder Runtime. The runtime:
 
-1. ranks candidate execution paths by expected economic utility;
-2. prefers cheaper paths when value/success are equivalent;
+1. pre-filters candidate paths by intelligence layer then latency (not USD);
+2. prefers cheaper layers when both are valid;
 3. compiles a <=4 KiB pointer-heavy context packet instead of replaying a chat transcript;
-4. stops consequential gates (money, external message, production mutation, irreversible action, private-IP risk) as `GOVERNANCE_SENTINEL_AXON_REQUIRED` — founder is not the executor;
-5. refuses to self-authorize L2/L3/L4 inference and returns `REASONING_BROKER_REQUIRED` bound to Revenue Factory `InferenceAuthorization` + Aegis IAR;
+4. stops consequential gates (money, external message, production mutation, irreversible action, private-IP risk, non-read-only) as `GOVERNANCE_SENTINEL_AXON_REQUIRED` — founder is not the executor and never sets `approved=true`;
+5. refuses to self-authorize L2/L3/L4 inference and returns `REASONING_BROKER_REQUIRED` bound to the IAR/RF contract (`iar_v2` health JSON + `InferenceAuthorization`);
 6. for safe L0/L1 read-only work, reuses the existing queue/runner and **autonomously enqueues + executes** the workflow;
-7. relies on the existing hash-chained ledger for execution receipts and idempotent replay;
-8. repeated identical dispatch resolves to the same job and does not re-run completed work.
+7. after a receipted worker result, emits `receipt.sealed` and a `COURT_REQUEST` packet onto the SWITCHAROO seam (or fail-closed documents the missing module);
+8. if `parent_mission_id` is set, resumes existing parent jobs from the ledger;
+9. repeated identical dispatch resolves to the same job and does not re-run completed work.
 
 ## Autonomy boundary
 
@@ -39,15 +66,16 @@ consequential actions.
 ```text
 Jeramie intent
   -> candidate paths
-  -> cheapest/value-aware route
+  -> cheapest-capable pre-filter (no USD spend)
   -> compact context
-  -> consequential? ------- yes -> Governance → Sentinel → AXON required
-  -> model required? ------ yes -> Revenue Factory / IAR authorization required
+  -> consequential? ------- yes -> Governance → Sentinel → AXON (fail-closed if absent)
+  -> model required? ------ yes -> IAR / Revenue Factory (fail-closed if absent)
   -> existing read-only workflow
   -> deterministic JobQueue
   -> WorkflowRunner
   -> hash-chained receipts
-  -> success / approval gate / typed failure
+  -> receipt.sealed + court.requested (SWITCHAROO consume / fail-closed)
+  -> automatic parent resume from ledger
 ```
 
 This gives the organism a real, court-able path toward `JERAMIE_MANUAL_HANDOFFS=0` without bypassing
@@ -63,39 +91,37 @@ The Founder Runtime uses the shared hierarchy:
 - `L3_CHEAP_REMOTE_MODEL`
 - `L4_FRONTIER_MODEL`
 
-Only L0/L1 execute in this package. Model inference must be delegated to a separately authorized reasoning
-broker. The Revenue Factory candidate already implements an economic model-call seam with single-use authorization,
-cache, no-inference receipts and reasoning-debt compilation; JGI should consume that seam after architecture
-convergence rather than rebuild it.
+Only L0/L1 execute in this package. Model inference and spend must be delegated to IAR / Revenue Factory.
+This package does not embed a provider client or a second model router.
 
-## What remains before true continuous autonomy
+## What remains fail-closed / not claimed
 
-1. **Architecture binding:** court which repo owns mission supervision; this PR is a candidate because `neuruh-workers`
-   already owns governed multi-step work.
-2. **Switchboard integration:** consume the pending receipt->court seams instead of manual clipboard handoffs.
-3. **Reasoning broker binding:** route L2/L3/L4 to IAR/Revenue Factory under single-use authorization and budget.
-4. **Canonical AXON binding:** only after Governance/Sentinel allows an action; never invent a second executor.
-5. **Mission recovery watcher:** stale/nonterminal missions are resumed from receipts automatically.
-6. **Execution Genome:** accepted outcomes compile repeated expensive reasoning into cheaper deterministic rules.
-7. **Offer Foundry adapter:** customer problem -> public-safe capability search -> Recipe Engine -> bounded offer -> governed workflow.
-8. **Cockpit projection:** only `NOW / MONEY / BLOCKED / LEARNED` founder surfaces.
+1. **Switchboard is not on this branch.** `receipt.sealed` is emitted as a consumer packet + optional PRIME file. Sentinel is not jobbed until `#3` is present.
+2. **IAR / Revenue Factory are not in this repo.** L2/L3/L4 probe the published contract and fail closed without issuing authorization.
+3. **Governance, Sentinel, and AXON processes are not in this CI.** Consequential work does not enqueue around them.
+4. **No stale-mission watcher.** Parent resume covers existing parent *jobs* on the ledger, not a new recovery daemon.
+5. **No architecture-court PASS job.** The GitHub Actions job named `court` still runs unit tests, secret scan, and the JGI demo only.
+6. **Not merged, not live, not Sentinel PASS.**
 
-## Court
+## Court (unit)
 
-The new tests prove:
+The tests prove:
 
 - safe deterministic mission runs through the existing workflow engine to `job.succeeded` with zero manual handoff;
 - identical dispatch is idempotent and does not execute twice;
-- production mutation is founder-gated before enqueue;
-- frontier reasoning is routed but not self-authorized;
-- an equivalent deterministic path beats a more expensive model path;
-- context packets are bounded and contain no transcript/chat field.
+- consequential flags do not enqueue without Governance → Sentinel → AXON;
+- L2/L3/L4 fail closed without IAR/RF and never self-authorize;
+- the local ranker cannot authorize spend or model calls and has no USD constants;
+- `receipt.sealed` + `court.requested` are emitted after a receipted worker result;
+- `parent_mission_id` resumes a paused or recovered parent from the existing ledger;
+- this PR does not add `switchboard.py` or `git_custodian`.
 
 Run:
 
 ```bash
 python3 -m unittest discover -s tests -t .
 python3 scripts/secret_scan.py
+python3 scripts/run_jgi_demo.py --ledger /tmp/jgi-demo.jsonl
 ```
 
 ## Non-claims
@@ -103,7 +129,10 @@ python3 scripts/secret_scan.py
 - not AGI in the scientific sense
 - not deployed
 - not merged
+- not converted from draft
 - not canonical owner yet
+- not Sentinel PASS
+- not architecture court PASS
 - no model call
 - no spend
 - no outbound message

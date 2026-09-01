@@ -18,11 +18,15 @@ PUBLIC_COMMONS=NOT_WRITTEN
 
 COURTED_CANDIDATE_HEAD=09608f6b2dee7ccfdbc3b4d560f98ed40bc02df5
 CONVERGENCE_SEAM_HEAD=f9c640af784bc435c466ccfc804deefb8a3ef72a
+LANE_B_CORRECTIVE=YES
 BASE=main@05c669afa0d922607c290d86b98142bf0aec6a3f
 BRANCH=feature/jgi-founder-runtime-v0-20260901
 COURT_AGENT=https://cursor.com/agents/bc-d263ce40-be40-463d-b8ec-522b63a983ba
 
-VERDICT=HOLD
+PRIOR_COURT_VERDICT=HOLD
+SENTINEL_VERDICT=NOT_JUDGED
+ARCHITECTURE_COURT_PASS=NO
+MERGED=NO
 ```
 
 ## Independent verification of reported court (do not trust chat)
@@ -64,7 +68,7 @@ Can PR #5 **own/integrate** (not recreate) the existing organism spine:
 | WORKER | `neuruh-workers` main `WorkerRegistry` + sample workflows | **REUSE** | no |
 | COURT | `neuruh-workers#3` Switchboard `court.requested` (`SENTINEL_MODEL_EXECUTION=BLOCKED`); Switchboard does not declare PASS | **CONSUME** (not copied onto this branch) | sibling unmerged PR |
 | RECEIPT | `neuruh-workers` main `ExecutionLedger` | **REUSE** | no |
-| AUTOMATIC PARENT RESUME | **UNOWNED** | `parent_mission_id` compiled; `parent_resume.automatic=false` | **BLOCKER** |
+| AUTOMATIC PARENT RESUME | main `JobQueue.resume` + `WorkflowRunner job.recovered` | **CONSUME** — child success resumes existing parent jobs | precise gap if parent job absent |
 | Switchboard / SWITCHAROO | `neuruh-workers#3` (`neuruh_workers/switchboard.py`, events.jsonl wrapper) and earlier `#2` | **CONSUME** | sibling unmerged; this PR does not copy it |
 | Git Custodian / HONEY_POT | `neuruh-workers#4` `neuruh_workers.git_custodian` | **CONSUME** | sibling unmerged; this PR does not copy it |
 | Revenue Factory / IAR reasoning authorization | live-integration#1 `revenue_factory/` ; IAR = Aegis `core/iar` | **CONSUME** | named, not executed |
@@ -111,17 +115,35 @@ Switchboard `#2/#3` and Git Custodian `#4` were **not** merged or copied. Copyin
 2. **Governance → Sentinel → AXON is named, not wired.**  
    Workers `#3` Switchboard, workers `#4` Git Custodian, and `neuruh-axon` remain sibling/unmerged. `OrganRegistrationSeam.activate()` still refuses. Consequential dispatch now fails closed to GSA instead of founder-as-executor, but cannot run the GSA chain from this package.
 
-3. **AUTOMATIC PARENT RESUME is absent.**  
-   `parent_mission_id` is compiled. On child success the runtime records `PARENT_RESUME_NOT_IMPLEMENTED` / `automatic=false`. No watcher resumes the parent from receipts.
+3. **AUTOMATIC PARENT RESUME is bound to existing job recovery.**  
+   Child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered`. If no parent job exists on the ledger the gap is `PARENT_JOB_ABSENT_IN_LEDGER`. There is still no stale-mission watcher.
 
 4. **Mission-level recovery watcher is absent.**  
-   Job crash recovery (`job.recovered`) exists on main `WorkflowRunner`. Stale/nonterminal **missions** are not auto-resumed.
+   Job crash recovery (`job.recovered`) exists on main `WorkflowRunner`. Stale/nonterminal **missions** without an existing parent job are not auto-created.
 
 5. **Outcome learning is not consumed.**  
    No accepted-outcome compile into cheaper L0 rules. Revenue Factory `reasoning_debt.py` stays `auto_apply=False` and is out of this repo.
 
 6. **Switchboard is not on this branch.**  
-   L0/L1 success receipts are ledger facts. They are not observed by SWITCHAROO (`receipt.sealed` → `court.requested`) until `#3` is consumed, not recreated.
+   L0/L1 success now emits `receipt.sealed` + `court.requested` as a consumer packet (and a PRIME observe file when configured). Switchboard is imported if present; otherwise `SWITCHBOARD_ABSENT_FAIL_CLOSED`. `#3` is not copied.
+
+## Lane B corrective (same PR #5 branch; not a new PR)
+
+The HOLD court named the organs. This corrective **binds or fail-closes** them
+without rebuilding Switchboard, IAR, AXON, Governance, Sentinel, or a second
+router / bus / ledger / git custodian.
+
+| Court defect | Binding | Still fail-closed |
+|---|---|---|
+| Local USD ranker (`founder_minute_value_usd=2.0`) | deleted; L0/L1 is layer/latency pre-filter only | ranker cannot authorize spend or model calls |
+| L2/L3/L4 unbound | `bind_iar_rf` probes `127.0.0.1:8090` health JSON + RF `InferenceAuthorization` import | organs absent → `REASONING_BROKER_REQUIRED`, no enqueue |
+| COURT / `receipt.sealed` missing | emit `receipt.sealed` + `court.requested` with evidence refs/SHAs; write PRIME observe file when `receipts_dir` set | `switchboard.py` not on this branch → `SWITCHBOARD_ABSENT_FAIL_CLOSED`; no vendored fork |
+| Consequential `FOUNDER_GATE_REQUIRED` | `GOVERNANCE_SENTINEL_AXON_REQUIRED`; evaluate+consume if importable; caller never `approved=true` | G/S/A absent → not enqueued |
+| `parent_mission_id` unused | child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing → `PARENT_JOB_ABSENT_IN_LEDGER` |
+| Sibling #3/#4 not imported | import-if-present consumers only | no second `switchboard.py` or `git_custodian` |
+
+This is an implementation bind on the existing draft PR. It is **not** Sentinel PASS,
+**not** architecture court PASS, and **not** a merge.
 
 ## What this PR may own after HOLD is cleared
 
@@ -147,7 +169,9 @@ Not a candidate owner of: Switchboard, Git Custodian, IAR, Revenue Factory autho
 5. Consume outcome-calibration / reasoning-debt after those ownership gates.
 
 ```text
-NEXT=HOLD_UNTIL_GSA_AND_RF_CONSUMED
+NEXT=LANE_B_BOUND_OR_FAIL_CLOSED_ON_PR5
 HUMAN_CLIPBOARD_REQUIRED=NO
 JERAMIE_MANUAL_HANDOFFS_TARGET=0
+SENTINEL_PASS=NO
+READY_TO_MERGE=NO
 ```
