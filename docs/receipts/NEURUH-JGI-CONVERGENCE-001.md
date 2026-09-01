@@ -17,6 +17,7 @@ NEURUH_WEB=NOT_WRITTEN
 PUBLIC_COMMONS=NOT_WRITTEN
 
 COURTED_CANDIDATE_HEAD=09608f6b2dee7ccfdbc3b4d560f98ed40bc02df5
+CONVERGENCE_SEAM_HEAD=f9c640af784bc435c466ccfc804deefb8a3ef72a
 BASE=main@05c669afa0d922607c290d86b98142bf0aec6a3f
 BRANCH=feature/jgi-founder-runtime-v0-20260901
 COURT_AGENT=https://cursor.com/agents/bc-d263ce40-be40-463d-b8ec-522b63a983ba
@@ -38,13 +39,13 @@ Re-run on this court, clean checkout of exact SHA `09608f6b2dee7ccfdbc3b4d560f98
 | deterministic JGI demo PASS | **CONFIRMED** | `scripts/run_jgi_demo.py` → `status=SUCCEEDED`, `job_id=job-42027ee43e5572cf49ba68c8`, `job.succeeded` via existing `property-research`, ledger `receipts=9`, `tail_sha=ca3505fadc8c9f3f64fa326c1156e42ee09b7e787020ec468e40d5ffc625fe13` |
 | GHA court on that HEAD | **CONFIRMED** | check run `court` conclusion=`success` at https://github.com/NeuruhAI/neuruh-workers/actions/runs/33570668959/job/100063709239 |
 
-Post-seam local court (ownership bind + GSA/RF fail-closed pointers, same branch):
+Post-seam court on `f9c640af784bc435c466ccfc804deefb8a3ef72a`:
 
 | Court | Result |
 |---|---|
-| unittest | `Ran 69 tests` OK (67 prior + 2 ownership/parent-resume) |
-| secret scan | re-run required after this receipt lands |
-| JGI demo | still L0 read-only `SUCCEEDED` without founder |
+| unittest | **PASS** `Ran 69 tests in 0.530s OK` (67 prior + ownership/parent-resume) |
+| secret scan | **PASS** `SECRET SCAN: CLEAN (37 tracked files, 9 patterns)` |
+| JGI demo | **PASS** L0 `SUCCEEDED` without founder; `job_id=job-7c5cf2d5393a5cd03d125d7c`; ledger `receipts=9` `tail_sha=98645755da9ab28d8a5f2ad8d20c327e4c88d3079abb1c49f65a386fab39d214` |
 
 ## Question the court answers
 
