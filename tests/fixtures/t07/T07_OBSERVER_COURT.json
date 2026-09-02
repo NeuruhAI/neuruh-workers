@@ -1,6 +1,7 @@
 {
   "fixture_kind": "sentinel-court-outcome",
-  "reconstruction": "Operator states Sentinel independently closed T07 after T07_RECEIPT.txt was written. SENTINEL_CLOSURE=PENDING in that receipt is NOT a PASS. Switchboard must not treat PRIME_VERDICT=PASS as court.passed. This file is the injected court.passed fixture keyed to that receipt.",
+  "independent": false,
+  "reconstruction": "Operator states Sentinel independently closed T07 after T07_RECEIPT.txt was written. SENTINEL_CLOSURE=PENDING in that receipt is NOT a PASS. Switchboard must not treat PRIME_VERDICT=PASS as court.passed. This file is a reconstruction / injected fixture and MUST be refused as court.passed.",
   "mission_id": "NEURUH_GROK_SOVEREIGN_BINDING_V4",
   "stage_id": "T07_LOCAL_GROK_OBSERVER_BIND",
   "task_id": "T07_LOCAL_GROK_OBSERVER_BIND",

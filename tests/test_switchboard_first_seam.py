@@ -4,20 +4,26 @@ on court.passed, one Honey Pot / Git Custodian artifact.  No clipboard.
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
 from neuruh_workers import (
+    HUMAN_CLIPBOARD_REQUIRED,
     OrganRegistrationSeam, OrganSeamDeclaration, ReceiptType, SeamNotAuthorized,
     Switchboard,
 )
 from neuruh_workers.events import AckState, DeadletterReason, EventType, SCHEMA_VERSION
+from neuruh_workers.ledger import ExecutionLedger
 from neuruh_workers.prime_receipts import seal_receipt_text
+from neuruh_workers.queue import JobQueue
 from neuruh_workers.switchboard import (
-    T07_AXON_BRANCH, T07_AXON_PR, T07_AXON_PR_URL, T07_HEAD, T07_MISSION,
-    T07_STAGE, _CrashSimulated,
+    INDEPENDENT_COURT_KIND, T07_AXON_BRANCH, T07_AXON_PR, T07_AXON_PR_URL,
+    T07_HEAD, T07_MISSION, T07_STAGE, SwitchboardError, _CrashSimulated,
 )
 from neuruh_workers.switchboard_jobs import (
     GIT_PUSH, HONEY_POT_WORKFLOW, REMEDIATION_WORKFLOW, SENTINEL_MODEL_EXECUTION,
@@ -81,7 +87,16 @@ def _synthetic_body(**overrides) -> str:
     return "\n".join(f"{k}={v}" for k, v in fields.items()) + "\n"
 
 
-def _ingest_pass(board: Switchboard, *, passed: bool):
+def _independent_evidence(ref: str = "test://sentinel-independent-close") -> dict:
+    return {
+        "kind": INDEPENDENT_COURT_KIND,
+        "source_role": "SENTINEL",
+        "independent": True,
+        "ref": ref,
+    }
+
+
+def _ingest_pass(board: Switchboard, *, passed: bool, extra_payload=None):
     sealed = board.events(EventType.RECEIPT_SEALED)[-1]
     court = board.events(EventType.COURT_REQUESTED)[-1]
     return board.record_court_outcome(
@@ -96,7 +111,9 @@ def _ingest_pass(board: Switchboard, *, passed: bool):
         authority_ref=sealed["authority_ref"],
         source_repo=sealed["source_repo"],
         receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
-        verdict_note="independent Sentinel close (fixture); Switchboard did not PASS",
+        evidence=_independent_evidence(),
+        verdict_note="independent Sentinel close; Switchboard did not PASS",
+        extra_payload=extra_payload,
     )
 
 
@@ -142,18 +159,32 @@ class T07FirstSeamTests(unittest.TestCase):
         self.assertEqual(len(self.board.events(EventType.COURT_REQUESTED)), 1)
         self.assertEqual(len(self.board.jobs_for(SENTINEL_WORKFLOW)), 1)
 
-    def test_sentinel_pass_materialises_exactly_one_honey_pot_no_git_push(self):
+    def test_independent_court_pass_materialises_exactly_one_honey_pot_no_git_push(self):
+        """Second seam: court.passed from independent evidence, never from T07 reconstruction."""
         self.board.tick()
-        self.board.ingest_court_fixture(T07_COURT_FIXTURE)
+        with self.assertRaises(SwitchboardError) as refused:
+            self.board.ingest_court_fixture(T07_COURT_FIXTURE)
+        self.assertIn("reconstruction", str(refused.exception).lower())
+        self.assertEqual(len(self.board.events(EventType.COURT_PASSED)), 0)
+        _ingest_pass(self.board, passed=True, extra_payload={
+            "summary": {"pass_count": 1, "fail_count": 0},
+            "honey_pot_expected": {
+                "repo": "NeuruhAI/neuruh-axon",
+                "branch": T07_AXON_BRANCH,
+                "head": T07_HEAD,
+                "pr_number": T07_AXON_PR,
+                "pr_url": T07_AXON_PR_URL,
+                "pr_draft": "YES",
+            },
+        })
         report = self.board.tick()
         passed = self.board.events(EventType.COURT_PASSED)
         self.assertEqual(len(passed), 1)
-        self.assertEqual(passed[0]["payload_ref_or_payload"]["summary"]["pass_count"], 35)
-        self.assertEqual(passed[0]["payload_ref_or_payload"]["summary"]["fail_count"], 0)
-        self.assertFalse(passed[0]["payload_ref_or_payload"]["secret_file_ingested"])
-        pointer = passed[0]["payload_ref_or_payload"]["secret_pointer"]
-        self.assertTrue(pointer.endswith("T07_OBSERVER_COURT.secret"))
-        self.assertTrue(pointer.startswith("/") or pointer.startswith("~"))
+        evidence = passed[0]["payload_ref_or_payload"]["evidence"]
+        self.assertEqual(evidence["kind"], INDEPENDENT_COURT_KIND)
+        self.assertEqual(evidence["source_role"], "SENTINEL")
+        self.assertTrue(evidence["independent"])
+        self.assertEqual(passed[0]["source_role"], "SENTINEL")
         pushes = self.board.events(EventType.CANDIDATE_PUSH_REQUESTED)
         self.assertEqual(len(pushes), 1)
         jobs = self.board.jobs_for(HONEY_POT_WORKFLOW)
@@ -179,7 +210,16 @@ class T07FirstSeamTests(unittest.TestCase):
 
     def test_chain_preserves_correlation_and_causation(self):
         self.board.tick()
-        self.board.ingest_court_fixture(T07_COURT_FIXTURE)
+        _ingest_pass(self.board, passed=True, extra_payload={
+            "honey_pot_expected": {
+                "repo": "NeuruhAI/neuruh-axon",
+                "branch": T07_AXON_BRANCH,
+                "head": T07_HEAD,
+                "pr_number": T07_AXON_PR,
+                "pr_url": T07_AXON_PR_URL,
+                "pr_draft": "YES",
+            },
+        })
         self.board.tick()
         created = self.board.events(EventType.RECEIPT_CREATED)[0]
         sealed = self.board.events(EventType.RECEIPT_SEALED)[0]
@@ -401,11 +441,262 @@ class FailClosedTests(unittest.TestCase):
         self.assertFalse(os.path.exists(
             "/Users/jeramiehicks/.neuruh-receipts/grok-sovereign-v4/"
             "T07_OBSERVER_COURT.secret"))
-        board.ingest_court_fixture(T07_COURT_FIXTURE)
+        with self.assertRaises(SwitchboardError):
+            board.ingest_court_fixture(T07_COURT_FIXTURE)
+        self.assertEqual(len(board.events(EventType.COURT_PASSED)), 0)
         with open(board.event_ledger._path) as fh:
             ledger = fh.read()
         self.assertNotIn("BEGIN ", ledger)
-        self.assertIn("secret_pointer", ledger)
+        with open(T07_FIXTURE, encoding="utf-8") as receipt_fh:
+            self.assertIn("NOT_PROVEN", receipt_fh.read())
+
+
+class RequiredProofTests(unittest.TestCase):
+    """Exact proofs required by NEURUH-JGI-CONVERGENCE-002 Phase 1 / PR #3 court."""
+
+    def test_1_receipt_observation_is_idempotent(self):
+        board = _board(self)
+        shutil.copy(T07_FIXTURE, os.path.join(board.receipts_dir, "T07_RECEIPT.txt"))
+        first = board.tick()
+        second = board.tick()
+        third = board.reopen().tick()
+        self.assertEqual(first.observed, ["T07_RECEIPT.txt"])
+        self.assertEqual(second.observed, [])
+        self.assertEqual(third.observed, [])
+        self.assertEqual(len(board.reopen().events(EventType.RECEIPT_SEALED)), 1)
+
+    def test_2_receipt_sealed_requests_sentinel_court_not_pass(self):
+        board = _board(self)
+        shutil.copy(T07_FIXTURE, os.path.join(board.receipts_dir, "T07_RECEIPT.txt"))
+        board.tick()
+        self.assertEqual(len(board.events(EventType.RECEIPT_SEALED)), 1)
+        self.assertEqual(len(board.events(EventType.COURT_REQUESTED)), 1)
+        self.assertEqual(len(board.jobs_for(SENTINEL_WORKFLOW)), 1)
+        self.assertEqual(len(board.events(EventType.COURT_PASSED)), 0)
+        artifact = board.queue.load(
+            board.jobs_for(SENTINEL_WORKFLOW)[0]).step_results["materialize"]
+        self.assertEqual(artifact["sentinel_model_execution"], SENTINEL_MODEL_EXECUTION)
+        self.assertEqual(SENTINEL_MODEL_EXECUTION, "BLOCKED")
+
+    def test_3_no_fake_sentinel_pass(self):
+        board = _board(self)
+        shutil.copy(T07_FIXTURE, os.path.join(board.receipts_dir, "T07_RECEIPT.txt"))
+        board.tick()
+        sealed = board.events(EventType.RECEIPT_SEALED)[0]
+        self.assertEqual(
+            sealed["payload_ref_or_payload"]["sentinel_closure_in_receipt"], "PENDING")
+        self.assertEqual(
+            sealed["payload_ref_or_payload"]["clipboard_defect"]["sentinel_closure_in_receipt"],
+            "PENDING")
+        with self.assertRaises(SwitchboardError) as caught:
+            board.ingest_court_fixture(T07_COURT_FIXTURE)
+        self.assertIn("fake sentinel pass", str(caught.exception).lower())
+        court = board.events(EventType.COURT_REQUESTED)[-1]
+        for kind in ("reconstruction", "injected", "prime_verdict",
+                     "sentinel_closure_in_receipt"):
+            with self.assertRaises(SwitchboardError):
+                board.record_court_outcome(
+                    passed=True,
+                    court_job_id=court["payload_ref_or_payload"]["court_job_id"],
+                    mission_id=sealed["mission_id"],
+                    plan_id=sealed["plan_id"],
+                    task_id=sealed["task_id"],
+                    correlation_id=sealed["correlation_id"],
+                    causation_id=court["event_id"],
+                    source_head=sealed["source_head"],
+                    authority_ref=sealed["authority_ref"],
+                    source_repo=sealed["source_repo"],
+                    receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
+                    evidence={
+                        "kind": kind,
+                        "source_role": "SENTINEL",
+                        "independent": True,
+                        "ref": "test://fake",
+                    },
+                )
+        self.assertEqual(len(board.events(EventType.COURT_PASSED)), 0)
+
+    def test_4_court_passed_only_from_independent_court_evidence(self):
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        board.tick()
+        sealed = board.events(EventType.RECEIPT_SEALED)[-1]
+        court = board.events(EventType.COURT_REQUESTED)[-1]
+        with self.assertRaises(SwitchboardError):
+            board.record_court_outcome(
+                passed=True,
+                court_job_id=court["payload_ref_or_payload"]["court_job_id"],
+                mission_id=sealed["mission_id"],
+                plan_id=sealed["plan_id"],
+                task_id=sealed["task_id"],
+                correlation_id=sealed["correlation_id"],
+                causation_id=court["event_id"],
+                source_head=sealed["source_head"],
+                authority_ref=sealed["authority_ref"],
+                source_repo=sealed["source_repo"],
+                receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
+                evidence={
+                    "kind": INDEPENDENT_COURT_KIND,
+                    "source_role": "PRIME",
+                    "independent": True,
+                    "ref": "test://self-court",
+                },
+            )
+        empty = _board(self)
+        _write_receipt(empty.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        empty.tick()
+        sealed = empty.events(EventType.RECEIPT_SEALED)[-1]
+        with self.assertRaises(SwitchboardError) as caught:
+            empty.record_court_outcome(
+                passed=True,
+                court_job_id="job-does-not-exist",
+                mission_id=sealed["mission_id"],
+                plan_id=sealed["plan_id"],
+                task_id=sealed["task_id"],
+                correlation_id=sealed["correlation_id"],
+                causation_id=sealed["event_id"],
+                source_head=sealed["source_head"],
+                authority_ref=sealed["authority_ref"],
+                source_repo=sealed["source_repo"],
+                receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
+                evidence=_independent_evidence(),
+            )
+        self.assertIn("court.requested", str(caught.exception))
+        _ingest_pass(board, passed=True)
+        self.assertEqual(len(board.events(EventType.COURT_PASSED)), 1)
+        self.assertEqual(
+            board.events(EventType.COURT_PASSED)[0]["payload_ref_or_payload"]
+            ["evidence"]["kind"],
+            INDEPENDENT_COURT_KIND)
+
+    def test_5_candidate_push_requested_only_after_court_pass(self):
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        board.tick()
+        self.assertEqual(len(board.events(EventType.CANDIDATE_PUSH_REQUESTED)), 0)
+        _ingest_pass(board, passed=False)
+        board.tick()
+        self.assertEqual(len(board.events(EventType.CANDIDATE_PUSH_REQUESTED)), 0)
+        self.assertEqual(len(board.jobs_for(HONEY_POT_WORKFLOW)), 0)
+        self.assertEqual(len(board.jobs_for(REMEDIATION_WORKFLOW)), 1)
+        board2 = _board(self)
+        _write_receipt(board2.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        board2.tick()
+        _ingest_pass(board2, passed=True)
+        board2.tick()
+        self.assertEqual(len(board2.events(EventType.CANDIDATE_PUSH_REQUESTED)), 1)
+
+    def test_6_restart_recovery(self):
+        board = _board(self, crash_after_lease=True)
+        _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        with self.assertRaises(_CrashSimulated):
+            board.tick()
+        fresh = board.reopen()
+        report = fresh.tick()
+        self.assertTrue(report.recovered)
+        self.assertEqual(len(fresh.jobs_for(SENTINEL_WORKFLOW)), 1)
+        self.assertEqual(len(fresh.events(EventType.COURT_REQUESTED)), 1)
+
+    def test_7_deadletter_behavior(self):
+        board = _board(self)
+        path = _write_receipt(board.receipts_dir, "bad.txt", _synthetic_body())
+        with open(path) as fh:
+            text = fh.read()
+        with open(path, "w") as fh:
+            fh.write(text.replace(
+                f"PAYLOAD_HASH={text.split('PAYLOAD_HASH=')[-1].strip()}",
+                "PAYLOAD_HASH=" + "0" * 64))
+        board.tick()
+        reasons = {d["payload_ref_or_payload"]["reason"] for d in board.deadletters()}
+        self.assertIn(DeadletterReason.BROKEN_HASH.value, reasons)
+        self.assertTrue(all(
+            d["payload_ref_or_payload"]["original_retained"]
+            for d in board.deadletters()))
+        self.assertEqual(len(board.jobs_for(SENTINEL_WORKFLOW)), 0)
+
+    def test_8_no_duplicate_consequential_jobs(self):
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        board.tick()
+        _ingest_pass(board, passed=True)
+        board.tick()
+        board.tick()
+        fresh = board.reopen()
+        fresh.tick()
+        self.assertEqual(len(fresh.jobs_for(SENTINEL_WORKFLOW)), 1)
+        self.assertEqual(len(fresh.jobs_for(HONEY_POT_WORKFLOW)), 1)
+        types = [r.receipt_type for r in fresh.job_ledger.receipts(
+            fresh.jobs_for(SENTINEL_WORKFLOW)[0])]
+        self.assertEqual(types.count(ReceiptType.JOB_ENQUEUED), 1)
+
+    def test_9_no_ether_or_second_event_bus(self):
+        import neuruh_workers.events as events_mod
+        import neuruh_workers.switchboard as switchboard_mod
+        board = _board(self)
+        self.assertIsInstance(board.event_ledger, ExecutionLedger)
+        self.assertIsInstance(board.job_ledger, ExecutionLedger)
+        self.assertIsInstance(board.queue, JobQueue)
+        self.assertIs(board.queue.ledger if hasattr(board.queue, "ledger") else board.job_ledger,
+                      board.job_ledger)
+        for module in (events_mod, switchboard_mod):
+            src = inspect.getsource(module).lower()
+            self.assertNotIn("ether-layer", src)
+            self.assertNotIn("import ether", src)
+            self.assertNotIn("from ether", src)
+        self.assertFalse(any("ether" in name for name in sys.modules))
+        self.assertEqual(board.event_ledger._path, os.path.join(board.root, "events.jsonl"))
+        self.assertEqual(board.job_ledger._path, os.path.join(board.root, "jobs.jsonl"))
+
+    def test_10_no_axon_mutation(self):
+        tracked = subprocess.check_output(
+            ["git", "ls-files"], cwd=REPO_ROOT, text=True).splitlines()
+        self.assertFalse(any(path.startswith("neuruh-axon/") or path.endswith("axon.py")
+                             for path in tracked))
+        src = inspect.getsource(materialize_candidate_push)
+        self.assertNotIn("git push", src)
+        self.assertEqual(GIT_PUSH, "BLOCKED")
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        board.tick()
+        _ingest_pass(board, passed=True)
+        board.tick()
+        artifact = board.queue.load(
+            board.jobs_for(HONEY_POT_WORKFLOW)[0]).step_results["materialize"]
+        self.assertEqual(artifact["git_push"], "BLOCKED")
+        self.assertIn("no git mutation", artifact["note"])
+
+    def test_11_human_clipboard_required_is_no(self):
+        self.assertEqual(HUMAN_CLIPBOARD_REQUIRED, "NO")
+        board = _board(self)
+        shutil.copy(T07_FIXTURE, os.path.join(board.receipts_dir, "T07_RECEIPT.txt"))
+        report = board.tick()
+        self.assertEqual(report.observed, ["T07_RECEIPT.txt"])
+        self.assertEqual(len(board.events(EventType.COURT_REQUESTED)), 1)
+        self.assertEqual(len(board.jobs_for(SENTINEL_WORKFLOW)), 1)
+
+    def test_independent_fixture_file_is_accepted(self):
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        board.tick()
+        sealed = board.events(EventType.RECEIPT_SEALED)[-1]
+        path = os.path.join(board.receipts_dir, "independent_court.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "kind": INDEPENDENT_COURT_KIND,
+                "source_role": "SENTINEL",
+                "independent": True,
+                "verdict": "PASS",
+                "mission_id": sealed["mission_id"],
+                "stage_id": sealed["plan_id"],
+                "source_head": sealed["source_head"],
+                "repo": sealed["source_repo"],
+            }, fh)
+        board.ingest_court_fixture(path)
+        self.assertEqual(len(board.events(EventType.COURT_PASSED)), 1)
+        self.assertEqual(
+            board.events(EventType.COURT_PASSED)[0]["payload_ref_or_payload"]
+            ["evidence"]["kind"],
+            INDEPENDENT_COURT_KIND)
 
 
 if __name__ == "__main__":

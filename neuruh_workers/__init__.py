@@ -28,7 +28,7 @@ from .queue import JobQueue, JobState
 from .registry import Capability, StepContext, WorkerDeclaration, WorkerRegistry
 from .runner import WorkflowRunner
 from .seams import OrganRegistrationSeam, OrganSeamDeclaration
-from .switchboard import Switchboard
+from .switchboard import HUMAN_CLIPBOARD_REQUIRED, Switchboard
 
 __version__ = "1.1.0"
 
@@ -39,5 +39,5 @@ __all__ = [
     "OrganSeamDeclaration", "ReceiptType", "RetryPolicy", "SeamNotAuthorized",
     "StepContext", "StepDefinition", "StepTimeout", "Switchboard", "WorkerDeclaration",
     "WorkerRegistry", "WorkflowCatalog", "WorkflowDefinition", "WorkflowError",
-    "WorkflowRunner", "deterministic_job_id",
+    "WorkflowRunner", "deterministic_job_id", "HUMAN_CLIPBOARD_REQUIRED",
 ]

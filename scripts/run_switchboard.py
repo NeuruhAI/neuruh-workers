@@ -46,6 +46,11 @@ def main() -> int:
     p.add_argument("--authority-ref", required=True)
     p.add_argument("--source-repo", required=True)
     p.add_argument("--receipt-ref", required=True)
+    p.add_argument("--evidence-kind", required=True,
+                   help="independent_sentinel_court; reconstruction/injected kinds are refused")
+    p.add_argument("--evidence-ref", required=True,
+                   help="pointer to independent Sentinel court evidence (not the PRIME receipt)")
+    p.add_argument("--evidence-source-role", default="SENTINEL")
     p = sub.add_parser("listen")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=0)
@@ -90,6 +95,12 @@ def main() -> int:
             authority_ref=args.authority_ref,
             source_repo=args.source_repo,
             receipt_ref=args.receipt_ref,
+            evidence={
+                "kind": args.evidence_kind,
+                "ref": args.evidence_ref,
+                "source_role": args.evidence_source_role,
+                "independent": True,
+            },
         )
         report = board.tick()
         print(json.dumps({"ingested": envelope["event_id"],

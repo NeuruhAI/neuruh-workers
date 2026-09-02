@@ -64,6 +64,17 @@ T07_AXON_BRANCH = "feat/grok-sovereign-mcp-v4-20260827"
 
 DEFAULT_MISSIONS = frozenset({T07_MISSION})
 
+# First seam closes the clipboard.  Court PASS is never derived here.
+HUMAN_CLIPBOARD_REQUIRED = "NO"
+INDEPENDENT_COURT_KIND = "independent_sentinel_court"
+_FAKE_EVIDENCE_KINDS = frozenset({
+    "reconstruction",
+    "injected",
+    "prime_verdict",
+    "sentinel_closure_in_receipt",
+    "clipboard",
+})
+
 
 class SwitchboardError(DefinitionError):
     code = "SWITCHBOARD_REFUSED"
@@ -251,10 +262,16 @@ class Switchboard:
         authority_ref: str,
         source_repo: str,
         receipt_ref: str,
+        evidence: Mapping[str, Any],
         verdict_note: str = "",
         extra_payload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Ingest Sentinel's independent verdict.  Switchboard does not PASS."""
+        normalized = self._require_independent_court_evidence(
+            evidence=evidence,
+            court_job_id=court_job_id,
+            correlation_id=correlation_id,
+        )
         event_type = EventType.COURT_PASSED if passed else EventType.COURT_FAILED
         payload = {
             "court_job_id": court_job_id,
@@ -266,6 +283,11 @@ class Switchboard:
         }
         if extra_payload:
             payload.update(dict(extra_payload))
+        # Evidence and verdict are pinned after extra_payload so a caller
+        # cannot overwrite them into a fake PASS.
+        payload["evidence"] = normalized
+        payload["verdict"] = "PASS" if passed else "FAIL"
+        payload["sentinel_model_execution"] = SENTINEL_MODEL_EXECUTION
         envelope = self._emit(
             event_type,
             mission_id=mission_id,
@@ -285,7 +307,12 @@ class Switchboard:
         return envelope
 
     def ingest_court_fixture(self, path: str) -> dict[str, Any]:
-        """Inject an independent Sentinel verdict.  Never opens SECRET_POINTER."""
+        """Ingest independent Sentinel court evidence.  Never opens SECRET_POINTER.
+
+        Reconstruction / injected fixtures are refused — they are not a
+        Sentinel PASS.  SENTINEL_CLOSURE / PRIME_VERDICT on the PRIME
+        receipt are also not a PASS.
+        """
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         pointer = data.get("secret_pointer")
@@ -301,6 +328,13 @@ class Switchboard:
                 "court fixture must not carry secret file contents")
         if data.get("verdict") not in {"PASS", "FAIL"}:
             raise SwitchboardError("court fixture verdict must be PASS or FAIL")
+        if data.get("reconstruction"):
+            raise SwitchboardError(
+                "reconstruction fixtures are not independent Sentinel court "
+                "evidence; refusing fake Sentinel PASS")
+        if data.get("independent") is False:
+            raise SwitchboardError(
+                "fixture marked independent=false is not court evidence")
         mission_id = str(data.get("mission_id", ""))
         stage_id = str(data.get("stage_id", ""))
         source_head = str(data.get("source_head", "")).lower()
@@ -323,6 +357,12 @@ class Switchboard:
         court = court_events[-1]
         summary = data.get("summary") or {}
         expected = data.get("honey_pot_expected") or {}
+        evidence = {
+            "kind": data.get("kind") or INDEPENDENT_COURT_KIND,
+            "source_role": data.get("source_role") or "SENTINEL",
+            "independent": data.get("independent", True),
+            "ref": os.path.abspath(path),
+        }
         return self.record_court_outcome(
             passed=data["verdict"] == "PASS",
             court_job_id=court["payload_ref_or_payload"]["court_job_id"],
@@ -335,12 +375,13 @@ class Switchboard:
             authority_ref=sealed["authority_ref"],
             source_repo=str(data.get("repo") or sealed["source_repo"]),
             receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
+            evidence=evidence,
             verdict_note=(
-                "independent Sentinel close injected from court fixture; "
-                "Switchboard did not judge; SENTINEL_CLOSURE in the PRIME "
-                "receipt was not treated as PASS"
+                "independent Sentinel court evidence ingested from fixture; "
+                "Switchboard did not judge; SENTINEL_CLOSURE / PRIME_VERDICT "
+                "in the PRIME receipt were not treated as PASS"
             ),
-        extra_payload={
+            extra_payload={
                 "summary": {
                     "pass_count": summary.get("pass_count"),
                     "fail_count": summary.get("fail_count"),
@@ -356,6 +397,64 @@ class Switchboard:
                 "secret_file_ingested": False,
             },
         )
+
+    def _require_independent_court_evidence(
+        self,
+        *,
+        evidence: Mapping[str, Any],
+        court_job_id: str,
+        correlation_id: str,
+    ) -> dict[str, Any]:
+        """Fail closed unless evidence is independent Sentinel court, not a fake."""
+        if not isinstance(evidence, Mapping) or not evidence:
+            raise SwitchboardError(
+                "court.passed/failed requires independent court evidence")
+        if evidence.get("reconstruction"):
+            raise SwitchboardError(
+                "reconstruction is not independent Sentinel court evidence; "
+                "refusing fake Sentinel PASS")
+        if evidence.get("independent") is False:
+            raise SwitchboardError(
+                "court evidence marked independent=false is refused")
+        kind = str(evidence.get("kind") or evidence.get("evidence_kind") or "").strip()
+        if not kind or kind.lower() in _FAKE_EVIDENCE_KINDS:
+            raise SwitchboardError(
+                "court evidence kind is missing or is a fake/reconstruction PASS")
+        source_role = str(evidence.get("source_role") or "").strip().upper()
+        if source_role != "SENTINEL":
+            raise SwitchboardError(
+                "court outcome source_role must be independent SENTINEL")
+        ref = evidence.get("ref") or evidence.get("evidence_ref")
+        if not isinstance(ref, str) or not ref.strip():
+            raise SwitchboardError("court evidence requires a non-empty ref")
+        sealed = self._prior_on_chain(correlation_id, EventType.RECEIPT_SEALED)
+        if sealed is None:
+            raise SwitchboardError(
+                "court outcome requires a sealed receipt on the correlation chain")
+        court_events = [
+            e for e in self.events(EventType.COURT_REQUESTED)
+            if (e.get("payload_ref_or_payload") or {}).get("court_job_id")
+            == court_job_id
+        ]
+        if not court_events:
+            raise SwitchboardError(
+                "court.passed/failed requires a prior court.requested job artifact")
+        receipt_payload = sealed.get("payload_ref_or_payload") or {}
+        forbidden_refs = {
+            "PRIME_VERDICT",
+            "SENTINEL_CLOSURE",
+            str(receipt_payload.get("prime_verdict_in_receipt") or ""),
+            str(receipt_payload.get("sentinel_closure_in_receipt") or ""),
+        }
+        if ref in forbidden_refs:
+            raise SwitchboardError(
+                "PRIME_VERDICT / SENTINEL_CLOSURE in the receipt is not court evidence")
+        return {
+            "kind": kind,
+            "source_role": "SENTINEL",
+            "independent": True,
+            "ref": ref,
+        }
 
     def ingest_raw(self, record: Mapping[str, Any]) -> dict[str, Any]:
         """Ingest a caller-supplied envelope.  Invalid schema is deadlettered."""
