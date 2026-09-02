@@ -46,6 +46,7 @@ class EventType(str, Enum):
     COURT_PASSED = "court.passed"
     COURT_FAILED = "court.failed"
     CANDIDATE_PUSH_REQUESTED = "candidate.push.requested"
+    PROMOTION_REQUESTED = "promotion.requested"
     DEADLETTER_CREATED = "deadletter.created"
     DEADLETTER_REQUEUED = "deadletter.requeued"
     TASK_READY = "task.ready"

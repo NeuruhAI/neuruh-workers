@@ -94,6 +94,12 @@ class ReceiptType(str, Enum):
     CI_PASSED = "ci.passed"
     CI_FAILED = "ci.failed"
     PROMOTION_READY = "promotion.ready"
+    PROMOTION_REQUESTED = "promotion.requested"
+    PROMOTION_AUTHORIZED = "promotion.authorized"
+    PROMOTION_EXECUTED = "promotion.executed"
+    PROMOTION_VERIFIED = "promotion.verified"
+    PROMOTION_REFUSED = "promotion.refused"
+    DEPLOY_REQUESTED = "deploy.requested"
 
 
 # --------------------------------------------------------------------------- #

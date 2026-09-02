@@ -124,6 +124,7 @@ class Switchboard:
         fail_handler: Callable[[str], None] | None = None,
         bind_host: str = "127.0.0.1",
         git_custodian: Any = None,
+        promotion_executor: Any = None,
     ):
         if bind_host not in ("127.0.0.1", "localhost", "::1"):
             raise SwitchboardError(
@@ -138,6 +139,7 @@ class Switchboard:
         self.crash_after_lease = crash_after_lease
         self.fail_handler = fail_handler
         self.git_custodian = git_custodian
+        self.promotion_executor = promotion_executor
         self.event_ledger = ExecutionLedger(
             os.path.join(self.root, EVENTS_NAME), clock=self._clock)
         self.job_ledger = ExecutionLedger(
@@ -162,6 +164,13 @@ class Switchboard:
             consumers.append(ConsumerSpec(
                 "git-custodian.consume-push-requested.v1",
                 EventType.CANDIDATE_PUSH_REQUESTED, self.known_missions))
+        if promotion_executor is not None:
+            # Bob emits promotion.requested; the Honey Pot's promotion executor
+            # consumes it. Without an executor the event is unroutable — the
+            # Switchboard never merges anything itself.
+            consumers.append(ConsumerSpec(
+                "git-custodian.consume-promotion-requested.v1",
+                EventType.PROMOTION_REQUESTED, self.known_missions))
         self.consumers = tuple(consumers)
 
     # -- persistence ------------------------------------------------------- #
@@ -230,6 +239,7 @@ class Switchboard:
             fail_handler=self.fail_handler,
             bind_host=self.bind_host,
             git_custodian=self.git_custodian,
+            promotion_executor=self.promotion_executor,
         )
 
     def events(self, event_type: str | EventType | None = None) -> list[dict]:
@@ -767,6 +777,10 @@ class Switchboard:
             return self._unroutable(consumer, event_type)
         if event_type is EventType.CANDIDATE_PUSH_REQUESTED:
             return self._on_candidate_push_requested(envelope)
+        if event_type is EventType.PROMOTION_REQUESTED:
+            if self.promotion_executor is None:
+                return self._unroutable(consumer, event_type)
+            return self._on_promotion_requested(envelope)
         if event_type is EventType.DEADLETTER_CREATED:
             return self._unroutable(consumer, event_type)
         if event_type is EventType.DEADLETTER_REQUEUED:
@@ -900,6 +914,13 @@ class Switchboard:
         if worker is None:
             return None
         receipt = worker.handle(envelope)
+        if isinstance(receipt, Mapping):
+            return str(receipt.get("job_id") or "") or None
+        return None
+
+    def _on_promotion_requested(self, envelope: dict) -> str | None:
+        """Promotion consume: the Honey Pot executor handles the envelope."""
+        receipt = self.promotion_executor.handle(envelope)
         if isinstance(receipt, Mapping):
             return str(receipt.get("job_id") or "") or None
         return None
