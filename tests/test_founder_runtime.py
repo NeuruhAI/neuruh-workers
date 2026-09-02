@@ -24,11 +24,10 @@ from neuruh_workers.founder_runtime import (
 )
 from neuruh_workers.ledger import ExecutionLedger
 from neuruh_workers.organ_consumers import (
-    AXON_GUARDS_URL,
+    AXON_EXECUTE_URL,
     GOVERNANCE_CONSUME_URL,
     GOVERNANCE_EVALUATE_URL,
     NRH_ENVELOPE_FIELDS,
-    SENTINEL_COURT_URL,
     honey_pot_bind,
     switchboard_present,
 )
@@ -124,9 +123,12 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertFalse(result.broker_bind["may_execute"])
         methods = {(c["organ"], c["method"]) for c in result.broker_bind["calls"]}
         self.assertIn(("governance", "evaluate"), methods)
-        self.assertIn(("sentinel", "court"), methods)
-        self.assertIn(("axon", "guards"), methods)
+        self.assertIn(("sentinel", "switchboard_court_job"), methods)
+        self.assertIn(("axon", "execute"), methods)
+        self.assertEqual(result.broker_bind["sentinel"]["bind_status"], "SWITCHBOARD_ABSENT")
         self.assertTrue(any(c["attempted"] and c.get("error") for c in result.broker_bind["calls"]))
+        self.assertIn("8848", result.broker_bind["calls"][0]["url"])
+        self.assertIn("/v1/evaluate", result.broker_bind["calls"][0]["url"])
         self.assertIsNone(result.job_id)
         self.assertEqual(self.ledger.verify()["receipts"], 0)
 
@@ -247,8 +249,8 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(tuple(result.sealed_receipt), NRH_ENVELOPE_FIELDS)
         self.assertEqual(result.sealed_receipt["schema_version"], "nrh.event.v1")
         self.assertEqual(result.sealed_receipt["event_type"], "receipt.sealed")
-        self.assertEqual(result.court_request["event_type"], "court.requested")
-        self.assertEqual(tuple(result.court_request), NRH_ENVELOPE_FIELDS)
+        self.assertEqual(result.sealed_receipt["source_role"], "JGI_FOUNDER_RUNTIME")
+        self.assertNotEqual(result.sealed_receipt["source_role"], "SWITCHAROO")
         payload = result.sealed_receipt["payload_ref_or_payload"]
         self.assertEqual(payload["job_id"], result.job_id)
         self.assertEqual(payload["ledger_tail_sha"], result.ledger_tail_sha)
@@ -256,18 +258,14 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertIsNotNone(payload["job_succeeded_sha"])
         self.assertIn("required_invariants", payload)
         self.assertEqual(payload["sentinel_closure_in_receipt"], "NOT_JUDGED")
-        self.assertIsNone(result.court_request["payload_ref_or_payload"]["verdict"])
-        self.assertEqual(
-            result.court_request["payload_ref_or_payload"]["sentinel_model_execution"],
-            "BLOCKED",
-        )
         self.assertTrue(result.switchboard_emit["attempted"])
         if not switchboard_present():
-            self.assertEqual(
-                result.switchboard_emit["bind_status"],
-                "SWITCHBOARD_ABSENT_FAIL_CLOSED",
-            )
+            self.assertIsNone(result.court_request)
+            self.assertEqual(result.switchboard_emit["bind_status"], "SWITCHBOARD_ABSENT")
             self.assertEqual(result.switchboard_emit["error"], "ModuleNotFoundError")
+        else:
+            self.assertEqual(result.court_request["event_type"], "court.requested")
+            self.assertEqual(tuple(result.court_request), NRH_ENVELOPE_FIELDS)
         receipt_path = os.path.join(self.receipts_dir, f"{result.job_id}.txt")
         self.assertTrue(os.path.exists(receipt_path))
         text = Path(receipt_path).read_text(encoding="utf-8")
@@ -374,12 +372,25 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(result.status, RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED)
         self.assertIsNone(result.job_id)
         self.assertIn(GOVERNANCE_EVALUATE_URL, seen)
-        self.assertIn(SENTINEL_COURT_URL, seen)
-        self.assertIn(AXON_GUARDS_URL, seen)
+        self.assertTrue(any("8848" in url and "/v1/evaluate" in url for url in seen))
+        self.assertIn(AXON_EXECUTE_URL, seen)
+        self.assertFalse(any(":8101" in url or "/court" in url for url in seen))
+        self.assertFalse(any("/guards" in url for url in seen))
         self.assertNotIn(GOVERNANCE_CONSUME_URL, seen)
+        self.assertEqual(result.broker_bind["sentinel"]["bind_status"], "SWITCHBOARD_ABSENT")
         self.assertTrue(result.broker_bind["attempted"])
         self.assertEqual(result.broker_bind["caller_approved"], False)
         self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+    def test_organ_consumers_has_no_invented_gsa_fabric(self):
+        source = Path(REPO_ROOT / "neuruh_workers" / "organ_consumers.py").read_text(encoding="utf-8")
+        self.assertNotIn("8100", source)
+        self.assertNotIn("8101", source)
+        self.assertNotIn("/guards", source)
+        self.assertIn("8848", source)
+        self.assertIn("/v1/evaluate", source)
+        self.assertIn("IAR_HEALTH_PORT = 8090", source)
+        self.assertIn("127.0.0.1:8300/execute", source)
 
     def test_no_duplicate_switchboard_or_custodian_modules(self):
         self.assertFalse((REPO_ROOT / "neuruh_workers" / "switchboard.py").exists())

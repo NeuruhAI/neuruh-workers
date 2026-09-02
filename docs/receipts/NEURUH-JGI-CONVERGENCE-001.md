@@ -127,7 +127,7 @@ Switchboard `#2/#3` and Git Custodian `#4` were **not** merged or copied. Copyin
    No accepted-outcome compile into cheaper L0 rules. Revenue Factory `reasoning_debt.py` stays `auto_apply=False` and is out of this repo.
 
 6. **Switchboard is not on this branch.**  
-   L0/L1 success now emits `receipt.sealed` + `court.requested` as a consumer packet (and a PRIME observe file when configured). Switchboard is imported if present; otherwise `SWITCHBOARD_ABSENT_FAIL_CLOSED`. `#3` is not copied.
+   L0/L1 success emits `receipt.sealed` as a consumer packet. `court.requested` is minted only after Switchboard consumes that envelope. Otherwise `SWITCHBOARD_ABSENT` and no forged `source_role=SWITCHAROO`. `#3` is not copied.
 
 ## Lane B corrective (same PR #5 branch; not a new PR)
 
@@ -140,7 +140,7 @@ router / bus / ledger / git custodian.
 | Local USD ranker (`founder_minute_value_usd=2.0`) | **DELETED** `score_candidate`; remaining sort is layer+capability | this PR does not own spend |
 | L2/L3/L4 unbound | GET IAR `127.0.0.1:8090/health` + RF import | organs absent → `REASONING_BROKER_REQUIRED`, no enqueue |
 | COURT / `receipt.sealed` missing | emit PR #3 `nrh.event.v1` `receipt.sealed` + `court.requested`; emit is attempted | Switchboard absent → `ModuleNotFoundError` from the attempt; no vendored fork |
-| Consequential `FOUNDER_GATE_REQUIRED` | **CALLS** POST governance evaluate/consume, sentinel court, axon guards | unreachable → error from the attempt; never `approved=true`; not enqueued |
+| Consequential `FOUNDER_GATE_REQUIRED` | **CALLS** POST `8848/v1/evaluate` then consume; AXON `8300/execute` | Sentinel jobbed by SWITCHAROO after sealed receipt; absent → `SWITCHBOARD_ABSENT`; never `approved=true` |
 | `parent_mission_id` unused | **BIND** child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing → `PARENT_JOB_ABSENT_IN_LEDGER` |
 | Sibling #3/#4 not imported | import-if-present consumers only | no second `switchboard.py` or `git_custodian` |
 

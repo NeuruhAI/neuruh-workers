@@ -39,9 +39,9 @@ It consumes, and does not vendor, sibling/foreign organs:
 | WORKER | existing `JobQueue` + `WorkflowRunner` | material flags still fail closed before enqueue |
 | COURT | emits `court.requested` in PR #3 `nrh.event.v1` shape | Sentinel organ unreachable; CI `court` job is unittest only; verdict stays `None` |
 | RECEIPT | existing `ExecutionLedger` | — |
-| `receipt.sealed` | **emitted** as PR #3 `EventType.RECEIPT_SEALED` envelope after L0/L1 ledger success; emit is attempted | Switchboard module absent → `SWITCHBOARD_ABSENT_FAIL_CLOSED` from the attempted import (no vendored `switchboard.py`) |
+| `receipt.sealed` | **emitted** as PR #3 `EventType.RECEIPT_SEALED` envelope after L0/L1 ledger success; emit is attempted | Switchboard module absent → `SWITCHBOARD_ABSENT`; `court.requested` omitted (no forged organ role) |
 | AUTOMATIC PARENT RESUME | **BIND** — child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing on ledger → `PARENT_JOB_ABSENT_IN_LEDGER` |
-| Governance → Sentinel → AXON | **CALLS** POST `8100/evaluate` then `8100/consume`, `8101/court`, `8300/guards`. Caller never `approved=true` | unreachable organ → error from the attempt; work not enqueued |
+| Governance → Sentinel → AXON | **CALLS** POST `8848/v1/evaluate` then `/v1/consume` on ALLOW; AXON `8300/execute`. Caller never `approved=true` | Sentinel is jobbed by SWITCHAROO after `receipt.sealed` — module absent → `SWITCHBOARD_ABSENT`; no invented `:8101` stub |
 | HONEY POT | import-if-present consumer | custodian not copied; custody stays on PR #4 |
 
 ## What v0 actually does

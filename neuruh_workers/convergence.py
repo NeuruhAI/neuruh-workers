@@ -89,17 +89,17 @@ SPINE_OWNERS: dict[str, dict[str, str]] = {
     "GOVERNANCE": {
         "owner": "NeuruhAI/autonomous-governance-core",
         "role": "CONSUME",
-        "note": "HTTP POST 127.0.0.1:8100/evaluate then /consume; fail from the attempt",
+        "note": "HTTP POST 127.0.0.1:8848/v1/evaluate then /v1/consume on organ ALLOW",
     },
     "SENTINEL": {
         "owner": "Sentinel independent court organ",
         "role": "CONSUME",
-        "note": "HTTP POST 127.0.0.1:8101/court; CI job named court is not Sentinel",
+        "note": "jobbed by SWITCHAROO after receipt.sealed; SWITCHBOARD_ABSENT if module missing",
     },
     "AXON": {
         "owner": "NeuruhAI/neuruh-axon",
         "role": "CONSUME",
-        "note": "HTTP POST 127.0.0.1:8300/guards; OrganRegistrationSeam.activate still refuses",
+        "note": "HTTP POST 127.0.0.1:8300/execute (proven gateway); fail from the attempt",
     },
     "EXECUTION_LEDGER": {
         "owner": "NeuruhAI/neuruh-workers main ExecutionLedger",

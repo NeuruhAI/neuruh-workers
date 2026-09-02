@@ -24,12 +24,17 @@ IAR_HEALTH_HOST = "127.0.0.1"
 IAR_HEALTH_PORT = 8090
 IAR_HEALTH_PATHS = ("/health", "/v1/health")
 
-# Loopback call sites. These are dialed. Unreachable → error from the attempt.
-# AXON :8300 matches the existing OrganRegistrationSeam test convention.
-GOVERNANCE_EVALUATE_URL = "http://127.0.0.1:8100/evaluate"
-GOVERNANCE_CONSUME_URL = "http://127.0.0.1:8100/consume"
-SENTINEL_COURT_URL = "http://127.0.0.1:8101/court"
-AXON_GUARDS_URL = "http://127.0.0.1:8300/guards"
+# Existing organ call sites. Unreachable → error from the attempt.
+GOVERNANCE_EVALUATE_URL = "http://127.0.0.1:8848/v1/evaluate"
+GOVERNANCE_CONSUME_URL = "http://127.0.0.1:8848/v1/consume"
+AXON_EXECUTE_URL = "http://127.0.0.1:8300/execute"
+AXON_PROVEN_ROUTES = (
+    "/health",
+    "/execute",
+    "/api/tasks/execute",
+    "/api/tools/call",
+    "/tools",
+)
 
 RF_IMPORT_PATHS = (
     "revenue_factory.authorization",
@@ -296,22 +301,43 @@ def call_gsa(
         consume["method"] = "consume"
     calls.append(consume)
 
-    sentinel = http_post_json(
-        SENTINEL_COURT_URL,
-        {"action": action, "after": "governance.evaluate"},
-        opener=opener,
-    )
-    sentinel["organ"] = "sentinel"
-    sentinel["method"] = "court"
+    # Sentinel is an independent agent jobbed by SWITCHAROO after
+    # receipt.sealed → court.requested. Do not invent a Sentinel HTTP stub.
+    switchboard = try_import(SWITCHBOARD_MODULE)
+    if switchboard is None:
+        sentinel = {
+            "organ": "sentinel",
+            "method": "switchboard_court_job",
+            "attempted": True,
+            "url": None,
+            "ok": False,
+            "status": None,
+            "error": "SWITCHBOARD_ABSENT",
+            "decision": None,
+            "bind_status": "SWITCHBOARD_ABSENT",
+        }
+    else:
+        sentinel = {
+            "organ": "sentinel",
+            "method": "switchboard_court_job",
+            "attempted": True,
+            "url": None,
+            "ok": False,
+            "status": None,
+            "error": "NO_RECEIPT_SEALED_FOR_CONSEQUENTIAL",
+            "decision": None,
+            "bind_status": "SWITCHBOARD_PRESENT_NO_SEALED_RECEIPT",
+        }
     calls.append(sentinel)
 
     axon = http_post_json(
-        AXON_GUARDS_URL,
-        {"action": action, "after": "sentinel.court"},
+        AXON_EXECUTE_URL,
+        {"action": action, "after": "governance.evaluate", "route": "/execute"},
         opener=opener,
     )
     axon["organ"] = "axon"
-    axon["method"] = "guards"
+    axon["method"] = "execute"
+    axon["proven_routes"] = list(AXON_PROVEN_ROUTES)
     calls.append(axon)
 
     may_execute = (
@@ -337,10 +363,11 @@ def call_gsa(
             "ci_job_named_court_is_not_sentinel": True,
             "verdict": sentinel.get("decision"),
             "authorized": False,
+            "bind_status": sentinel.get("bind_status"),
         },
         "axon": {
             "owner": "NeuruhAI/neuruh-axon",
-            "guards": axon,
+            "execute": axon,
             "activated": False,
             "authorized": False,
             "executed": False,
@@ -498,7 +525,7 @@ def attempt_switchboard_emit(
             "switchboard_present": False,
             "consumed": False,
             "error": "ModuleNotFoundError",
-            "bind_status": "SWITCHBOARD_ABSENT_FAIL_CLOSED",
+            "bind_status": "SWITCHBOARD_ABSENT",
         }
     if not switchboard_root or not receipts_dir:
         return {
@@ -625,39 +652,43 @@ def emit_receipt_sealed_and_court_request(
         receipts_dir=receipts_dir,
         switchboard_root=switchboard_root,
     )
-    court_payload = {
-        "court_job_id": None,
-        "mission": mission_id,
-        "stage": "jgi-founder-runtime",
-        "claimer": "JGI_FOUNDER_RUNTIME",
-        "receipt_ref": sealed_payload["receipt_ref"],
-        "source_head": head,
-        "required_invariants": list(RECEIPT_SEALED_INVARIANTS),
-        "authority_ref": "jgi-founder-runtime-l0-readonly",
-        "sentinel_model_execution": "BLOCKED",
-        "verdict": None,
-        "ledger_tail_sha": ledger_tail_sha,
-        "context_digest": context_digest,
-        "evidence_refs": evidence,
-        "job_id": job_id,
-        "job_succeeded_sha": job_succeeded_sha,
-    }
-    court = build_nrh_event_v1(
-        event_type=EVENT_COURT_REQUESTED,
-        mission_id=mission_id,
-        plan_id="jgi-founder-runtime",
-        task_id=job_id,
-        correlation_id=correlation_id,
-        causation_id=sealed["event_id"],
-        source_role="SWITCHAROO",
-        source_component="founder-runtime-switcharoo-consumer",
-        source_repo="NeuruhAI/neuruh-workers",
-        source_head=head,
-        created_at=utc_now(),
-        authority_ref="jgi-founder-runtime-l0-readonly",
-        payload=court_payload,
-        idempotency_key=f"{EVENT_COURT_REQUESTED}|{job_succeeded_sha or ledger_tail_sha}",
-    )
+    # court.requested exists only when Switchboard actually consumed
+    # receipt.sealed. Do not forge source_role=SWITCHAROO on a local envelope.
+    court = None
+    if emit.get("consumed"):
+        court_payload = {
+            "court_job_id": None,
+            "mission": mission_id,
+            "stage": "jgi-founder-runtime",
+            "claimer": "JGI_FOUNDER_RUNTIME",
+            "receipt_ref": sealed_payload["receipt_ref"],
+            "source_head": head,
+            "required_invariants": list(RECEIPT_SEALED_INVARIANTS),
+            "authority_ref": "jgi-founder-runtime-l0-readonly",
+            "sentinel_model_execution": "BLOCKED",
+            "verdict": None,
+            "ledger_tail_sha": ledger_tail_sha,
+            "context_digest": context_digest,
+            "evidence_refs": evidence,
+            "job_id": job_id,
+            "job_succeeded_sha": job_succeeded_sha,
+        }
+        court = build_nrh_event_v1(
+            event_type=EVENT_COURT_REQUESTED,
+            mission_id=mission_id,
+            plan_id="jgi-founder-runtime",
+            task_id=job_id,
+            correlation_id=correlation_id,
+            causation_id=sealed["event_id"],
+            source_role="SWITCHAROO",
+            source_component="switchboard-first-seam",
+            source_repo="NeuruhAI/neuruh-workers",
+            source_head=head,
+            created_at=utc_now(),
+            authority_ref="jgi-founder-runtime-l0-readonly",
+            payload=court_payload,
+            idempotency_key=f"{EVENT_COURT_REQUESTED}|{job_succeeded_sha or ledger_tail_sha}",
+        )
     honey = honey_pot_bind()
     return {
         "sealed": sealed,
