@@ -26,9 +26,10 @@ from .contracts import JobStatus, canonical_json, content_sha
 from .convergence import GSA_AUTHORITY_PATH
 from .definitions import WorkflowCatalog
 from .organ_consumers import (
+    HttpOpen,
     bind_iar_rf,
+    call_gsa,
     emit_receipt_sealed_and_court_request,
-    gsa_bind,
     job_succeeded_sha,
     resolve_source_head,
     resume_parent_from_receipts,
@@ -128,18 +129,6 @@ class WorkCandidate:
 
 
 @dataclass(frozen=True)
-class CandidateScore:
-    """Non-authorizing L0/L1 path pre-filter. Not spend authority."""
-
-    candidate_id: str
-    layer: str
-    layer_rank: int
-    latency_minutes: float
-    authorizes_spend: bool = False
-    authorizes_model_call: bool = False
-
-
-@dataclass(frozen=True)
 class RuntimeResult:
     mission_id: str
     status: RuntimeStatus
@@ -159,6 +148,7 @@ class RuntimeResult:
     parent_resume: Mapping[str, Any] | None = None
     sealed_receipt: Mapping[str, Any] | None = None
     court_request: Mapping[str, Any] | None = None
+    switchboard_emit: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -181,32 +171,19 @@ def founder_gate_reasons(candidate: WorkCandidate) -> tuple[str, ...]:
     return tuple(reasons)
 
 
-def score_candidate(
-    mission: MissionIntent,
-    candidate: WorkCandidate,
-) -> CandidateScore:
-    """Pre-filter only. Does not price work or authorize spend/model calls.
-
-    Mission economic hints (expected_value_usd, model_budget_usd) stay on
-    the intent as metadata. Spend authority is IAR / Revenue Factory.
-    """
-    del mission  # economic hints are not spend authority here
-    return CandidateScore(
-        candidate_id=candidate.candidate_id,
-        layer=candidate.layer.value,
-        layer_rank=_LAYER_ORDER[candidate.layer],
-        latency_minutes=candidate.estimated_latency_minutes,
-        authorizes_spend=False,
-        authorizes_model_call=False,
-    )
-
-
-def rank_candidates(mission: MissionIntent, candidates: Sequence[WorkCandidate]) -> list[tuple[WorkCandidate, CandidateScore]]:
+def rank_candidates(mission: MissionIntent, candidates: Sequence[WorkCandidate]) -> list[WorkCandidate]:
+    """Layer + capability order only. Not spend authority. USD ranker deleted."""
+    del mission  # economic hints are metadata, not a local utility function
     if not candidates:
         raise ValueError("at least one work candidate is required")
-    ranked = [(candidate, score_candidate(mission, candidate)) for candidate in candidates]
-    ranked.sort(key=lambda pair: (pair[1].layer_rank, pair[1].latency_minutes, pair[0].candidate_id))
-    return ranked
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            _LAYER_ORDER[candidate.layer],
+            candidate.workflow_name,
+            candidate.candidate_id,
+        ),
+    )
 
 
 def compile_context(
@@ -266,6 +243,7 @@ class FounderRuntime:
         switchboard_root: str | None = None,
         source_head: str | None = None,
         iar_probe: Callable[[], Mapping[str, Any]] | None = None,
+        http_open: HttpOpen | None = None,
     ) -> None:
         self.queue = queue
         self.catalog = catalog
@@ -274,6 +252,7 @@ class FounderRuntime:
         self.switchboard_root = switchboard_root
         self.source_head = source_head
         self.iar_probe = iar_probe
+        self.http_open = http_open
 
     def dispatch(
         self,
@@ -283,13 +262,13 @@ class FounderRuntime:
         auto_execute_read_only: bool = True,
         state_delta: Mapping[str, Any] | None = None,
     ) -> RuntimeResult:
-        candidate, score = rank_candidates(mission, candidates)[0]
+        candidate = rank_candidates(mission, candidates)[0]
         context = compile_context(mission, candidate, state_delta=state_delta)
         context_digest = content_sha(context)
         gates = founder_gate_reasons(candidate)
 
         if gates:
-            bind = gsa_bind(reasons=gates)
+            bind = call_gsa(reasons=gates, opener=self.http_open)
             return RuntimeResult(
                 mission_id=mission.mission_id,
                 status=RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED,
@@ -306,7 +285,11 @@ class FounderRuntime:
             )
 
         if candidate.layer in {IntelligenceLayer.L2, IntelligenceLayer.L3, IntelligenceLayer.L4}:
-            bind = bind_iar_rf(context_digest=context_digest, health_probe=self.iar_probe)
+            bind = bind_iar_rf(
+                context_digest=context_digest,
+                health_probe=self.iar_probe,
+                opener=self.http_open,
+            )
             return RuntimeResult(
                 mission_id=mission.mission_id,
                 status=RuntimeStatus.REASONING_BROKER_REQUIRED,
@@ -325,7 +308,7 @@ class FounderRuntime:
         definition = self.catalog.get(candidate.workflow_name)
         if not definition.read_only:
             reasons = ("NON_READ_ONLY_WORKFLOW",)
-            bind = gsa_bind(reasons=reasons)
+            bind = call_gsa(reasons=reasons, opener=self.http_open)
             return RuntimeResult(
                 mission_id=mission.mission_id,
                 status=RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED,
@@ -339,24 +322,6 @@ class FounderRuntime:
                 authority_path=GSA_AUTHORITY_PATH,
                 broker_bind=bind,
                 note="non-read-only work is consequential; Governance → Sentinel → AXON required",
-            )
-
-        # Local ranker must not authorize spend even for L0/L1 path choice.
-        if score.authorizes_spend or score.authorizes_model_call:
-            bind = bind_iar_rf(context_digest=context_digest, health_probe=self.iar_probe)
-            return RuntimeResult(
-                mission_id=mission.mission_id,
-                status=RuntimeStatus.REASONING_BROKER_REQUIRED,
-                candidate_id=candidate.candidate_id,
-                workflow_name=candidate.workflow_name,
-                layer=candidate.layer.value,
-                utility_usd=0.0,
-                founder_gate_reasons=(),
-                context_digest=context_digest,
-                compiled_context=context,
-                authority_path="revenue_factory.authorization->aegis.iar_v2",
-                broker_bind=bind,
-                note="path ranker attempted spend/model authority; refused",
             )
 
         dedupe_key = content_sha({
@@ -389,6 +354,7 @@ class FounderRuntime:
         chain = self.queue.ledger.verify()
         sealed = None
         court = None
+        switchboard_emit = None
         parent_resume = None
         if status in {RuntimeStatus.SUCCEEDED, RuntimeStatus.ALREADY_SUCCEEDED}:
             emission = emit_receipt_sealed_and_court_request(
@@ -404,6 +370,7 @@ class FounderRuntime:
             )
             sealed = emission["sealed"]
             court = emission["court_request"]
+            switchboard_emit = emission["emit"]
             if mission.parent_mission_id:
                 parent_resume = resume_parent_from_receipts(
                     self.queue,
@@ -437,5 +404,6 @@ class FounderRuntime:
             parent_resume=parent_resume,
             sealed_receipt=sealed,
             court_request=court,
+            switchboard_emit=switchboard_emit,
             note="existing deterministic workflow reused; queue/runner/ledger remain canonical",
         )

@@ -34,21 +34,21 @@ It consumes, and does not vendor, sibling/foreign organs:
 |---|---|---|
 | INTENT | `MissionIntent` on this PR | — |
 | CONTEXT COMPILER | pointer packet, no chat/transcript | — |
-| CHEAPEST CAPABLE ROUTER (L0/L1) | layer/latency **pre-filter only**; no hardcoded USD spend | does not authorize spend or model calls |
-| CHEAPEST CAPABLE ROUTER (L2/L3/L4) | probes IAR health + RF import | no organ → no enqueue, no model call, no local auth |
+| CHEAPEST CAPABLE ROUTER (L0/L1) | **DELETED** USD `score_candidate` (`$2` / `$0.05` gone). Remaining sort is layer+capability only | this PR does not own spend |
+| CHEAPEST CAPABLE ROUTER (L2/L3/L4) | GET IAR `127.0.0.1:8090/health` + RF import | no organ → no enqueue, no model call |
 | WORKER | existing `JobQueue` + `WorkflowRunner` | material flags still fail closed before enqueue |
-| COURT | emits `court.requested` packet with evidence SHAs | Sentinel organ absent; CI `court` job is unittest only; verdict stays `None` |
+| COURT | emits `court.requested` in PR #3 `nrh.event.v1` shape | Sentinel organ unreachable; CI `court` job is unittest only; verdict stays `None` |
 | RECEIPT | existing `ExecutionLedger` | — |
-| `receipt.sealed` | emitted after receipted worker result; PRIME observe file if `receipts_dir` set | Switchboard module not on this branch → `SWITCHBOARD_ABSENT_FAIL_CLOSED` (no vendored `switchboard.py`) |
-| AUTOMATIC PARENT RESUME | child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing on ledger → `PARENT_JOB_ABSENT_IN_LEDGER` |
-| Governance → Sentinel → AXON | named path; evaluate+consume if importable; caller never `approved=true` | organs absent → consequential work not enqueued |
+| `receipt.sealed` | **emitted** as PR #3 `EventType.RECEIPT_SEALED` envelope after L0/L1 ledger success; emit is attempted | Switchboard module absent → `SWITCHBOARD_ABSENT_FAIL_CLOSED` from the attempted import (no vendored `switchboard.py`) |
+| AUTOMATIC PARENT RESUME | **BIND** — child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing on ledger → `PARENT_JOB_ABSENT_IN_LEDGER` |
+| Governance → Sentinel → AXON | **CALLS** POST `8100/evaluate` then `8100/consume`, `8101/court`, `8300/guards`. Caller never `approved=true` | unreachable organ → error from the attempt; work not enqueued |
 | HONEY POT | import-if-present consumer | custodian not copied; custody stays on PR #4 |
 
 ## What v0 actually does
 
 `MissionIntent` + candidate paths enter the Founder Runtime. The runtime:
 
-1. pre-filters candidate paths by intelligence layer then latency (not USD);
+1. selects among already-valid paths by intelligence layer then capability name (USD ranker deleted);
 2. prefers cheaper layers when both are valid;
 3. compiles a <=4 KiB pointer-heavy context packet instead of replaying a chat transcript;
 4. stops consequential gates (money, external message, production mutation, irreversible action, private-IP risk, non-read-only) as `GOVERNANCE_SENTINEL_AXON_REQUIRED` — founder is not the executor and never sets `approved=true`;

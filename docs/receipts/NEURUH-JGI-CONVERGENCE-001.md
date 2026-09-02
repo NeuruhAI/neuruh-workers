@@ -64,7 +64,7 @@ Can PR #5 **own/integrate** (not recreate) the existing organism spine:
 |---|---|---|---|
 | INTENT | `FounderRuntime.MissionIntent` (this PR) | **OWN** | no |
 | CONTEXT COMPILER | `FounderRuntime.compile_context` (this PR) | **OWN** | no |
-| CHEAPEST CAPABLE ROUTER (L0/L1 paths) | `FounderRuntime.rank_candidates` (this PR) | **OWN** as path ranker only | reconciled: not IAR |
+| CHEAPEST CAPABLE ROUTER (L0/L1 paths) | USD `score_candidate` **DELETED** | layer+capability sort only | spend is IAR/RF |
 | CHEAPEST CAPABLE ROUTER (L2/L3/L4 inference) | `NeuruhAI/aegis` `core/iar` + `NeuruhAI/neuruh-live-integration#1` `revenue_factory/authorization.py` (`InferenceAuthorization`, `ConsumptionLedger`) | **CONSUME** (named bind, `authorized=false`) | was unbound status-only; smallest seam now names the contract |
 | WORKER | `neuruh-workers` main `WorkerRegistry` + sample workflows | **REUSE** | no |
 | COURT | `neuruh-workers#3` Switchboard `court.requested` (`SENTINEL_MODEL_EXECUTION=BLOCKED`); Switchboard does not declare PASS | **CONSUME** (not copied onto this branch) | sibling unmerged PR |
@@ -136,11 +136,11 @@ router / bus / ledger / git custodian.
 
 | Court defect | Binding | Still fail-closed |
 |---|---|---|
-| Local USD ranker (`founder_minute_value_usd=2.0`) | deleted; L0/L1 is layer/latency pre-filter only | ranker cannot authorize spend or model calls |
-| L2/L3/L4 unbound | `bind_iar_rf` probes `127.0.0.1:8090` health JSON + RF `InferenceAuthorization` import | organs absent → `REASONING_BROKER_REQUIRED`, no enqueue |
-| COURT / `receipt.sealed` missing | emit `receipt.sealed` + `court.requested` with evidence refs/SHAs; write PRIME observe file when `receipts_dir` set | `switchboard.py` not on this branch → `SWITCHBOARD_ABSENT_FAIL_CLOSED`; no vendored fork |
-| Consequential `FOUNDER_GATE_REQUIRED` | `GOVERNANCE_SENTINEL_AXON_REQUIRED`; evaluate+consume if importable; caller never `approved=true` | G/S/A absent → not enqueued |
-| `parent_mission_id` unused | child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing → `PARENT_JOB_ABSENT_IN_LEDGER` |
+| Local USD ranker (`founder_minute_value_usd=2.0`) | **DELETED** `score_candidate`; remaining sort is layer+capability | this PR does not own spend |
+| L2/L3/L4 unbound | GET IAR `127.0.0.1:8090/health` + RF import | organs absent → `REASONING_BROKER_REQUIRED`, no enqueue |
+| COURT / `receipt.sealed` missing | emit PR #3 `nrh.event.v1` `receipt.sealed` + `court.requested`; emit is attempted | Switchboard absent → `ModuleNotFoundError` from the attempt; no vendored fork |
+| Consequential `FOUNDER_GATE_REQUIRED` | **CALLS** POST governance evaluate/consume, sentinel court, axon guards | unreachable → error from the attempt; never `approved=true`; not enqueued |
+| `parent_mission_id` unused | **BIND** child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing → `PARENT_JOB_ABSENT_IN_LEDGER` |
 | Sibling #3/#4 not imported | import-if-present consumers only | no second `switchboard.py` or `git_custodian` |
 
 This is an implementation bind on the existing draft PR. It is **not** Sentinel PASS,

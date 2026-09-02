@@ -32,9 +32,9 @@ SPINE_OWNERS: dict[str, dict[str, str]] = {
         "note": "<=4 KiB pointer packet; no chat/transcript field",
     },
     "CHEAPEST_CAPABLE_ROUTER_L0_L1": {
-        "owner": "NeuruhAI/neuruh-workers#5 FounderRuntime.rank_candidates",
-        "role": "OWN",
-        "note": "non-authorizing layer/latency pre-filter; no USD spend authority",
+        "owner": "NeuruhAI/aegis iar_v2 + Revenue Factory (spend); this PR deleted USD utility",
+        "role": "DELETE",
+        "note": "score_candidate USD ranker deleted; remaining sort is layer+capability only",
     },
     "CHEAPEST_CAPABLE_ROUTER_L2_L4": {
         "owner": "NeuruhAI/aegis iar_v2 + NeuruhAI/neuruh-live-integration#1 revenue_factory/authorization.py",
@@ -89,17 +89,17 @@ SPINE_OWNERS: dict[str, dict[str, str]] = {
     "GOVERNANCE": {
         "owner": "NeuruhAI/autonomous-governance-core",
         "role": "CONSUME",
-        "note": "evaluate+consume if importable; caller never sets approved=true",
+        "note": "HTTP POST 127.0.0.1:8100/evaluate then /consume; fail from the attempt",
     },
     "SENTINEL": {
         "owner": "Sentinel independent court organ",
         "role": "CONSUME",
-        "note": "not a CI job name; verdict stays None until the organ courts",
+        "note": "HTTP POST 127.0.0.1:8101/court; CI job named court is not Sentinel",
     },
     "AXON": {
         "owner": "NeuruhAI/neuruh-axon",
         "role": "CONSUME",
-        "note": "ToolRegistry/guards/receipts; OrganRegistrationSeam.activate refuses in v1",
+        "note": "HTTP POST 127.0.0.1:8300/guards; OrganRegistrationSeam.activate still refuses",
     },
     "EXECUTION_LEDGER": {
         "owner": "NeuruhAI/neuruh-workers main ExecutionLedger",
@@ -126,7 +126,6 @@ SPINE_OWNERS: dict[str, dict[str, str]] = {
 THIS_PR_MAY_OWN = frozenset({
     "INTENT",
     "CONTEXT_COMPILER",
-    "CHEAPEST_CAPABLE_ROUTER_L0_L1",
 })
 
 THIS_PR_REUSES = frozenset({
@@ -145,6 +144,7 @@ THIS_PR_MUST_NOT_OWN = frozenset({
     "GOVERNANCE",
     "SENTINEL",
     "AXON",
+    "CHEAPEST_CAPABLE_ROUTER_L0_L1",
     "CHEAPEST_CAPABLE_ROUTER_L2_L4",
     "OUTCOME_LEARNING",
     "COURT",

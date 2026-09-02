@@ -1,8 +1,9 @@
 """Thin consumers for organs this PR must not rebuild.
 
-Founder Runtime may import or probe existing seams. It may not vendor
-Switchboard, Git Custodian, IAR, Revenue Factory, Governance, Sentinel,
-or AXON. Missing organs fail closed. Callers never set approved=true.
+Calls existing seams. Does not vendor Switchboard, Git Custodian, IAR,
+Revenue Factory, Governance, Sentinel, or AXON. Missing organs fail from
+the attempted call, not from a pre-filled authorized=False struct.
+Callers never set approved=true.
 """
 from __future__ import annotations
 
@@ -12,9 +13,10 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
-from .contracts import JobStatus, ReceiptType, content_sha
+from .contracts import JobStatus, ReceiptType, canonical_json, content_sha
 from .queue import JobQueue
 from .runner import WorkflowRunner
 
@@ -22,22 +24,16 @@ IAR_HEALTH_HOST = "127.0.0.1"
 IAR_HEALTH_PORT = 8090
 IAR_HEALTH_PATHS = ("/health", "/v1/health")
 
+# Loopback call sites. These are dialed. Unreachable → error from the attempt.
+# AXON :8300 matches the existing OrganRegistrationSeam test convention.
+GOVERNANCE_EVALUATE_URL = "http://127.0.0.1:8100/evaluate"
+GOVERNANCE_CONSUME_URL = "http://127.0.0.1:8100/consume"
+SENTINEL_COURT_URL = "http://127.0.0.1:8101/court"
+AXON_GUARDS_URL = "http://127.0.0.1:8300/guards"
+
 RF_IMPORT_PATHS = (
     "revenue_factory.authorization",
     "revenue_factory",
-)
-GOVERNANCE_IMPORT_PATHS = (
-    "autonomous_governance_core",
-    "governance_core",
-    "neuruh_governance",
-)
-SENTINEL_IMPORT_PATHS = (
-    "neuruh_sentinel",
-    "sentinel",
-)
-AXON_IMPORT_PATHS = (
-    "neuruh_axon",
-    "axon",
 )
 SWITCHBOARD_MODULE = "neuruh_workers.switchboard"
 EVENTS_MODULE = "neuruh_workers.events"
@@ -45,6 +41,44 @@ GIT_CUSTODIAN_MODULE = "neuruh_workers.git_custodian"
 
 GSA_AUTHORITY_PATH = "governance->sentinel->axon"
 PARENT_REQUESTED_BY_PREFIX = "jgi:"
+
+# PR #3 nrh.event.v1 contract (consume the shape; do not vendor events.py).
+NRH_EVENT_V1 = "nrh.event.v1"
+NRH_ENVELOPE_FIELDS = (
+    "schema_version",
+    "event_id",
+    "event_type",
+    "mission_id",
+    "plan_id",
+    "task_id",
+    "correlation_id",
+    "causation_id",
+    "source_role",
+    "source_component",
+    "source_repo",
+    "source_head",
+    "created_at",
+    "authority_ref",
+    "payload_hash",
+    "payload_ref_or_payload",
+    "idempotency_key",
+    "attempt",
+    "max_attempts",
+    "ack_state",
+)
+EVENT_RECEIPT_SEALED = "receipt.sealed"
+EVENT_COURT_REQUESTED = "court.requested"
+RECEIPT_SEALED_INVARIANTS = (
+    "envelope.valid",
+    "hash.matches_if_provided",
+    "source_identity.coherent",
+    "mission_stage.unambiguous",
+    "authority.present",
+    "loopback_only",
+    "sentinel_closure_in_receipt_is_not_pass",
+)
+
+HttpOpen = Callable[..., Any]
 
 
 def try_import(module_name: str) -> Any | None:
@@ -78,14 +112,64 @@ def resolve_source_head(explicit: str | None = None) -> str:
     return "0" * 40
 
 
-def default_iar_health_probe(timeout_s: float = 0.25) -> dict[str, Any]:
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def http_post_json(
+    url: str,
+    payload: Mapping[str, Any],
+    *,
+    timeout_s: float = 0.25,
+    opener: HttpOpen | None = None,
+) -> dict[str, Any]:
+    """Dial a loopback organ. Failure is the exception from the attempt."""
+    body = canonical_json(dict(payload)).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    open_fn = opener or urllib.request.urlopen
+    try:
+        with open_fn(request, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+            status = int(getattr(resp, "status", 200))
+            data = json.loads(raw) if raw else {}
+            if not isinstance(data, dict):
+                data = {}
+            return {
+                "attempted": True,
+                "url": url,
+                "ok": 200 <= status < 300,
+                "status": status,
+                "error": None,
+                "decision": data.get("decision") or data.get("status") or data.get("verdict"),
+            }
+    except Exception as exc:  # noqa: BLE001 — fail closed from the attempt
+        return {
+            "attempted": True,
+            "url": url,
+            "ok": False,
+            "status": None,
+            "error": f"{type(exc).__name__}",
+            "decision": None,
+        }
+
+
+def default_iar_health_probe(
+    timeout_s: float = 0.25,
+    opener: HttpOpen | None = None,
+) -> dict[str, Any]:
     """Loopback IAR health JSON only. Not a model router or provider client."""
     last_reason = "unreachable"
+    open_fn = opener or urllib.request.urlopen
     for path in IAR_HEALTH_PATHS:
         url = f"http://{IAR_HEALTH_HOST}:{IAR_HEALTH_PORT}{path}"
         try:
             request = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(request, timeout=timeout_s) as resp:
+            with open_fn(request, timeout=timeout_s) as resp:
                 raw = resp.read().decode("utf-8")
             data = json.loads(raw)
             if not isinstance(data, dict):
@@ -94,6 +178,7 @@ def default_iar_health_probe(timeout_s: float = 0.25) -> dict[str, Any]:
                     "url": url,
                     "reason": "health_not_json_object",
                     "authorized": False,
+                    "attempted": True,
                 }
             allowed = ("status", "ok", "healthy", "service", "name", "version")
             return {
@@ -101,6 +186,7 @@ def default_iar_health_probe(timeout_s: float = 0.25) -> dict[str, Any]:
                 "url": url,
                 "health": {key: data[key] for key in allowed if key in data},
                 "authorized": False,
+                "attempted": True,
             }
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             last_reason = type(exc).__name__
@@ -110,6 +196,7 @@ def default_iar_health_probe(timeout_s: float = 0.25) -> dict[str, Any]:
         "url": f"http://{IAR_HEALTH_HOST}:{IAR_HEALTH_PORT}/health",
         "reason": last_reason,
         "authorized": False,
+        "attempted": True,
     }
 
 
@@ -139,9 +226,13 @@ def bind_iar_rf(
     *,
     context_digest: str,
     health_probe: Callable[[], Mapping[str, Any]] | None = None,
+    opener: HttpOpen | None = None,
 ) -> dict[str, Any]:
-    """Name and probe the existing IAR/RF contract. Never issue or consume auth."""
-    iar = dict((health_probe or default_iar_health_probe)())
+    """Call the IAR health contract. Never issue or consume authorization."""
+    if health_probe is not None:
+        iar = dict(health_probe())
+    else:
+        iar = default_iar_health_probe(opener=opener)
     rf = import_inference_authorization()
     organs_present = bool(iar.get("present")) and bool(rf.get("present"))
     return {
@@ -162,6 +253,7 @@ def bind_iar_rf(
         "model_call": False,
         "required_authorization_id": None,
         "context_digest": context_digest,
+        "attempted": bool(iar.get("attempted", True)),
         "gap": None if organs_present else (
             "IAR loopback health and/or Revenue Factory InferenceAuthorization absent; "
             "L2/L3/L4 fail closed"
@@ -169,127 +261,100 @@ def bind_iar_rf(
     }
 
 
-def _first_import(paths: Sequence[str]) -> tuple[str | None, Any | None]:
-    for name in paths:
-        module = try_import(name)
-        if module is not None:
-            return name, module
-    return None, None
-
-
-def try_governance_evaluate(action: Mapping[str, Any]) -> dict[str, Any]:
-    """Consume Governance evaluate+consume if present. Caller never approves."""
-    name, module = _first_import(GOVERNANCE_IMPORT_PATHS)
-    bind: dict[str, Any] = {
-        "owner": "NeuruhAI/autonomous-governance-core",
-        "present": module is not None,
-        "module": name,
-        "caller_approved": False,
-        "authorized": False,
-        "consumed": False,
-    }
-    if module is None:
-        bind["gap"] = "autonomous-governance-core is not importable on this branch"
-        return bind
-    evaluate = getattr(module, "evaluate", None)
-    consume = getattr(module, "consume", None)
-    if not callable(evaluate):
-        bind["gap"] = "governance module present but evaluate() is missing"
-        return bind
-    try:
-        verdict = evaluate(dict(action))
-    except Exception as exc:  # noqa: BLE001 — fail closed; do not approve
-        bind["gap"] = f"governance.evaluate refused ({type(exc).__name__})"
-        return bind
-    bind["evaluate_result"] = verdict if isinstance(verdict, (str, int, bool)) else type(verdict).__name__
-    allowed = verdict in {"ALLOW", "ALLOWED", True} or (
-        isinstance(verdict, Mapping) and verdict.get("decision") in {"ALLOW", "ALLOWED"}
-    )
-    if allowed and callable(consume):
-        try:
-            consume(dict(action))
-            bind["consumed"] = True
-        except Exception as exc:  # noqa: BLE001 — fail closed
-            bind["gap"] = f"governance.consume refused ({type(exc).__name__})"
-            return bind
-    # Even after a foreign ALLOW, this caller still does not set approved=true.
-    bind["organ_allow"] = bool(allowed)
-    bind["authorized"] = False
-    return bind
-
-
-def try_sentinel_bind() -> dict[str, Any]:
-    name, module = _first_import(SENTINEL_IMPORT_PATHS)
-    switchboard = try_import(SWITCHBOARD_MODULE)
-    return {
-        "owner": "Sentinel independent court organ",
-        "present": module is not None,
-        "module": name,
-        "ci_job_named_court_is_not_sentinel": True,
-        "switchboard_court_job_seam": switchboard is not None,
-        "verdict": None,
-        "authorized": False,
-        "gap": None if module is not None else (
-            "Sentinel court organ is not importable; CI unittest job is not Sentinel"
-        ),
-    }
-
-
-def try_axon_bind() -> dict[str, Any]:
-    name, module = _first_import(AXON_IMPORT_PATHS)
-    tool_registry = getattr(module, "ToolRegistry", None) if module is not None else None
-    return {
-        "owner": "NeuruhAI/neuruh-axon",
-        "present": module is not None,
-        "module": name,
-        "tool_registry": tool_registry is not None,
-        "activated": False,
-        "authorized": False,
-        "executed": False,
-        "gap": None if module is not None else (
-            "neuruh-axon is not importable; OrganRegistrationSeam.activate remains refused in v1"
-        ),
-    }
-
-
-def gsa_bind(*, reasons: tuple[str, ...]) -> dict[str, Any]:
-    """Governance → Sentinel → AXON only. Missing organs fail closed."""
+def call_gsa(
+    *,
+    reasons: tuple[str, ...],
+    opener: HttpOpen | None = None,
+) -> dict[str, Any]:
+    """CALL Governance → Sentinel → AXON. Fail from the attempt, never self-approve."""
     action = {
         "kind": "consequential",
         "reasons": list(reasons),
         "path": GSA_AUTHORITY_PATH,
+        "caller_approved": False,
     }
-    governance = try_governance_evaluate(action)
-    sentinel = try_sentinel_bind()
-    axon = try_axon_bind()
-    organs_present = bool(
-        governance.get("present") and sentinel.get("present") and axon.get("present")
+    calls: list[dict[str, Any]] = []
+
+    evaluate = http_post_json(GOVERNANCE_EVALUATE_URL, action, opener=opener)
+    evaluate["organ"] = "governance"
+    evaluate["method"] = "evaluate"
+    calls.append(evaluate)
+
+    consume = {
+        "organ": "governance",
+        "method": "consume",
+        "attempted": False,
+        "url": GOVERNANCE_CONSUME_URL,
+        "ok": False,
+        "error": "skipped_evaluate_did_not_allow",
+        "decision": None,
+    }
+    organ_allow = bool(evaluate.get("ok") and evaluate.get("decision") in {"ALLOW", "ALLOWED", "PASS"})
+    if organ_allow:
+        consume = http_post_json(GOVERNANCE_CONSUME_URL, action, opener=opener)
+        consume["organ"] = "governance"
+        consume["method"] = "consume"
+    calls.append(consume)
+
+    sentinel = http_post_json(
+        SENTINEL_COURT_URL,
+        {"action": action, "after": "governance.evaluate"},
+        opener=opener,
     )
-    organ_allow = bool(governance.get("organ_allow")) and sentinel.get("verdict") == "PASS"
-    # Execution requires all three live organs plus their own allow. This
-    # package never supplies approved=true and never activates AXON itself.
+    sentinel["organ"] = "sentinel"
+    sentinel["method"] = "court"
+    calls.append(sentinel)
+
+    axon = http_post_json(
+        AXON_GUARDS_URL,
+        {"action": action, "after": "sentinel.court"},
+        opener=opener,
+    )
+    axon["organ"] = "axon"
+    axon["method"] = "guards"
+    calls.append(axon)
+
     may_execute = (
-        organs_present
-        and organ_allow
-        and bool(governance.get("consumed"))
-        and bool(axon.get("activated"))
-        and governance.get("caller_approved") is False
+        organ_allow
+        and bool(consume.get("ok"))
+        and sentinel.get("decision") == "PASS"
+        and bool(axon.get("ok"))
     )
+    errors = [c.get("error") for c in calls if c.get("attempted") and c.get("error")]
     return {
         "path": GSA_AUTHORITY_PATH,
-        "governance": governance,
-        "sentinel": sentinel,
-        "axon": axon,
-        "policy_gate": "NeuruhAI/neuruh-policy-gate",
+        "calls": calls,
+        "governance": {
+            "owner": "NeuruhAI/autonomous-governance-core",
+            "evaluate": evaluate,
+            "consume": consume,
+            "caller_approved": False,
+            "authorized": False,
+        },
+        "sentinel": {
+            "owner": "Sentinel independent court organ",
+            "court": sentinel,
+            "ci_job_named_court_is_not_sentinel": True,
+            "verdict": sentinel.get("decision"),
+            "authorized": False,
+        },
+        "axon": {
+            "owner": "NeuruhAI/neuruh-axon",
+            "guards": axon,
+            "activated": False,
+            "authorized": False,
+            "executed": False,
+        },
         "reasons": list(reasons),
-        "organs_present": organs_present,
         "authorized": False,
         "executed": False,
         "enqueued": False,
         "caller_approved": False,
         "may_execute": bool(may_execute),
-        "gap": None if organs_present else (
-            "Governance, Sentinel, and/or AXON absent; consequential work not enqueued"
+        "attempted": True,
+        "error": errors[0] if errors else None,
+        "gap": None if may_execute else (
+            "GSA call failed closed from the attempt; consequential work not enqueued"
         ),
     }
 
@@ -315,6 +380,68 @@ def honey_pot_bind() -> dict[str, Any]:
 
 def switchboard_present() -> bool:
     return try_import(SWITCHBOARD_MODULE) is not None
+
+
+def event_id_for(*, event_type: str, idempotency_key: str, causation_id: str = "") -> str:
+    return "evt-" + content_sha({
+        "event_type": event_type,
+        "idempotency_key": idempotency_key,
+        "causation_id": causation_id,
+    })[:24]
+
+
+def build_nrh_event_v1(
+    *,
+    event_type: str,
+    mission_id: str,
+    plan_id: str,
+    task_id: str,
+    correlation_id: str,
+    causation_id: str,
+    source_role: str,
+    source_component: str,
+    source_repo: str,
+    source_head: str,
+    created_at: str,
+    authority_ref: str,
+    payload: Mapping[str, Any],
+    idempotency_key: str,
+    attempt: int = 1,
+    max_attempts: int = 3,
+    ack_state: str = "PENDING",
+) -> dict[str, Any]:
+    """Consumer of PR #3 EventType envelope. Field set must match nrh.event.v1."""
+    body = {
+        "schema_version": NRH_EVENT_V1,
+        "event_id": event_id_for(
+            event_type=event_type,
+            idempotency_key=idempotency_key,
+            causation_id=causation_id,
+        ),
+        "event_type": event_type,
+        "mission_id": mission_id,
+        "plan_id": plan_id,
+        "task_id": task_id,
+        "correlation_id": correlation_id,
+        "causation_id": causation_id,
+        "source_role": source_role,
+        "source_component": source_component,
+        "source_repo": source_repo,
+        "source_head": source_head,
+        "created_at": created_at,
+        "authority_ref": authority_ref,
+        "payload_hash": content_sha(dict(payload)),
+        "payload_ref_or_payload": dict(payload),
+        "idempotency_key": idempotency_key,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "ack_state": ack_state,
+    }
+    if tuple(body) != NRH_ENVELOPE_FIELDS:
+        raise ValueError("nrh.event.v1 field set drifted from PR #3 contract")
+    if body["payload_hash"] != content_sha(body["payload_ref_or_payload"]):
+        raise ValueError("payload_hash does not match payload")
+    return body
 
 
 def _prime_receipt_text(
@@ -354,6 +481,69 @@ def _prime_receipt_text(
     return "\n".join(lines) + "\n"
 
 
+def attempt_switchboard_emit(
+    envelope: Mapping[str, Any],
+    *,
+    receipts_dir: str | None = None,
+    switchboard_root: str | None = None,
+) -> dict[str, Any]:
+    """Attempt to hand the envelope to Switchboard. Absence is a failed call."""
+    sb_mod = try_import(SWITCHBOARD_MODULE)
+    events_mod = try_import(EVENTS_MODULE)
+    if events_mod is not None and hasattr(events_mod, "validate_envelope"):
+        events_mod.validate_envelope(dict(envelope))
+    if sb_mod is None:
+        return {
+            "attempted": True,
+            "switchboard_present": False,
+            "consumed": False,
+            "error": "ModuleNotFoundError",
+            "bind_status": "SWITCHBOARD_ABSENT_FAIL_CLOSED",
+        }
+    if not switchboard_root or not receipts_dir:
+        return {
+            "attempted": True,
+            "switchboard_present": True,
+            "consumed": False,
+            "error": "SwitchboardPresentUnwired",
+            "bind_status": "SWITCHBOARD_PRESENT_UNWIRED_FAIL_CLOSED",
+        }
+    switchboard_cls = getattr(sb_mod, "Switchboard", None)
+    if switchboard_cls is None:
+        return {
+            "attempted": True,
+            "switchboard_present": True,
+            "consumed": False,
+            "error": "SwitchboardClassMissing",
+            "bind_status": "SWITCHBOARD_PRESENT_UNWIRED_FAIL_CLOSED",
+        }
+    try:
+        board = switchboard_cls(
+            switchboard_root,
+            receipts_dir=receipts_dir,
+            known_missions=frozenset({envelope["mission_id"]}),
+        )
+        if hasattr(board, "ingest_raw"):
+            board.ingest_raw(dict(envelope))
+        else:
+            board.tick()
+        return {
+            "attempted": True,
+            "switchboard_present": True,
+            "consumed": True,
+            "error": None,
+            "bind_status": "SWITCHBOARD_CONSUMED",
+        }
+    except Exception as exc:  # noqa: BLE001 — fail closed from the attempt
+        return {
+            "attempted": True,
+            "switchboard_present": True,
+            "consumed": False,
+            "error": type(exc).__name__,
+            "bind_status": "SWITCHBOARD_EMIT_REFUSED",
+        }
+
+
 def emit_receipt_sealed_and_court_request(
     *,
     mission_id: str,
@@ -366,12 +556,7 @@ def emit_receipt_sealed_and_court_request(
     receipts_dir: str | None = None,
     switchboard_root: str | None = None,
 ) -> dict[str, Any]:
-    """Emit receipt.sealed + COURT_REQUEST onto the SWITCHAROO seam.
-
-    If ``neuruh_workers.switchboard`` is on this branch, tick it. If it exists
-    only on sibling PR #3, keep the packet and optional PRIME observe file and
-    fail closed rather than vendoring a fork. This is not a new event bus.
-    """
+    """Emit receipt.sealed + court.requested in the PR #3 nrh.event.v1 shape."""
     head = resolve_source_head(source_head)
     evidence = list(evidence_refs)
     receipt_ref = ""
@@ -389,77 +574,97 @@ def emit_receipt_sealed_and_court_request(
                 source_head=head,
             ))
 
-    idempotency = f"receipt.sealed|{job_id}|{ledger_tail_sha}"
-    sealed = {
-        "event_type": "receipt.sealed",
-        "mission_id": mission_id,
-        "job_id": job_id,
+    created_at = utc_now()
+    correlation_id = "corr-" + content_sha({
+        "mission": mission_id,
+        "stage": "jgi-founder-runtime",
+        "head": head,
+    })[:24]
+    sealed_payload = {
+        "receipt_ref": receipt_ref or f"ledger:{job_id}",
+        "receipt_sha": job_succeeded_sha or ledger_tail_sha,
+        "mission": mission_id,
+        "stage": "jgi-founder-runtime",
+        "claimer": "JGI_FOUNDER_RUNTIME",
+        "repo": "NeuruhAI/neuruh-workers",
+        "worktree": "",
+        "branch": "feature/jgi-founder-runtime-v0-20260901",
+        "head": head,
+        "remote": "origin",
+        "expected_pr": "5",
+        "expected_pr_url": "https://github.com/NeuruhAI/neuruh-workers/pull/5",
+        "expected_pr_draft": "YES",
+        "bind": "loopback_only",
+        "sentinel_closure_in_receipt": "NOT_JUDGED",
+        "clipboard_defect": None,
+        "required_invariants": list(RECEIPT_SEALED_INVARIANTS),
         "ledger_tail_sha": ledger_tail_sha,
         "context_digest": context_digest,
         "evidence_refs": evidence,
+        "job_id": job_id,
         "job_succeeded_sha": job_succeeded_sha,
-        "receipt_ref": receipt_ref or None,
-        "source_head": head,
-        "source_role": "JGI_FOUNDER_RUNTIME",
-        "source_component": "founder-runtime",
-        "idempotency_key": idempotency,
-        "event_id": "evt-" + content_sha({
-            "event_type": "receipt.sealed",
-            "idempotency_key": idempotency,
-        })[:24],
-        "sentinel_verdict": None,
-        "sentinel_model_execution": "BLOCKED",
     }
-    court = {
-        "event_type": "court.requested",
-        "mission_id": mission_id,
-        "job_id": job_id,
-        "ledger_tail_sha": ledger_tail_sha,
-        "context_digest": context_digest,
-        "evidence_refs": evidence,
-        "job_succeeded_sha": job_succeeded_sha,
+    sealed = build_nrh_event_v1(
+        event_type=EVENT_RECEIPT_SEALED,
+        mission_id=mission_id,
+        plan_id="jgi-founder-runtime",
+        task_id=job_id,
+        correlation_id=correlation_id,
+        causation_id="",
+        source_role="JGI_FOUNDER_RUNTIME",
+        source_component="founder-runtime",
+        source_repo="NeuruhAI/neuruh-workers",
+        source_head=head,
+        created_at=created_at,
+        authority_ref="jgi-founder-runtime-l0-readonly",
+        payload=sealed_payload,
+        idempotency_key=f"{EVENT_RECEIPT_SEALED}|{job_succeeded_sha or ledger_tail_sha}",
+    )
+    emit = attempt_switchboard_emit(
+        sealed,
+        receipts_dir=receipts_dir,
+        switchboard_root=switchboard_root,
+    )
+    court_payload = {
+        "court_job_id": None,
+        "mission": mission_id,
+        "stage": "jgi-founder-runtime",
+        "claimer": "JGI_FOUNDER_RUNTIME",
+        "receipt_ref": sealed_payload["receipt_ref"],
         "source_head": head,
+        "required_invariants": list(RECEIPT_SEALED_INVARIANTS),
+        "authority_ref": "jgi-founder-runtime-l0-readonly",
         "sentinel_model_execution": "BLOCKED",
         "verdict": None,
-        "causation_id": sealed["event_id"],
-        "idempotency_key": f"court.requested|{job_id}|{ledger_tail_sha}",
+        "ledger_tail_sha": ledger_tail_sha,
+        "context_digest": context_digest,
+        "evidence_refs": evidence,
+        "job_id": job_id,
+        "job_succeeded_sha": job_succeeded_sha,
     }
-    court["event_id"] = "evt-" + content_sha({
-        "event_type": "court.requested",
-        "idempotency_key": court["idempotency_key"],
-        "causation_id": sealed["event_id"],
-    })[:24]
-
-    sb_mod = try_import(SWITCHBOARD_MODULE)
-    events_mod = try_import(EVENTS_MODULE)
+    court = build_nrh_event_v1(
+        event_type=EVENT_COURT_REQUESTED,
+        mission_id=mission_id,
+        plan_id="jgi-founder-runtime",
+        task_id=job_id,
+        correlation_id=correlation_id,
+        causation_id=sealed["event_id"],
+        source_role="SWITCHAROO",
+        source_component="founder-runtime-switcharoo-consumer",
+        source_repo="NeuruhAI/neuruh-workers",
+        source_head=head,
+        created_at=utc_now(),
+        authority_ref="jgi-founder-runtime-l0-readonly",
+        payload=court_payload,
+        idempotency_key=f"{EVENT_COURT_REQUESTED}|{job_succeeded_sha or ledger_tail_sha}",
+    )
     honey = honey_pot_bind()
-    bind_status = "SWITCHBOARD_ABSENT_FAIL_CLOSED"
-    consumed = False
-    if sb_mod is not None and switchboard_root and receipts_dir:
-        switchboard_cls = getattr(sb_mod, "Switchboard", None)
-        if switchboard_cls is not None:
-            board = switchboard_cls(
-                switchboard_root,
-                receipts_dir=receipts_dir,
-                known_missions=frozenset({mission_id}),
-            )
-            board.tick()
-            bind_status = "SWITCHBOARD_CONSUMED"
-            consumed = True
-    elif sb_mod is not None:
-        bind_status = "SWITCHBOARD_PRESENT_UNWIRED_FAIL_CLOSED"
-    elif events_mod is not None:
-        bind_status = "EVENTS_PRESENT_SWITCHBOARD_ABSENT_FAIL_CLOSED"
-
-    sealed["switchboard_module"] = SWITCHBOARD_MODULE
-    sealed["switchboard_present"] = sb_mod is not None
-    sealed["events_module_present"] = events_mod is not None
-    sealed["bind_status"] = bind_status
-    sealed["consumed"] = consumed
-    sealed["honey_pot"] = honey
-    court["bind_status"] = bind_status
-    court["switchboard_present"] = sb_mod is not None
-    return {"sealed": sealed, "court_request": court}
+    return {
+        "sealed": sealed,
+        "court_request": court,
+        "emit": emit,
+        "honey_pot": honey,
+    }
 
 
 def job_succeeded_sha(queue: JobQueue, job_id: str) -> str | None:
