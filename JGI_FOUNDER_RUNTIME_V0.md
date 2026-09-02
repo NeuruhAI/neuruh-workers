@@ -26,7 +26,7 @@ It consumes, and does not vendor, sibling/foreign organs:
 - Revenue Factory `InferenceAuthorization`
 - Governance (`NeuruhAI/autonomous-governance-core` evaluate+consume)
 - Sentinel (independent court organ; not a CI job name)
-- AXON (`NeuruhAI/neuruh-axon` ToolRegistry/guards/receipts)
+- AXON (`NeuruhAI/neuruh-axon`; proven routes only after Switchboard consumes `receipt.sealed`)
 
 ## Bound vs fail-closed (Lane B corrective)
 
@@ -54,7 +54,7 @@ It consumes, and does not vendor, sibling/foreign organs:
 4. stops consequential gates (money, external message, production mutation, irreversible action, private-IP risk, non-read-only) as `GOVERNANCE_SENTINEL_AXON_REQUIRED` — founder is not the executor and never sets `approved=true`;
 5. refuses to self-authorize L2/L3/L4 inference and returns `REASONING_BROKER_REQUIRED` bound to the IAR/RF contract (`iar_v2` health JSON + `InferenceAuthorization`);
 6. for safe L0/L1 read-only work, reuses the existing queue/runner and **autonomously enqueues + executes** the workflow;
-7. after a receipted worker result, emits `receipt.sealed` and a `COURT_REQUEST` packet onto the SWITCHAROO seam (or fail-closed documents the missing module);
+7. after a receipted worker result, hands `receipt.sealed` to Switchboard via `neuruh_workers.events` when that module is importable; this PR does not mint `court.requested`; missing events/switchboard → `SWITCHBOARD_ABSENT` with no home-grown envelope;
 8. if `parent_mission_id` is set, resumes existing parent jobs from the ledger;
 9. repeated identical dispatch resolves to the same job and does not re-run completed work.
 
@@ -74,7 +74,7 @@ Jeramie intent
   -> deterministic JobQueue
   -> WorkflowRunner
   -> hash-chained receipts
-  -> receipt.sealed + court.requested (SWITCHAROO consume / fail-closed)
+  -> receipt.sealed via neuruh_workers.events (Switchboard consume / fail-closed; this PR does not mint court.requested)
   -> automatic parent resume from ledger
 ```
 

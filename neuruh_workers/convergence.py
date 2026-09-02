@@ -6,7 +6,7 @@ may do locally:
 
 - L0/L1 non-authorizing path pre-filter + read-only dispatch through JobQueue/WorkflowRunner
 - pointer-heavy context compilation
-- emit receipt.sealed / court.requested onto the SWITCHAROO seam when present
+- hand receipt.sealed to SWITCHAROO via neuruh_workers.events when present; this PR does not mint court.requested
 - resume existing parent jobs from ExecutionLedger
 - fail-closed handoff to existing owners for everything else
 

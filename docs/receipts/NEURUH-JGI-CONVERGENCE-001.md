@@ -21,11 +21,15 @@ CONVERGENCE_SEAM_HEAD=f9c640af784bc435c466ccfc804deefb8a3ef72a
 LANE_B_CORRECTIVE=YES
 LANE_B_IMPLEMENTATION_HEAD=45189f606883d79d994b2c52ff0c633b49cdb589
 R2_CALL_BIND_HEAD=6ed1550026edf1dbff75411fde248ba3b637292f
+R4_COURTED_HEAD=bde445294fe453298f04243d8f5b4e3d91ebe719
+R4_VERDICT=PASS_WITH_EXCEPTIONS
+R4_READY_TO_MERGE=NO
 BASE=main@05c669afa0d922607c290d86b98142bf0aec6a3f
 BRANCH=feature/jgi-founder-runtime-v0-20260901
 COURT_AGENT=https://cursor.com/agents/bc-d263ce40-be40-463d-b8ec-522b63a983ba
 
 PRIOR_COURT_VERDICT=HOLD
+R4_COURT_VERDICT=PASS_WITH_EXCEPTIONS
 SENTINEL_VERDICT=NOT_JUDGED
 ARCHITECTURE_COURT_PASS=NO
 MERGED=NO
@@ -146,6 +150,20 @@ router / bus / ledger / git custodian.
 
 This is an implementation bind on the existing draft PR. It is **not** Sentinel PASS,
 **not** architecture court PASS, and **not** a merge.
+
+## R4 exceptions (not ready_to_merge)
+
+Architecture court R4 of `bde445294fe453298f04243d8f5b4e3d91ebe719` was
+`PASS_WITH_EXCEPTIONS`. That is not `ready_to_merge`. Correctives on this
+same draft PR #5 branch, without claiming a later court PASS:
+
+1. `nrh.event.v1` stays on SWITCHAROO (`neuruh_workers.events`). This PR
+   no longer clones `NRH_ENVELOPE_FIELDS` / `build_nrh_event_v1`. Events or
+   Switchboard absent → `SWITCHBOARD_ABSENT`, no home-grown 20-field envelope.
+2. This PR does not mint `court.requested`. Switchboard jobs Sentinel after
+   it consumes `receipt.sealed`. Module absent → omit `court.requested`.
+3. `call_gsa` does not POST AXON `/execute` when Switchboard is absent.
+4. PR #5 body Current head is the real branch SHA, not stale `09608f6`.
 
 ## What this PR may own after HOLD is cleared
 
