@@ -565,11 +565,11 @@ class PromotionExecutor:
         if pr is None:
             raise self._refuse("PR_MISSING", "the custody PR does not exist",
                                repo=repo, pr=promotion["pr_number"])
-        if pr.merged:
-            return self._already_promoted(promotion, pr, job_id, authority)
-        if pr.state != "OPEN":
-            raise self._refuse("PR_NOT_OPEN", "the custody PR is not open",
-                               state=pr.state)
+        # Identity is proven for EVERY promotion, merged or not. These checks
+        # used to live below the already-merged short circuit, so a PR someone
+        # had merged by hand at a head nobody courted came back as a proven
+        # promotion: the replay path asked only whether the base contained the
+        # courted head, which stays true for any descendant merge.
         if pr.head_branch != branch or pr.base_branch != base:
             raise self._refuse("PR_MISMATCH", "PR branches do not match the promotion",
                                pr_head=pr.head_branch, pr_base=pr.base_branch)
@@ -579,6 +579,11 @@ class PromotionExecutor:
         if pr.head_sha and pr.head_sha != head:
             raise self._refuse("HEAD_DRIFT", "PR head is not the courted head",
                                pr_head=pr.head_sha, expected=head)
+        if pr.merged:
+            return self._already_promoted(promotion, pr, job_id, authority)
+        if pr.state != "OPEN":
+            raise self._refuse("PR_NOT_OPEN", "the custody PR is not open",
+                               state=pr.state)
 
         # Gate 3: the heads are what the court and the custody saw.
         self.git.fetch(worktree, remote)
@@ -621,10 +626,20 @@ class PromotionExecutor:
         }, job_id, ReceiptType.PROMOTION_AUTHORIZED)
 
         # Head re-checked at the last instant, then enforced by the merge itself.
+        # Both coordinates the ALLOW's precondition_hash binds are re-read at
+        # the last instant. The head alone was checked here once, which left the
+        # base free to move during the authorize round trip: the merge would
+        # then land on a base Governance never authorized, and the containment
+        # check afterwards could not tell the difference.
         self.git.fetch(worktree, remote)
         if self.git.remote_head(worktree, remote, branch) != head:
             raise self._refuse("HEAD_DRIFT", "candidate branch moved after authorization",
                                expected=head)
+        base_now = self.git.remote_head(worktree, remote, base)
+        if base_now != base_head:
+            raise self._refuse("BASE_DRIFT", "base branch moved after authorization; the "
+                               "authorized precondition no longer holds",
+                               remote=base_now, expected=base_head)
         if pr.draft:
             assert_action_allowed(authority, "PR_READY")
             pr = self.pr.mark_ready(pr)
@@ -683,29 +698,71 @@ class PromotionExecutor:
 
     def _already_promoted(self, promotion: Mapping[str, Any], pr: PullRequest,
                           job_id: str, authority: Mapping[str, Any]) -> dict[str, Any]:
-        """Replay: the PR is merged. Prove the base contains it; ask nothing, merge nothing."""
+        """Replay: the PR is merged. PROVE it is the promotion that was authorized.
+
+        A merged pull request is not by itself evidence that this executor, or
+        anything else holding an authorization, performed the merge. Sentinel,
+        custody, the authority policy and the PR's identity have already been
+        verified by the caller; what remains is to prove that the merge on the
+        canonical base is the one the court and the custody describe:
+
+          * the PR names a merge commit (a merged PR that cannot say what it
+            merged proves nothing);
+          * the canonical base still descends from the base that was courted, so
+            the branch was not reset or replaced underneath the promotion;
+          * the base contains the courted head; and
+          * the base contains that merge commit.
+
+        Any gap is MERGED_UNVERIFIED and refuses. Nothing is merged here and
+        Governance is not asked: there is no act left to authorize.
+        """
         worktree, remote = promotion["worktree"], promotion["remote_name"]
+        base_branch, head = promotion["base_branch"], promotion["expected_head"]
+        base_head = promotion["expected_base_head"]
         self.git.fetch(worktree, remote)
-        base_after = self.git.remote_head(worktree, remote, promotion["base_branch"])
+        base_after = self.git.remote_head(worktree, remote, base_branch)
         merge_sha = (pr.merge_commit_sha or "").lower()
-        contained = bool(
-            base_after
-            and self.git.is_ancestor(worktree, promotion["expected_head"], base_after)
-            and (not merge_sha or base_after == merge_sha
-                 or self.git.is_ancestor(worktree, merge_sha, base_after)))
-        if not contained:
+        checks = {
+            "merge_commit_recorded": bool(merge_sha),
+            "base_readable": bool(base_after),
+            "base_descends_from_courted_base": bool(
+                base_after and self.git.is_ancestor(worktree, base_head, base_after)),
+            "base_contains_courted_head": bool(
+                base_after and self.git.is_ancestor(worktree, head, base_after)),
+            "base_contains_merge": bool(
+                base_after and merge_sha
+                and (base_after == merge_sha
+                     or self.git.is_ancestor(worktree, merge_sha, base_after))),
+        }
+        failed = [name for name, ok in checks.items() if not ok]
+        if failed:
             raise self._refuse(
                 "PR_ALREADY_MERGED_UNVERIFIED",
-                "the PR reports merged but the base does not provably contain the head",
-                base_after=base_after, merge_sha=merge_sha)
+                "MERGED_UNVERIFIED: the merged PR is not provably the authorized promotion",
+                unproven=failed, base_after=base_after, merge_sha=merge_sha,
+                expected_head=head, expected_base_head=base_head)
         self._emit("promotion.verified", {
-            "job_id": job_id, "merge_sha": merge_sha, "base_after": base_after,
-            "contains_head": True, "pr": pr.number, "replay": True,
+            "job_id": job_id, "merge_sha": merge_sha, "base_before": base_head,
+            "base_after": base_after, "contains_head": True, "pr": pr.number,
+            "replay": True, "proven": sorted(checks),
         }, job_id, ReceiptType.PROMOTION_VERIFIED)
+        # A deploy child is part of the promotion, not part of the merge. If the
+        # process died between the merge and the child, the replay is the only
+        # thing that can still emit it; reporting "none required" would bury the
+        # gap in a receipt that claims success.
+        deploy_child = None
+        if promotion.get("deploy_required"):
+            deploy_child = {
+                "job_id": job_id, "repo": promotion["repo"], "sha": merge_sha,
+                "target": promotion.get("deploy_target") or "",
+                "mission_id": promotion["mission_id"], "replay": True,
+                "note": "child request re-emitted on replay; no deploy is performed here",
+            }
+            self._emit("deploy.requested", deploy_child, job_id, ReceiptType.DEPLOY_REQUESTED)
         return self._receipt(
             promotion, authority, None, None, job_id,
             merge_sha=merge_sha, base_after=base_after, pr=pr,
-            idempotency="PROVEN", deploy_child=None, drift="NO")
+            idempotency="PROVEN", deploy_child=deploy_child, drift="NO")
 
     # -- receipts ---------------------------------------------------------- #
 
