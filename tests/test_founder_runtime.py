@@ -27,7 +27,6 @@ from neuruh_workers.organ_consumers import (
     AXON_EXECUTE_URL,
     GOVERNANCE_CONSUME_URL,
     GOVERNANCE_EVALUATE_URL,
-    NRH_ENVELOPE_FIELDS,
     honey_pot_bind,
     switchboard_present,
 )
@@ -124,8 +123,10 @@ class FounderRuntimeCourt(unittest.TestCase):
         methods = {(c["organ"], c["method"]) for c in result.broker_bind["calls"]}
         self.assertIn(("governance", "evaluate"), methods)
         self.assertIn(("sentinel", "switchboard_court_job"), methods)
-        self.assertIn(("axon", "execute"), methods)
         self.assertEqual(result.broker_bind["sentinel"]["bind_status"], "SWITCHBOARD_ABSENT")
+        axon_call = next(c for c in result.broker_bind["calls"] if c["organ"] == "axon")
+        self.assertFalse(axon_call["attempted"])
+        self.assertEqual(axon_call["error"], "SWITCHBOARD_ABSENT")
         self.assertTrue(any(c["attempted"] and c.get("error") for c in result.broker_bind["calls"]))
         self.assertIn("8848", result.broker_bind["calls"][0]["url"])
         self.assertIn("/v1/evaluate", result.broker_bind["calls"][0]["url"])
@@ -246,32 +247,17 @@ class FounderRuntimeCourt(unittest.TestCase):
     def test_receipt_sealed_and_court_request_emitted(self):
         result = self.runtime.dispatch(self.mission(), [self.property_candidate()])
         self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
-        self.assertEqual(tuple(result.sealed_receipt), NRH_ENVELOPE_FIELDS)
-        self.assertEqual(result.sealed_receipt["schema_version"], "nrh.event.v1")
-        self.assertEqual(result.sealed_receipt["event_type"], "receipt.sealed")
-        self.assertEqual(result.sealed_receipt["source_role"], "JGI_FOUNDER_RUNTIME")
-        self.assertNotEqual(result.sealed_receipt["source_role"], "SWITCHAROO")
-        payload = result.sealed_receipt["payload_ref_or_payload"]
-        self.assertEqual(payload["job_id"], result.job_id)
-        self.assertEqual(payload["ledger_tail_sha"], result.ledger_tail_sha)
-        self.assertIn("workflow:property-research@1.0.0", payload["evidence_refs"])
-        self.assertIsNotNone(payload["job_succeeded_sha"])
-        self.assertIn("required_invariants", payload)
-        self.assertEqual(payload["sentinel_closure_in_receipt"], "NOT_JUDGED")
         self.assertTrue(result.switchboard_emit["attempted"])
+        self.assertIsNone(result.court_request)
+        self.assertNotEqual(result.sealed_receipt.get("source_role"), "SWITCHAROO")
+        self.assertFalse(result.sealed_receipt.get("home_grown_envelope", False))
+        self.assertEqual(result.sealed_receipt.get("schema_owner"), "neuruh_workers.events")
         if not switchboard_present():
-            self.assertIsNone(result.court_request)
             self.assertEqual(result.switchboard_emit["bind_status"], "SWITCHBOARD_ABSENT")
-            self.assertEqual(result.switchboard_emit["error"], "ModuleNotFoundError")
-        else:
-            self.assertEqual(result.court_request["event_type"], "court.requested")
-            self.assertEqual(tuple(result.court_request), NRH_ENVELOPE_FIELDS)
-        receipt_path = os.path.join(self.receipts_dir, f"{result.job_id}.txt")
-        self.assertTrue(os.path.exists(receipt_path))
-        text = Path(receipt_path).read_text(encoding="utf-8")
-        self.assertIn("EVENT_TARGET=receipt.sealed", text)
-        self.assertIn("SENTINEL_CLOSURE=NOT_JUDGED", text)
-        self.assertNotIn("SENTINEL_CLOSURE=PASS", text)
+            self.assertEqual(result.sealed_receipt["bind_status"], "SWITCHBOARD_ABSENT")
+            self.assertNotIn("schema_version", result.sealed_receipt)
+            self.assertNotIn("ack_state", result.sealed_receipt)
+            self.assertFalse((Path(self.receipts_dir) / f"{result.job_id}.txt").exists())
 
     def test_parent_resume_from_paused_parent_job(self):
         parent_def = self.catalog.get("property-research")
@@ -373,11 +359,13 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertIsNone(result.job_id)
         self.assertIn(GOVERNANCE_EVALUATE_URL, seen)
         self.assertTrue(any("8848" in url and "/v1/evaluate" in url for url in seen))
-        self.assertIn(AXON_EXECUTE_URL, seen)
-        self.assertFalse(any(":8101" in url or "/court" in url for url in seen))
+        self.assertNotIn(AXON_EXECUTE_URL, seen)
+        self.assertFalse(any(":8300" in url for url in seen))
         self.assertFalse(any("/guards" in url for url in seen))
         self.assertNotIn(GOVERNANCE_CONSUME_URL, seen)
         self.assertEqual(result.broker_bind["sentinel"]["bind_status"], "SWITCHBOARD_ABSENT")
+        axon_call = next(c for c in result.broker_bind["calls"] if c["organ"] == "axon")
+        self.assertFalse(axon_call["attempted"])
         self.assertTrue(result.broker_bind["attempted"])
         self.assertEqual(result.broker_bind["caller_approved"], False)
         self.assertEqual(self.ledger.verify()["receipts"], 0)
@@ -390,7 +378,8 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertIn("8848", source)
         self.assertIn("/v1/evaluate", source)
         self.assertIn("IAR_HEALTH_PORT = 8090", source)
-        self.assertIn("127.0.0.1:8300/execute", source)
+        self.assertNotIn("NRH_ENVELOPE_FIELDS", source)
+        self.assertNotIn("def build_nrh_event_v1", source)
 
     def test_no_duplicate_switchboard_or_custodian_modules(self):
         self.assertFalse((REPO_ROOT / "neuruh_workers" / "switchboard.py").exists())

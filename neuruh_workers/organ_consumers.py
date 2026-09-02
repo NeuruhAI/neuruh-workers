@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
-from .contracts import JobStatus, ReceiptType, canonical_json, content_sha
+from .contracts import JobStatus, ReceiptType, canonical_json
 from .queue import JobQueue
 from .runner import WorkflowRunner
 
@@ -46,42 +46,6 @@ GIT_CUSTODIAN_MODULE = "neuruh_workers.git_custodian"
 
 GSA_AUTHORITY_PATH = "governance->sentinel->axon"
 PARENT_REQUESTED_BY_PREFIX = "jgi:"
-
-# PR #3 nrh.event.v1 contract (consume the shape; do not vendor events.py).
-NRH_EVENT_V1 = "nrh.event.v1"
-NRH_ENVELOPE_FIELDS = (
-    "schema_version",
-    "event_id",
-    "event_type",
-    "mission_id",
-    "plan_id",
-    "task_id",
-    "correlation_id",
-    "causation_id",
-    "source_role",
-    "source_component",
-    "source_repo",
-    "source_head",
-    "created_at",
-    "authority_ref",
-    "payload_hash",
-    "payload_ref_or_payload",
-    "idempotency_key",
-    "attempt",
-    "max_attempts",
-    "ack_state",
-)
-EVENT_RECEIPT_SEALED = "receipt.sealed"
-EVENT_COURT_REQUESTED = "court.requested"
-RECEIPT_SEALED_INVARIANTS = (
-    "envelope.valid",
-    "hash.matches_if_provided",
-    "source_identity.coherent",
-    "mission_stage.unambiguous",
-    "authority.present",
-    "loopback_only",
-    "sentinel_closure_in_receipt_is_not_pass",
-)
 
 HttpOpen = Callable[..., Any]
 
@@ -330,14 +294,21 @@ def call_gsa(
         }
     calls.append(sentinel)
 
-    axon = http_post_json(
-        AXON_EXECUTE_URL,
-        {"action": action, "after": "governance.evaluate", "route": "/execute"},
-        opener=opener,
-    )
-    axon["organ"] = "axon"
-    axon["method"] = "execute"
-    axon["proven_routes"] = list(AXON_PROVEN_ROUTES)
+    # AXON execute is only legal after Switchboard consumed receipt.sealed
+    # so Sentinel can be jobbed. Do not POST /execute on SWITCHBOARD_ABSENT.
+    axon = {
+        "organ": "axon",
+        "method": "execute",
+        "attempted": False,
+        "url": AXON_EXECUTE_URL,
+        "ok": False,
+        "status": None,
+        "error": (
+            "SWITCHBOARD_ABSENT" if switchboard is None
+            else "NO_CONSUMED_RECEIPT_SEALED"
+        ),
+        "decision": None,
+    }
     calls.append(axon)
 
     may_execute = (
@@ -407,68 +378,6 @@ def honey_pot_bind() -> dict[str, Any]:
 
 def switchboard_present() -> bool:
     return try_import(SWITCHBOARD_MODULE) is not None
-
-
-def event_id_for(*, event_type: str, idempotency_key: str, causation_id: str = "") -> str:
-    return "evt-" + content_sha({
-        "event_type": event_type,
-        "idempotency_key": idempotency_key,
-        "causation_id": causation_id,
-    })[:24]
-
-
-def build_nrh_event_v1(
-    *,
-    event_type: str,
-    mission_id: str,
-    plan_id: str,
-    task_id: str,
-    correlation_id: str,
-    causation_id: str,
-    source_role: str,
-    source_component: str,
-    source_repo: str,
-    source_head: str,
-    created_at: str,
-    authority_ref: str,
-    payload: Mapping[str, Any],
-    idempotency_key: str,
-    attempt: int = 1,
-    max_attempts: int = 3,
-    ack_state: str = "PENDING",
-) -> dict[str, Any]:
-    """Consumer of PR #3 EventType envelope. Field set must match nrh.event.v1."""
-    body = {
-        "schema_version": NRH_EVENT_V1,
-        "event_id": event_id_for(
-            event_type=event_type,
-            idempotency_key=idempotency_key,
-            causation_id=causation_id,
-        ),
-        "event_type": event_type,
-        "mission_id": mission_id,
-        "plan_id": plan_id,
-        "task_id": task_id,
-        "correlation_id": correlation_id,
-        "causation_id": causation_id,
-        "source_role": source_role,
-        "source_component": source_component,
-        "source_repo": source_repo,
-        "source_head": source_head,
-        "created_at": created_at,
-        "authority_ref": authority_ref,
-        "payload_hash": content_sha(dict(payload)),
-        "payload_ref_or_payload": dict(payload),
-        "idempotency_key": idempotency_key,
-        "attempt": attempt,
-        "max_attempts": max_attempts,
-        "ack_state": ack_state,
-    }
-    if tuple(body) != NRH_ENVELOPE_FIELDS:
-        raise ValueError("nrh.event.v1 field set drifted from PR #3 contract")
-    if body["payload_hash"] != content_sha(body["payload_ref_or_payload"]):
-        raise ValueError("payload_hash does not match payload")
-    return body
 
 
 def _prime_receipt_text(
@@ -583,9 +492,40 @@ def emit_receipt_sealed_and_court_request(
     receipts_dir: str | None = None,
     switchboard_root: str | None = None,
 ) -> dict[str, Any]:
-    """Emit receipt.sealed + court.requested in the PR #3 nrh.event.v1 shape."""
+    """Hand a receipted L0/L1 result to SWITCHAROO. Do not clone nrh.event.v1."""
+    events = try_import(EVENTS_MODULE)
+    switchboard = try_import(SWITCHBOARD_MODULE)
+    honey = honey_pot_bind()
+    absent = {
+        "bind_status": "SWITCHBOARD_ABSENT",
+        "attempted": True,
+        "consumed": False,
+        "events_present": events is not None,
+        "switchboard_present": switchboard is not None,
+        "schema_owner": EVENTS_MODULE,
+        "home_grown_envelope": False,
+        "job_id": job_id,
+        "ledger_tail_sha": ledger_tail_sha,
+        "job_succeeded_sha": job_succeeded_sha,
+        "context_digest": context_digest,
+        "evidence_refs": list(evidence_refs),
+    }
+    if events is None or switchboard is None:
+        emit = {
+            "attempted": True,
+            "switchboard_present": switchboard is not None,
+            "consumed": False,
+            "error": "ModuleNotFoundError",
+            "bind_status": "SWITCHBOARD_ABSENT",
+        }
+        return {
+            "sealed": absent,
+            "court_request": None,
+            "emit": emit,
+            "honey_pot": honey,
+        }
+
     head = resolve_source_head(source_head)
-    evidence = list(evidence_refs)
     receipt_ref = ""
     if receipts_dir:
         os.makedirs(receipts_dir, exist_ok=True)
@@ -596,103 +536,50 @@ def emit_receipt_sealed_and_court_request(
                 job_id=job_id,
                 ledger_tail_sha=ledger_tail_sha,
                 context_digest=context_digest,
-                evidence_refs=evidence,
+                evidence_refs=evidence_refs,
                 job_succeeded_sha=job_succeeded_sha,
                 source_head=head,
             ))
-
-    created_at = utc_now()
-    correlation_id = "corr-" + content_sha({
-        "mission": mission_id,
-        "stage": "jgi-founder-runtime",
-        "head": head,
-    })[:24]
-    sealed_payload = {
+    payload = {
         "receipt_ref": receipt_ref or f"ledger:{job_id}",
         "receipt_sha": job_succeeded_sha or ledger_tail_sha,
         "mission": mission_id,
         "stage": "jgi-founder-runtime",
         "claimer": "JGI_FOUNDER_RUNTIME",
-        "repo": "NeuruhAI/neuruh-workers",
-        "worktree": "",
-        "branch": "feature/jgi-founder-runtime-v0-20260901",
         "head": head,
-        "remote": "origin",
-        "expected_pr": "5",
-        "expected_pr_url": "https://github.com/NeuruhAI/neuruh-workers/pull/5",
-        "expected_pr_draft": "YES",
-        "bind": "loopback_only",
-        "sentinel_closure_in_receipt": "NOT_JUDGED",
-        "clipboard_defect": None,
-        "required_invariants": list(RECEIPT_SEALED_INVARIANTS),
+        "job_id": job_id,
         "ledger_tail_sha": ledger_tail_sha,
         "context_digest": context_digest,
-        "evidence_refs": evidence,
-        "job_id": job_id,
+        "evidence_refs": list(evidence_refs),
         "job_succeeded_sha": job_succeeded_sha,
+        "sentinel_closure_in_receipt": "NOT_JUDGED",
     }
-    sealed = build_nrh_event_v1(
-        event_type=EVENT_RECEIPT_SEALED,
+    sealed = events.build_envelope(
+        event_type=events.EventType.RECEIPT_SEALED,
         mission_id=mission_id,
         plan_id="jgi-founder-runtime",
         task_id=job_id,
-        correlation_id=correlation_id,
+        correlation_id="corr-" + (job_succeeded_sha or ledger_tail_sha)[:24],
         causation_id="",
         source_role="JGI_FOUNDER_RUNTIME",
         source_component="founder-runtime",
         source_repo="NeuruhAI/neuruh-workers",
         source_head=head,
-        created_at=created_at,
+        created_at=utc_now(),
         authority_ref="jgi-founder-runtime-l0-readonly",
-        payload=sealed_payload,
-        idempotency_key=f"{EVENT_RECEIPT_SEALED}|{job_succeeded_sha or ledger_tail_sha}",
+        payload=payload,
+        idempotency_key=f"receipt.sealed|{job_succeeded_sha or ledger_tail_sha}",
     )
     emit = attempt_switchboard_emit(
         sealed,
         receipts_dir=receipts_dir,
         switchboard_root=switchboard_root,
     )
-    # court.requested exists only when Switchboard actually consumed
-    # receipt.sealed. Do not forge source_role=SWITCHAROO on a local envelope.
-    court = None
-    if emit.get("consumed"):
-        court_payload = {
-            "court_job_id": None,
-            "mission": mission_id,
-            "stage": "jgi-founder-runtime",
-            "claimer": "JGI_FOUNDER_RUNTIME",
-            "receipt_ref": sealed_payload["receipt_ref"],
-            "source_head": head,
-            "required_invariants": list(RECEIPT_SEALED_INVARIANTS),
-            "authority_ref": "jgi-founder-runtime-l0-readonly",
-            "sentinel_model_execution": "BLOCKED",
-            "verdict": None,
-            "ledger_tail_sha": ledger_tail_sha,
-            "context_digest": context_digest,
-            "evidence_refs": evidence,
-            "job_id": job_id,
-            "job_succeeded_sha": job_succeeded_sha,
-        }
-        court = build_nrh_event_v1(
-            event_type=EVENT_COURT_REQUESTED,
-            mission_id=mission_id,
-            plan_id="jgi-founder-runtime",
-            task_id=job_id,
-            correlation_id=correlation_id,
-            causation_id=sealed["event_id"],
-            source_role="SWITCHAROO",
-            source_component="switchboard-first-seam",
-            source_repo="NeuruhAI/neuruh-workers",
-            source_head=head,
-            created_at=utc_now(),
-            authority_ref="jgi-founder-runtime-l0-readonly",
-            payload=court_payload,
-            idempotency_key=f"{EVENT_COURT_REQUESTED}|{job_succeeded_sha or ledger_tail_sha}",
-        )
-    honey = honey_pot_bind()
+    # Switchboard, not this PR, mints court.requested after it consumes
+    # receipt.sealed. Never forge source_role=SWITCHAROO here.
     return {
-        "sealed": sealed,
-        "court_request": court,
+        "sealed": sealed if emit.get("consumed") else {**absent, "events_present": True},
+        "court_request": None,
         "emit": emit,
         "honey_pot": honey,
     }

@@ -139,7 +139,7 @@ router / bus / ledger / git custodian.
 |---|---|---|
 | Local USD ranker (`founder_minute_value_usd=2.0`) | **DELETED** `score_candidate`; remaining sort is layer+capability | this PR does not own spend |
 | L2/L3/L4 unbound | GET IAR `127.0.0.1:8090/health` + RF import | organs absent → `REASONING_BROKER_REQUIRED`, no enqueue |
-| COURT / `receipt.sealed` missing | emit PR #3 `nrh.event.v1` `receipt.sealed` + `court.requested`; emit is attempted | Switchboard absent → `ModuleNotFoundError` from the attempt; no vendored fork |
+| COURT / `receipt.sealed` missing | consume `neuruh_workers.events` when importable; this PR does not clone nrh.event.v1 | events/switchboard absent → `SWITCHBOARD_ABSENT`; no `court.requested` minted here |
 | Consequential `FOUNDER_GATE_REQUIRED` | **CALLS** POST `8848/v1/evaluate` then consume; AXON `8300/execute` | Sentinel jobbed by SWITCHAROO after sealed receipt; absent → `SWITCHBOARD_ABSENT`; never `approved=true` |
 | `parent_mission_id` unused | **BIND** child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing → `PARENT_JOB_ABSENT_IN_LEDGER` |
 | Sibling #3/#4 not imported | import-if-present consumers only | no second `switchboard.py` or `git_custodian` |

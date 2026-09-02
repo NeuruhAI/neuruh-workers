@@ -37,9 +37,9 @@ It consumes, and does not vendor, sibling/foreign organs:
 | CHEAPEST CAPABLE ROUTER (L0/L1) | **DELETED** USD `score_candidate` (`$2` / `$0.05` gone). Remaining sort is layer+capability only | this PR does not own spend |
 | CHEAPEST CAPABLE ROUTER (L2/L3/L4) | GET IAR `127.0.0.1:8090/health` + RF import | no organ → no enqueue, no model call |
 | WORKER | existing `JobQueue` + `WorkflowRunner` | material flags still fail closed before enqueue |
-| COURT | emits `court.requested` in PR #3 `nrh.event.v1` shape | Sentinel organ unreachable; CI `court` job is unittest only; verdict stays `None` |
+| COURT | Switchboard jobs `court.requested` after it consumes `receipt.sealed` | this PR does not mint `court.requested`; module absent → `SWITCHBOARD_ABSENT` |
 | RECEIPT | existing `ExecutionLedger` | — |
-| `receipt.sealed` | **emitted** as PR #3 `EventType.RECEIPT_SEALED` envelope after L0/L1 ledger success; emit is attempted | Switchboard module absent → `SWITCHBOARD_ABSENT`; `court.requested` omitted (no forged organ role) |
+| `receipt.sealed` | consume `neuruh_workers.events.build_envelope` when PR #3 is importable | events/switchboard absent → `SWITCHBOARD_ABSENT`, no home-grown envelope |
 | AUTOMATIC PARENT RESUME | **BIND** — child success resumes existing parent jobs via `JobQueue.resume` / `job.recovered` | parent job missing on ledger → `PARENT_JOB_ABSENT_IN_LEDGER` |
 | Governance → Sentinel → AXON | **CALLS** POST `8848/v1/evaluate` then `/v1/consume` on ALLOW; AXON `8300/execute`. Caller never `approved=true` | Sentinel is jobbed by SWITCHAROO after `receipt.sealed` — module absent → `SWITCHBOARD_ABSENT`; no invented `:8101` stub |
 | HONEY POT | import-if-present consumer | custodian not copied; custody stays on PR #4 |
@@ -112,7 +112,7 @@ The tests prove:
 - consequential flags do not enqueue without Governance → Sentinel → AXON;
 - L2/L3/L4 fail closed without IAR/RF and never self-authorize;
 - the local ranker cannot authorize spend or model calls and has no USD constants;
-- `receipt.sealed` + `court.requested` are emitted after a receipted worker result;
+- after L0 success the runtime attempts SWITCHAROO emit; `court.requested` is omitted unless Switchboard consumed the sealed receipt;
 - `parent_mission_id` resumes a paused or recovered parent from the existing ledger;
 - this PR does not add `switchboard.py` or `git_custodian`.
 

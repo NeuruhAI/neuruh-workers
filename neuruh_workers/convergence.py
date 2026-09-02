@@ -49,7 +49,7 @@ SPINE_OWNERS: dict[str, dict[str, str]] = {
     "COURT": {
         "owner": "Sentinel independent court organ; SWITCHAROO jobs court.requested",
         "role": "CONSUME",
-        "note": "this PR emits court.requested; CI job named court is not Sentinel",
+        "note": "Switchboard jobs court.requested after receipt.sealed; this PR does not mint it",
     },
     "RECEIPT": {
         "owner": "NeuruhAI/neuruh-workers main ExecutionLedger",
