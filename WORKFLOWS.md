@@ -83,4 +83,34 @@ python3 scripts/secret_scan.py
 
 Covers: unit (definitions/ledger/queue/runner), replay + idempotency,
 crash recovery, adversarial approvals, external-action lockout, seam
-refusal, and a secret scan of every tracked file.
+refusal, Switchboard first seam (observe → court job; independent court
+evidence → honey-pot artifact; no fake Sentinel PASS), and a secret scan
+of every tracked file.
+
+CI: `.github/workflows/switchboard-first-seam.yml` runs the same unittest
+court + secret scan on the PR #3 branch HEAD.
+
+## Switchboard first seam (SWITCHAROO)
+
+A thin wrap around the existing ledger + job queue.  A sealed PRIME receipt
+file is observed once, the envelope is validated (Switchboard does **not**
+declare PASS), and exactly one Sentinel `court.requested` **job artifact** is
+enqueued.  Sentinel court is independent: `SENTINEL_CLOSURE` / `PRIME_VERDICT`
+on the PRIME receipt are not PASS, and reconstruction fixtures are refused.
+`court.passed` is accepted only from independent Sentinel evidence.  That
+event then materialises exactly one Honey Pot / Git Custodian
+`candidate.push.requested` artifact.  No git push.  Sentinel model execution
+is `BLOCKED`.  `OrganRegistrationSeam.activate()` still refuses.
+Loopback/file observation only.  `HUMAN_CLIPBOARD_REQUIRED=NO`.
+
+The live T07 pair is checked in at `tests/fixtures/t07/`: `T07_RECEIPT.txt`
+(operator receipt, including the clipboard defect
+`EVENT_IMPLEMENTATION_STATUS=NOT_PROVEN`) is observed through
+`court.requested` only.  `T07_OBSERVER_COURT.json` is a reconstruction and is
+**refused** as court.passed.  Honey Pot expected identity (existing axon PR
+#4) is proven only after independent court evidence.  This wrap does not
+mutate `neuruh-axon` and does not start Ether.
+
+```bash
+python3 scripts/run_switchboard.py tick --receipts <dir> --root .neuruh/switchboard
+```
