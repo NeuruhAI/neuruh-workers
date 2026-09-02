@@ -110,6 +110,15 @@ class MockPRAdapter:
             "AUTO_MERGE is forbidden",
             {"number": pr.number}, reason="AUTO_MERGE")
 
+    def create_tag(self, *args: Any, **kwargs: Any) -> None:
+        raise GitCustodianRefused(
+            "tag writes are structurally forbidden", reason="TAG_WRITE")
+
+    def deploy(self, *args: Any, **kwargs: Any) -> None:
+        raise GitCustodianRefused(
+            "production deployment is structurally forbidden",
+            reason="PRODUCTION_DEPLOY")
+
 
 @dataclass
 class CISnapshot:

@@ -92,6 +92,15 @@ class RecordedGitBackend:
             "remote_after": after,
         }
 
+    def create_tag(self, *args: Any, **kwargs: Any) -> None:
+        raise GitCustodianRefused(
+            "tag writes are structurally forbidden", reason="TAG_WRITE")
+
+    def deploy(self, *args: Any, **kwargs: Any) -> None:
+        raise GitCustodianRefused(
+            "production deployment is structurally forbidden",
+            reason="PRODUCTION_DEPLOY")
+
 
 class RealGitBackend:
     """Local git via argv. Force flags are a hard refusal."""
@@ -261,6 +270,15 @@ class RealGitBackend:
                 reason="PUSH_PROOF_FAILED")
         return {"already_present": False, "remote_before": before,
                 "remote_after": after}
+
+    def create_tag(self, *args: Any, **kwargs: Any) -> None:
+        raise GitCustodianRefused(
+            "tag writes are structurally forbidden", reason="TAG_WRITE")
+
+    def deploy(self, *args: Any, **kwargs: Any) -> None:
+        raise GitCustodianRefused(
+            "production deployment is structurally forbidden",
+            reason="PRODUCTION_DEPLOY")
 
     def _require(self, worktree: str, args: Sequence[str]) -> str:
         result = self._run(worktree, args)

@@ -15,6 +15,7 @@ from neuruh_workers import ExecutionLedger, ExternalActionDenied, WorkerRegistry
 from neuruh_workers.git_custodian import (
     FOUNDER_CANDIDATE_V1,
     GitCustodian,
+    GitCustodianRefused,
     GitIdentity,
     MemoryAuthorityStore,
     MemoryCourtStore,
@@ -23,6 +24,7 @@ from neuruh_workers.git_custodian import (
     PullRequest,
     RecordedGitBackend,
     RecordingSwitchboard,
+    build_candidate_push_event,
 )
 from neuruh_workers.registry import EXTERNAL_AUTHORIZATION_SENTINEL
 from tests.git_custodian_fixtures import (
@@ -104,8 +106,7 @@ class T07GoldenIdempotencyTests(unittest.TestCase):
 
     def _run_twice(self):
         worker, git, pr, ci, switchboard, stack = _t07_stack(self)
-        event = {"type": "candidate.push.requested",
-                 "candidate": t07_candidate()}
+        event = build_candidate_push_event(t07_candidate())
         first = worker.handle(event)
         second = worker.handle(event)
         return first, second, git, pr, switchboard, stack
@@ -129,7 +130,16 @@ class T07GoldenIdempotencyTests(unittest.TestCase):
             self.assertEqual(receipt["T07_PR"], T07_PR)
             self.assertEqual(receipt["PR_DRAFT"], "YES")
             self.assertEqual(receipt["EXTRA_COMMENTS"], "NO")
-            self.assertIs(receipt["SWITCHAROO_INTEGRATED"], False)
+            self.assertIs(receipt["SWITCHAROO_INTEGRATED"], True)
+            self.assertIs(receipt["STRUCTURED_SENTINEL_PASS_REQUIRED"], True)
+            self.assertEqual(receipt["TAG_WRITE"], "NO")
+            self.assertEqual(receipt["AUTO_MERGE"], "NO")
+            self.assertEqual(receipt["PRODUCTION_DEPLOY"], "NO")
+            self.assertEqual(receipt["DIRECT_MAIN"], "NO")
+            self.assertEqual(receipt["FORCE_PUSH"], "NO")
+            self.assertEqual(receipt["ONE_PR_PER_MISSION_BRANCH"], "YES")
+            self.assertEqual(receipt["CI_READ"], "PASS")
+            self.assertEqual(receipt["CI_FALSE_PASS"], "IMPOSSIBLE")
             self.assertNotEqual(receipt["NEXT"], "")
             self.assertIn("BACKEND", receipt)
             self.assertIn("AUTH_BACKEND", receipt)
@@ -157,10 +167,7 @@ class T07GoldenIdempotencyTests(unittest.TestCase):
 
     def test_t07_does_not_invent_ci_pass_from_empty_provider(self):
         worker, *_rest = _t07_stack(self)
-        receipt = worker.handle({
-            "type": "candidate.push.requested",
-            "candidate": t07_candidate(),
-        })
+        receipt = worker.handle(build_candidate_push_event(t07_candidate()))
         self.assertEqual(receipt["CI_STATUS"], "NOT_CONFIGURED_OR_NO_RUNS")
         self.assertNotEqual(receipt["CI_STATUS"], "PASS")
         self.assertNotEqual(receipt["CI_STATUS"], "PENDING")
@@ -169,10 +176,7 @@ class T07GoldenIdempotencyTests(unittest.TestCase):
         worker, git, pr, ci, switchboard, stack = _t07_stack(self)
         worker.court_store = MemoryCourtStore({T07_COURT_REF: "PASS"})
         with self.assertRaises(Exception) as caught:
-            worker.handle({
-                "type": "candidate.push.requested",
-                "candidate": t07_candidate(),
-            })
+            worker.handle(build_candidate_push_event(t07_candidate()))
         self.assertIn("COURT", str(caught.exception).upper())
         self.assertEqual(git.push_calls, [])
         self.assertEqual(pr.creates, 0)
@@ -186,10 +190,7 @@ class T07GoldenIdempotencyTests(unittest.TestCase):
         )
         # Identity still matches after redaction; the planted value must not
         # leak even if the caller handed it to us.
-        receipt = worker.handle({
-            "type": "candidate.push.requested",
-            "candidate": candidate,
-        })
+        receipt = worker.handle(build_candidate_push_event(candidate))
         blob = json.dumps(receipt, sort_keys=True)
         self.assertNotIn(PLANTED_CREDENTIAL, blob)
         with open(stack.ledger_path, encoding="utf-8") as fh:
@@ -220,6 +221,72 @@ class T07GoldenIdempotencyTests(unittest.TestCase):
             runner_src = fh.read()
         self.assertIn("EXTERNAL_ACTION_DENIED", runner_src)
         self.assertIn("cap.external", runner_src)
+
+    def test_homemade_type_candidate_dict_is_refused(self):
+        worker, git, pr, *_rest = _t07_stack(self)
+        with self.assertRaises(GitCustodianRefused) as caught:
+            worker.handle({
+                "type": "candidate.push.requested",
+                "candidate": t07_candidate(),
+            })
+        self.assertIn("SWITCHBOARD_UNKNOWN", caught.exception.code_detail())
+        self.assertEqual(git.push_calls, [])
+        self.assertEqual(pr.creates, 0)
+
+    def test_empty_provider_cannot_invent_ci_pass(self):
+        from neuruh_workers.git_custodian.adapters import summarize_ci
+        self.assertEqual(summarize_ci([], []), "NOT_CONFIGURED_OR_NO_RUNS")
+        self.assertNotEqual(summarize_ci([], []), "PASS")
+        self.assertEqual(
+            summarize_ci([{"status": "in_progress", "name": "workers-ci"}], []),
+            "RUNNING")
+        self.assertNotEqual(
+            summarize_ci([{"status": "queued", "name": "workers-ci"}], []),
+            "PASS")
+
+    def test_tag_deploy_and_auto_merge_are_structurally_impossible(self):
+        worker, git, pr, ci, switchboard, stack = _t07_stack(self)
+        with self.assertRaises(GitCustodianRefused) as tag_exc:
+            git.create_tag("v1.0.0")
+        self.assertEqual(tag_exc.exception.reason, "TAG_WRITE")
+        with self.assertRaises(GitCustodianRefused) as deploy_exc:
+            git.deploy("production")
+        self.assertEqual(deploy_exc.exception.reason, "PRODUCTION_DEPLOY")
+        with self.assertRaises(GitCustodianRefused) as merge_exc:
+            pr.merge(pr.prs[0])
+        self.assertEqual(merge_exc.exception.reason, "AUTO_MERGE")
+        with self.assertRaises(GitCustodianRefused):
+            pr.create_tag("v1.0.0")
+        with self.assertRaises(GitCustodianRefused):
+            pr.deploy("production")
+
+    def test_promotion_ready_is_evidence_not_authority(self):
+        worker, git, pr, ci, switchboard, stack = _t07_stack(self)
+        ci.check_runs = [{
+            "name": "workers-ci",
+            "conclusion": "success",
+            "status": "completed",
+        }]
+        receipt = worker.handle(build_candidate_push_event(t07_candidate()))
+        self.assertEqual(receipt["CI_STATUS"], "PASS")
+        self.assertEqual(receipt["MERGE"], "NO")
+        self.assertEqual(receipt["MERGED"], "NO")
+        self.assertEqual(receipt["AUTO_MERGE"], "NO")
+        self.assertEqual(receipt["DEPLOY"], "NO")
+        ready = [e for e in switchboard.events if e["type"] == "promotion.ready"]
+        self.assertEqual(len(ready), 1)
+        self.assertIn("not merge authority", ready[0]["payload"]["note"])
+        self.assertIn("not authorized", receipt["NEXT"])
+
+    def test_consumes_events_module_envelope_not_a_copy(self):
+        import inspect
+        from neuruh_workers import events as events_mod
+        from neuruh_workers.git_custodian import switchboard as port
+        self.assertIs(port.validate_envelope, events_mod.validate_envelope)
+        self.assertIs(port.build_envelope, events_mod.build_envelope)
+        src = inspect.getsource(port.accept_candidate_push)
+        self.assertIn("validate_envelope", src)
+        self.assertNotIn("ENVELOPE_FIELDS =", inspect.getsource(port))
 
 
 if __name__ == "__main__":

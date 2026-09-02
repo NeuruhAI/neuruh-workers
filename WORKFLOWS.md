@@ -46,15 +46,17 @@ WorkerRegistry (capability declarations: read_only / external)
   runner refuses to execute external capabilities unconditionally (receipted
   `external.action_denied`). No email, SMS, contracts, purchases or
   production writes exist in this layer.
-- **Git Custodian V1** — a separate governed worker (`neuruh_workers.git_custodian`)
-  that may perform only `FEATURE_BRANCH_PUSH`, `PR_CREATE`, `PR_UPDATE`, and
-  `CI_READ` after a structured independent court (`INDEPENDENT_COURT=PASS` with
-  mission/stage/source HEAD/candidate evidence) and founder-candidate authority.
-  It is a custody bridge to a reviewable candidate (remote feature branch + PR +
-  CI state + promotion-ready *evidence*). It is not a merge bot, deploy bot,
+- **Git Custodian V1** — a governed Honey Pot worker
+  (`neuruh_workers.git_custodian`) that **consumes** Switchboard
+  `candidate.push.requested` (`nrh.event.v1`) and may perform only
+  `FEATURE_BRANCH_PUSH`, `PR_CREATE`, `PR_UPDATE`, and `CI_READ` after a
+  structured independent court (`STRUCTURED_SENTINEL_PASS_REQUIRED=YES`; a
+  bare `"PASS"` string is refused) and founder-candidate authority. It is a
+  custody bridge to a reviewable candidate (remote feature branch + PR + CI
+  state + promotion-ready *evidence*). It is not a merge bot, deploy bot,
   release approver, or Sentinel. Force push, direct main, auto-merge, tags,
-  production deploys, and history rewrite are structurally forbidden. The global
-  external-action lockout is unchanged.
+  production deploys, and history rewrite are structurally forbidden.
+  `SWITCHAROO_INTEGRATED=YES`. The global external-action lockout is unchanged.
 - **Mother/AXON seam** — `OrganRegistrationSeam` accepts typed declarations
   (loopback endpoint + exact 40-hex source SHA) and receipts them
   `PENDING_AUTHORIZATION`; activation refuses unconditionally in v1.

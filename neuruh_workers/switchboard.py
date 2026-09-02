@@ -123,6 +123,7 @@ class Switchboard:
         crash_after_lease: bool = False,
         fail_handler: Callable[[str], None] | None = None,
         bind_host: str = "127.0.0.1",
+        git_custodian: Any = None,
     ):
         if bind_host not in ("127.0.0.1", "localhost", "::1"):
             raise SwitchboardError(
@@ -136,6 +137,7 @@ class Switchboard:
         self.known_missions = known_missions or DEFAULT_MISSIONS
         self.crash_after_lease = crash_after_lease
         self.fail_handler = fail_handler
+        self.git_custodian = git_custodian
         self.event_ledger = ExecutionLedger(
             os.path.join(self.root, EVENTS_NAME), clock=self._clock)
         self.job_ledger = ExecutionLedger(
@@ -148,14 +150,19 @@ class Switchboard:
         self.cursor_path = os.path.join(self.root, CURSOR_NAME)
         self._cursor = self._load_cursor()
         self._rebuild_seen_from_ledger()
-        self.consumers = (
+        consumers: list[ConsumerSpec] = [
             ConsumerSpec("switchboard.court-on-sealed.v1",
                          EventType.RECEIPT_SEALED, self.known_missions),
             ConsumerSpec("switchboard.push-on-court-passed.v1",
                          EventType.COURT_PASSED, self.known_missions),
             ConsumerSpec("switchboard.remediate-on-court-failed.v1",
                          EventType.COURT_FAILED, self.known_missions),
-        )
+        ]
+        if git_custodian is not None:
+            consumers.append(ConsumerSpec(
+                "git-custodian.consume-push-requested.v1",
+                EventType.CANDIDATE_PUSH_REQUESTED, self.known_missions))
+        self.consumers = tuple(consumers)
 
     # -- persistence ------------------------------------------------------- #
 
@@ -222,6 +229,7 @@ class Switchboard:
             clock=self._clock,
             fail_handler=self.fail_handler,
             bind_host=self.bind_host,
+            git_custodian=self.git_custodian,
         )
 
     def events(self, event_type: str | EventType | None = None) -> list[dict]:
@@ -758,7 +766,7 @@ class Switchboard:
         if event_type is EventType.COURT_STARTED:
             return self._unroutable(consumer, event_type)
         if event_type is EventType.CANDIDATE_PUSH_REQUESTED:
-            return self._unroutable(consumer, event_type)
+            return self._on_candidate_push_requested(envelope)
         if event_type is EventType.DEADLETTER_CREATED:
             return self._unroutable(consumer, event_type)
         if event_type is EventType.DEADLETTER_REQUEUED:
@@ -860,6 +868,8 @@ class Switchboard:
         }
         if params["expected_pr"] == "":
             params["expected_pr"] = None
+        if expected.get("candidate"):
+            params["candidate"] = expected["candidate"]
         wf = self.catalog.get(HONEY_POT_WORKFLOW)
         job_id = self.queue.enqueue(
             wf, params, requested_by=SOURCE_ROLE,
@@ -883,6 +893,16 @@ class Switchboard:
             idempotency_key=params["idempotency_key"],
         )
         return job_id
+
+    def _on_candidate_push_requested(self, envelope: dict) -> str | None:
+        """Honey Pot consume: Git Custodian handles the Switchboard envelope."""
+        worker = self.git_custodian
+        if worker is None:
+            return None
+        receipt = worker.handle(envelope)
+        if isinstance(receipt, Mapping):
+            return str(receipt.get("job_id") or "") or None
+        return None
 
     def _on_court_failed(self, envelope: dict) -> str:
         court = envelope["payload_ref_or_payload"]

@@ -4,7 +4,14 @@ from .authority import FOUNDER_CANDIDATE_V1, MemoryAuthorityStore, verify_author
 from .court import MemoryCourtStore, verify_court
 from .errors import GitCustodianRefused
 from .git_backend import GitIdentity, RealGitBackend, RecordedGitBackend
-from .switchboard import RecordingSwitchboard
+from .switchboard import (
+    STRUCTURED_SENTINEL_PASS_REQUIRED,
+    SWITCHAROO_INTEGRATED,
+    RecordingSwitchboard,
+    accept_candidate_push,
+    build_candidate_push_event,
+    candidate_from_envelope,
+)
 from .worker import GitCustodian
 
 __all__ = [
@@ -21,6 +28,11 @@ __all__ = [
     "RealGitBackend",
     "RecordedGitBackend",
     "RecordingSwitchboard",
+    "STRUCTURED_SENTINEL_PASS_REQUIRED",
+    "SWITCHAROO_INTEGRATED",
+    "accept_candidate_push",
+    "build_candidate_push_event",
+    "candidate_from_envelope",
     "render_pr_body",
     "verify_authority",
     "verify_court",

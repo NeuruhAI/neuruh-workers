@@ -18,6 +18,7 @@ from neuruh_workers.git_custodian import (
     MockPRAdapter,
     RecordedGitBackend,
     RecordingSwitchboard,
+    build_candidate_push_event,
 )
 from tests.git_custodian_fixtures import T07_AUTHORITY_REF
 from tests.helpers import make_stack
@@ -106,8 +107,7 @@ class MockPRAdapterCourtTests(unittest.TestCase):
                 {T07_AUTHORITY_REF: FOUNDER_CANDIDATE_V1}),
             switchboard=self.switchboard, ledger=stack.ledger,
         )
-        self.event = {"type": "candidate.push.requested",
-                      "candidate": _candidate(court)}
+        self.event = build_candidate_push_event(_candidate(court))
 
     def test_create_then_reuse_exactly_one_pr(self):
         first = self.worker.handle(self.event)
@@ -147,12 +147,14 @@ class MockPRAdapterCourtTests(unittest.TestCase):
 
     def test_pr_body_does_not_embed_secrets(self):
         from tests.git_custodian_fixtures import PLANTED_CREDENTIAL
-        self.worker.known_secrets = [PLANTED_CREDENTIAL]
-        self.event["candidate"]["pr_body_metadata"]["TEST_SUMMARY"] = (
+        court = _court()
+        candidate = _candidate(court)
+        candidate["pr_body_metadata"]["TEST_SUMMARY"] = (
             f"leaked {PLANTED_CREDENTIAL}"
         )
+        self.worker.known_secrets = [PLANTED_CREDENTIAL]
         with self.assertRaises(Exception):
-            self.worker.handle(self.event)
+            self.worker.handle(build_candidate_push_event(candidate))
         self.assertEqual(self.pr.creates, 0)
 
 

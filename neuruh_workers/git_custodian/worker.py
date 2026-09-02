@@ -16,7 +16,13 @@ from .court import verify_court
 from .errors import GitCustodianRefused
 from .git_backend import GitIdentity
 from .redact import assert_no_secrets, collect_secrets, redact_any, redact_text
-from .switchboard import RecordingSwitchboard
+from .switchboard import (
+    STRUCTURED_SENTINEL_PASS_REQUIRED,
+    SWITCHAROO_INTEGRATED,
+    RecordingSwitchboard,
+    accept_candidate_push,
+    candidate_from_envelope,
+)
 
 
 def _yn(flag: bool) -> str:
@@ -45,11 +51,8 @@ class GitCustodian:
         self.known_secrets = list(known_secrets or [])
 
     def handle(self, event: Any) -> dict[str, Any]:
-        if not isinstance(event, Mapping) or event.get("type") != SWITCHBOARD_INPUT:
-            raise self._refuse(
-                "SWITCHBOARD_UNKNOWN",
-                "Git Custodian accepts only candidate.push.requested")
-        return self.run(event.get("candidate"))
+        envelope = accept_candidate_push(event)
+        return self.run(candidate_from_envelope(envelope))
 
     def run(self, raw_candidate: Any) -> dict[str, Any]:
         secrets = collect_secrets(self.known_secrets)
@@ -189,7 +192,14 @@ class GitCustodian:
             "MERGED": "NO",
             "DEPLOY": "NO",
             "DEPLOYED": "NO",
-            "SWITCHAROO_INTEGRATED": bool(self.switchboard.integrated),
+            "AUTO_MERGE": "NO",
+            "PRODUCTION_DEPLOY": "NO",
+            "TAG_WRITE": "NO",
+            "ONE_PR_PER_MISSION_BRANCH": "YES",
+            "CI_READ": "PASS",
+            "CI_FALSE_PASS": "IMPOSSIBLE",
+            "STRUCTURED_SENTINEL_PASS_REQUIRED": STRUCTURED_SENTINEL_PASS_REQUIRED,
+            "SWITCHAROO_INTEGRATED": bool(SWITCHAROO_INTEGRATED),
             "NEXT": self._next(ci_status),
             "BRANCH_ALREADY_PRESENT": _yn(already_branch),
             "REMOTE_HEAD_MATCH": _yn(head_match),

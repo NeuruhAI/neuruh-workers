@@ -24,6 +24,7 @@ from neuruh_workers.git_custodian import (
     MockPRAdapter,
     RealGitBackend,
     RecordingSwitchboard,
+    build_candidate_push_event,
 )
 from neuruh_workers.contracts import content_sha
 from tests.git_custodian_fixtures import (
@@ -69,10 +70,8 @@ class BareRemoteCourtTests(unittest.TestCase):
         self.court = local_court(self.pair)
 
     def _event(self, **overrides):
-        return {
-            "type": "candidate.push.requested",
-            "candidate": local_candidate(self.pair, court=self.court, **overrides),
-        }
+        return build_candidate_push_event(
+            local_candidate(self.pair, court=self.court, **overrides))
 
     def test_push_verifies_exact_remote_sha_and_rerun_is_idempotent(self):
         worker, pr, switchboard, stack = _worker(self, self.pair, self.court)
@@ -86,7 +85,11 @@ class BareRemoteCourtTests(unittest.TestCase):
         self.assertEqual(first["DIRECT_MAIN"], "NO")
         self.assertEqual(first["MERGED"], "NO")
         self.assertEqual(first["DEPLOYED"], "NO")
-        self.assertIs(first["SWITCHAROO_INTEGRATED"], False)
+        self.assertIs(first["SWITCHAROO_INTEGRATED"], True)
+        self.assertIs(first["STRUCTURED_SENTINEL_PASS_REQUIRED"], True)
+        self.assertEqual(first["TAG_WRITE"], "NO")
+        self.assertEqual(first["AUTO_MERGE"], "NO")
+        self.assertEqual(first["PRODUCTION_DEPLOY"], "NO")
         pushed = [e for e in switchboard.events
                   if e["type"] == "candidate.branch.pushed"]
         self.assertEqual(len(pushed), 1)
@@ -108,11 +111,6 @@ class BareRemoteCourtTests(unittest.TestCase):
     def test_main_push_rejected(self):
         worker, pr, *_ = _worker(self, self.pair, self.court)
         git(self.pair["work"], "checkout", "main")
-        event = self._event(
-            branch="main",
-            expected_local_head=self.pair["base_sha"],
-            worktree=self.pair["work"],
-        )
         # Court evidence still names the feature candidate; even a matching
         # court would not authorize main. Use a main-shaped court so we fail
         # on the branch policy, not on court mismatch.
@@ -126,9 +124,12 @@ class BareRemoteCourtTests(unittest.TestCase):
         worker.court_store = MemoryCourtStore({
             "court://local/bare-remote": main_court,
         })
-        event["candidate"]["court_receipt_hash"] = content_sha(main_court)
-        event["candidate"]["expected_local_head"] = self.pair["base_sha"]
-        event["candidate"]["branch"] = "main"
+        event = self._event(
+            branch="main",
+            expected_local_head=self.pair["base_sha"],
+            worktree=self.pair["work"],
+            court_receipt_hash=content_sha(main_court),
+        )
         with self.assertRaises(GitCustodianRefused) as caught:
             worker.handle(event)
         self.assertIn("PROTECTED_BRANCH", caught.exception.code_detail())
@@ -229,10 +230,17 @@ class BareRemoteCourtTests(unittest.TestCase):
         with self.assertRaises(GitCustodianRefused):
             worker.handle({"type": "not.a.real.event",
                            "candidate": local_candidate(self.pair, court=self.court)})
+        homemade = {
+            "schema_version": "nrh.event.v1",
+            "event_type": "candidate.push.requested",
+        }
+        with self.assertRaises(GitCustodianRefused) as homemade_exc:
+            worker.handle(homemade)
+        self.assertIn("SWITCHBOARD_UNKNOWN", homemade_exc.exception.code_detail())
         bad = local_candidate(self.pair, court=self.court)
         bad["schema_version"] = "nrh.git.candidate.v0"
         with self.assertRaises(GitCustodianRefused):
-            worker.handle({"type": "candidate.push.requested", "candidate": bad})
+            worker.handle(build_candidate_push_event(bad))
         self.assertEqual(pr.creates, 0)
 
     def test_missing_and_failed_court_rejected(self):
@@ -246,8 +254,7 @@ class BareRemoteCourtTests(unittest.TestCase):
         failed["independent_court"] = "FAIL"
         worker.court_store = MemoryCourtStore(
             {"court://local/bare-remote": failed})
-        event = self._event()
-        event["candidate"]["court_receipt_hash"] = content_sha(failed)
+        event = self._event(court_receipt_hash=content_sha(failed))
         with self.assertRaises(GitCustodianRefused) as caught:
             worker.handle(event)
         self.assertIn("COURT", caught.exception.code_detail())
@@ -256,8 +263,7 @@ class BareRemoteCourtTests(unittest.TestCase):
         mismatched["mission_id"] = "SOME_OTHER_MISSION"
         worker.court_store = MemoryCourtStore(
             {"court://local/bare-remote": mismatched})
-        event = self._event()
-        event["candidate"]["court_receipt_hash"] = content_sha(mismatched)
+        event = self._event(court_receipt_hash=content_sha(mismatched))
         with self.assertRaises(GitCustodianRefused) as caught:
             worker.handle(event)
         self.assertIn("COURT", caught.exception.code_detail())
@@ -273,9 +279,10 @@ class BareRemoteCourtTests(unittest.TestCase):
 
     def test_credential_values_never_logged(self):
         worker, pr, switchboard, stack = _worker(self, self.pair, self.court)
-        event = self._event()
-        event["candidate"]["remote_url_or_identity"] = (
-            f"https://user:{PLANTED_CREDENTIAL}@example.invalid/org/repo.git"
+        event = self._event(
+            remote_url_or_identity=(
+                f"https://user:{PLANTED_CREDENTIAL}@example.invalid/org/repo.git"
+            ),
         )
         # Identity is the local path; a credentialed URL that does not match
         # the real remote must fail closed — and still not log the secret.
