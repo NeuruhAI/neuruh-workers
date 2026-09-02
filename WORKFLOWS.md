@@ -46,6 +46,17 @@ WorkerRegistry (capability declarations: read_only / external)
   runner refuses to execute external capabilities unconditionally (receipted
   `external.action_denied`). No email, SMS, contracts, purchases or
   production writes exist in this layer.
+- **Git Custodian V1** — a governed Honey Pot worker
+  (`neuruh_workers.git_custodian`) that **consumes** Switchboard
+  `candidate.push.requested` (`nrh.event.v1`) and may perform only
+  `FEATURE_BRANCH_PUSH`, `PR_CREATE`, `PR_UPDATE`, and `CI_READ` after a
+  structured independent court (`STRUCTURED_SENTINEL_PASS_REQUIRED=YES`; a
+  bare `"PASS"` string is refused) and founder-candidate authority. It is a
+  custody bridge to a reviewable candidate (remote feature branch + PR + CI
+  state + promotion-ready *evidence*). It is not a merge bot, deploy bot,
+  release approver, or Sentinel. Force push, direct main, auto-merge, tags,
+  production deploys, and history rewrite are structurally forbidden.
+  `SWITCHAROO_INTEGRATED=YES`. The global external-action lockout is unchanged.
 - **Mother/AXON seam** — `OrganRegistrationSeam` accepts typed declarations
   (loopback endpoint + exact 40-hex source SHA) and receipts them
   `PENDING_AUTHORIZATION`; activation refuses unconditionally in v1.
@@ -84,11 +95,15 @@ python3 scripts/secret_scan.py
 Covers: unit (definitions/ledger/queue/runner), replay + idempotency,
 crash recovery, adversarial approvals, external-action lockout, seam
 refusal, Switchboard first seam (observe → court job; independent court
-evidence → honey-pot artifact; no fake Sentinel PASS), and a secret scan
-of every tracked file.
+evidence → honey-pot artifact; no fake Sentinel PASS), Git Custodian V1
+(consumes Switchboard `candidate.push.requested` / `nrh.event.v1`; T07
+golden idempotency; bare-remote fail-closed matrix; mock PR adapter), and
+a secret scan of every tracked file.
 
-CI: `.github/workflows/switchboard-first-seam.yml` runs the same unittest
-court + secret scan on the PR #3 branch HEAD.
+Canonical CI: `.github/workflows/ci.yml` (`workers-ci`) runs unittest
+discovery + `secret_scan.py` on Python 3.11/3.12/3.13 against the exact
+HEAD. `.github/workflows/switchboard-first-seam.yml` is the first-seam
+court retained from SWITCHAROO.
 
 ## Switchboard first seam (SWITCHAROO)
 
@@ -99,7 +114,8 @@ enqueued.  Sentinel court is independent: `SENTINEL_CLOSURE` / `PRIME_VERDICT`
 on the PRIME receipt are not PASS, and reconstruction fixtures are refused.
 `court.passed` is accepted only from independent Sentinel evidence.  That
 event then materialises exactly one Honey Pot / Git Custodian
-`candidate.push.requested` artifact.  No git push.  Sentinel model execution
+`candidate.push.requested` artifact (`nrh.event.v1`).  Switchboard itself
+does not git-push (artifact `git_push=BLOCKED`).  Sentinel model execution
 is `BLOCKED`.  `OrganRegistrationSeam.activate()` still refuses.
 Loopback/file observation only.  `HUMAN_CLIPBOARD_REQUIRED=NO`.
 
@@ -114,3 +130,24 @@ mutate `neuruh-axon` and does not start Ether.
 ```bash
 python3 scripts/run_switchboard.py tick --receipts <dir> --root .neuruh/switchboard
 ```
+
+## Git Custodian V1 (REL-GIT-001 / HONEY POT)
+
+Custody worker. It **consumes** Switchboard `candidate.push.requested`
+(`nrh.event.v1` via `neuruh_workers.events.validate_envelope`); it does not
+copy or reimplement the envelope and does not mint a second event bus.
+`SWITCHAROO_INTEGRATED=YES`. `STRUCTURED_SENTINEL_PASS_REQUIRED=YES` — a
+bare `"PASS"` string is not a court.
+
+Responsibility ends at: remote feature branch + PR + CI state +
+promotion-ready **evidence**. `promotion.ready` is not merge authority.
+Writes to `NeuruhAI/neuruh-axon` remain write-banned (T07 observe-only).
+
+```bash
+python3 -m unittest discover -s tests -t . -p 'test_git_custodian*.py'
+```
+
+Allowed after structured independent court + founder-candidate authority:
+`FEATURE_BRANCH_PUSH`, `PR_CREATE` / `PR_UPDATE`, `CI_READ`.
+Structurally forbidden: direct main, force push, auto-merge, tags,
+production deploy, history rewrite.

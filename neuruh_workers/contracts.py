@@ -87,6 +87,13 @@ class ReceiptType(str, Enum):
     EXTERNAL_ACTION_DENIED = "external.action_denied"
     SEAM_DECLARED = "seam.declared"
     SEAM_ACTIVATION_REFUSED = "seam.activation_refused"
+    CANDIDATE_PUSH_REQUESTED = "candidate.push.requested"
+    CANDIDATE_BRANCH_PUSHED = "candidate.branch.pushed"
+    CANDIDATE_PR_OPENED = "candidate.pr.opened"
+    CI_STARTED = "ci.started"
+    CI_PASSED = "ci.passed"
+    CI_FAILED = "ci.failed"
+    PROMOTION_READY = "promotion.ready"
 
 
 # --------------------------------------------------------------------------- #
