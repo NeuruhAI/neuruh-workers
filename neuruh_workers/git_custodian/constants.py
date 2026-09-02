@@ -59,6 +59,7 @@ PR_BODY_SECTIONS = (
 )
 
 SWITCHBOARD_INPUT = "candidate.push.requested"
+PROMOTION_INPUT = "promotion.requested"
 SWITCHBOARD_EVENTS = frozenset({
     "candidate.push.requested",
     "candidate.branch.pushed",
@@ -67,7 +68,38 @@ SWITCHBOARD_EVENTS = frozenset({
     "ci.passed",
     "ci.failed",
     "promotion.ready",
+    # PROMOTION EXECUTOR (nrh.git.promotion.v1): promotion.ready is evidence;
+    # these are the receipts of the authorized act that consumes it.
+    "promotion.requested",
+    "promotion.authorized",
+    "promotion.executed",
+    "promotion.verified",
+    "promotion.refused",
+    "deploy.requested",
 })
+
+# --- PROMOTION EXECUTOR ---------------------------------------------------
+# A promotion is NOT an AUTO_MERGE (still forbidden above). PROMOTION_MERGE
+# exists only behind four gates — Sentinel PASS, Governance ALLOW, Honey Pot
+# custody, unchanged head — and is granted by a separate founder policy.
+PROMOTION_SCHEMA = "nrh.git.promotion.v1"
+PROMOTION_ALLOWED_ACTIONS = (
+    "PR_READ",
+    "CI_READ",
+    "PR_READY",
+    "PROMOTION_MERGE",
+)
+PROMOTION_BASE_BRANCHES = frozenset({"main", "master"})
+REQUIRED_PROMOTION_FIELDS = (
+    "schema_version", "mission_id", "task_id", "repo", "worktree", "branch",
+    "base_branch", "expected_head", "expected_base_head", "remote_name",
+    "pr_number", "sentinel_receipt_ref", "sentinel_receipt_hash",
+    "custody_receipt_ref", "custody_receipt_hash", "authority_ref",
+    "idempotency_key",
+)
+OPTIONAL_PROMOTION_FIELDS = (
+    "founder_approval", "grant", "deploy_required", "deploy_target", "lane",
+)
 
 T07_REPO = "NeuruhAI/neuruh-axon"
 T07_HEAD = "7461eb835b3f979a8243f9f70da634a4e5ab62fc"

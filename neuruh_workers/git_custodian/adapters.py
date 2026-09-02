@@ -23,6 +23,7 @@ class PullRequest:
     comments: list[dict[str, Any]] = field(default_factory=list)
     html_url: str = ""
     head_sha: str = ""
+    merge_commit_sha: str = ""
 
 
 def render_pr_body(candidate: Mapping[str, Any], court: Mapping[str, Any],
@@ -57,7 +58,13 @@ class MockPRAdapter:
         self.update_calls: list[dict[str, Any]] = []
         self.comment_calls: list[dict[str, Any]] = []
         self.merge_calls: list[dict[str, Any]] = []
+        self.promote_calls: list[dict[str, Any]] = []
+        self.ready_calls: list[dict[str, Any]] = []
         self.creates = 0
+        # PROMOTION court hook: performs the actual merge (e.g. in a scratch
+        # clone against a bare remote) and returns the merge commit sha. None
+        # => a synthetic sha, for courts that only need the contract.
+        self.merge_fn = None
 
     def active_prs(self, repo: str, branch: str, mission_id: str) -> list[PullRequest]:
         return [
@@ -109,6 +116,60 @@ class MockPRAdapter:
         raise GitCustodianRefused(
             "AUTO_MERGE is forbidden",
             {"number": pr.number}, reason="AUTO_MERGE")
+
+    # -- PROMOTION EXECUTOR surface (governed; not AUTO_MERGE) -------------
+    def get(self, repo: str, number: int) -> PullRequest | None:
+        for pr in self.prs:
+            if pr.repo == repo and pr.number == number:
+                return pr
+        return None
+
+    def mark_ready(self, pr: PullRequest) -> PullRequest:
+        self.ready_calls.append({"number": pr.number})
+        pr.draft = False
+        return pr
+
+    def promote_merge(self, pr: PullRequest, *, match_head_sha: str,
+                      method: str = "merge", authorization_ref: str = "") -> dict[str, Any]:
+        """Merge exactly ``match_head_sha`` of this PR, or refuse.
+
+        ``authorization_ref`` must name a Governance authorization; without one
+        this is an AUTO_MERGE and refuses the same way ``merge`` does.
+        """
+        self.promote_calls.append({
+            "number": pr.number, "match_head_sha": match_head_sha,
+            "method": method, "authorization_ref": authorization_ref,
+        })
+        if not authorization_ref.startswith("governance:"):
+            raise GitCustodianRefused(
+                "a merge without a Governance authorization is AUTO_MERGE",
+                {"number": pr.number}, reason="AUTO_MERGE")
+        if pr.merged:
+            raise GitCustodianRefused(
+                "PR is already merged", {"number": pr.number},
+                reason="PR_ALREADY_MERGED")
+        if pr.head_sha != match_head_sha:
+            raise GitCustodianRefused(
+                "PR head moved since authorization; refusing to merge a "
+                "different commit", {"number": pr.number,
+                                     "head": pr.head_sha,
+                                     "expected": match_head_sha},
+                reason="MATCH_HEAD_MISMATCH")
+        if method != "merge":
+            raise GitCustodianRefused(
+                "only a true merge commit is a promotion; squash/rebase "
+                "rewrite the courted history", {"method": method},
+                reason="REWRITE_HISTORY")
+        if self.merge_fn is not None:
+            merge_sha = self.merge_fn(pr)
+        else:
+            import hashlib
+            merge_sha = hashlib.sha1(
+                f"merge:{pr.repo}:{pr.number}:{match_head_sha}".encode()).hexdigest()
+        pr.merged = True
+        pr.state = "MERGED"
+        pr.merge_commit_sha = merge_sha
+        return {"merge_sha": merge_sha, "method": method}
 
     def create_tag(self, *args: Any, **kwargs: Any) -> None:
         raise GitCustodianRefused(

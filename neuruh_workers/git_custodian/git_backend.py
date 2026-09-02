@@ -48,16 +48,31 @@ class RecordedGitBackend:
         self.command_log: list[list[str]] = []
         self.force_used = False
         self.auto_advance_remote = False
+        # PROMOTION courts: per-branch remote heads and a recorded ancestry
+        # graph (pairs of (ancestor, descendant)). Unset branches fall back to
+        # the identity's remote_branch_head; a==b is always an ancestor.
+        self.remote_heads: dict[str, str | None] = {}
+        self.ancestry: set[tuple[str, str]] = set()
+        self.fetch_calls = 0
 
     def inspect(self, worktree: str, remote_name: str, branch: str,
                 base_branch: str) -> GitIdentity:
         return self.identity
 
     def fetch(self, worktree: str, remote_name: str) -> None:
+        self.fetch_calls += 1
         return None
 
     def remote_head(self, worktree: str, remote_name: str, branch: str) -> str | None:
+        if branch in self.remote_heads:
+            return self.remote_heads[branch]
         return self.identity.remote_branch_head
+
+    def is_ancestor(self, worktree: str, maybe_ancestor: str,
+                    maybe_descendant: str) -> bool:
+        if maybe_ancestor == maybe_descendant:
+            return True
+        return (maybe_ancestor, maybe_descendant) in self.ancestry
 
     def push_feature_branch(self, worktree: str, remote: str, branch: str,
                             expected_sha: str) -> dict[str, Any]:
@@ -293,6 +308,11 @@ class RealGitBackend:
         result = self._run(worktree, [
             "merge-base", "--is-ancestor", maybe_ancestor, maybe_descendant])
         return result.returncode == 0
+
+    def is_ancestor(self, worktree: str, maybe_ancestor: str,
+                    maybe_descendant: str) -> bool:
+        """Public ancestry check for the promotion verifier (read-only)."""
+        return self._is_ancestor(worktree, maybe_ancestor, maybe_descendant)
 
     def _count(self, worktree: str, rev_range: str) -> int:
         result = self._run(worktree, ["rev-list", "--count", rev_range])

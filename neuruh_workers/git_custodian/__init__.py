@@ -12,11 +12,37 @@ from .switchboard import (
     build_candidate_push_event,
     candidate_from_envelope,
 )
+from .promotion import (
+    FOUNDER_PROMOTION_V1,
+    LoopbackGovernanceAuthorize,
+    PromotionExecutor,
+    custody_record_for,
+    parse_promotion,
+    promotion_facts,
+    verify_governance_allow,
+    verify_sentinel_record,
+)
+from .switchboard import (
+    accept_promotion_request,
+    build_promotion_request_event,
+    promotion_from_envelope,
+)
 from .worker import GitCustodian
 
 __all__ = [
     "CISnapshot",
     "FOUNDER_CANDIDATE_V1",
+    "FOUNDER_PROMOTION_V1",
+    "LoopbackGovernanceAuthorize",
+    "PromotionExecutor",
+    "accept_promotion_request",
+    "build_promotion_request_event",
+    "custody_record_for",
+    "parse_promotion",
+    "promotion_facts",
+    "promotion_from_envelope",
+    "verify_governance_allow",
+    "verify_sentinel_record",
     "GitCustodian",
     "GitCustodianRefused",
     "GitIdentity",

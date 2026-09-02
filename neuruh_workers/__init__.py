@@ -29,7 +29,7 @@ from .registry import Capability, StepContext, WorkerDeclaration, WorkerRegistry
 from .runner import WorkflowRunner
 from .seams import OrganRegistrationSeam, OrganSeamDeclaration
 from .switchboard import HUMAN_CLIPBOARD_REQUIRED, Switchboard
-from .git_custodian import GitCustodian, GitCustodianRefused
+from .git_custodian import GitCustodian, GitCustodianRefused, PromotionExecutor
 
 __version__ = "1.1.0"
 
@@ -41,5 +41,5 @@ __all__ = [
     "StepContext", "StepDefinition", "StepTimeout", "Switchboard", "WorkerDeclaration",
     "WorkerRegistry", "WorkflowCatalog", "WorkflowDefinition", "WorkflowError",
     "WorkflowRunner", "deterministic_job_id", "HUMAN_CLIPBOARD_REQUIRED",
-    "GitCustodian", "GitCustodianRefused",
+    "GitCustodian", "GitCustodianRefused", "PromotionExecutor",
 ]
