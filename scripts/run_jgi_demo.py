@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-"""Run one safe JGI Founder Runtime demo against the existing workflow layer.
+"""Run one safe dispatch-bridge demo against the existing workflow layer.
 
+Consumes an FR APPROVED/QUEUED ticket shape and dispatches it onto JobQueue.
 No network, no external action, no production mutation. The demo creates a
-local ledger, autonomously selects/executes the existing property-research
-workflow, then prints the structured result + ledger facts.
+local ledger, autonomously executes the existing property-research workflow,
+hands receipt.sealed to live SWITCHAROO, then prints the structured result.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import tempfile
 from pathlib import Path
 
-# Direct execution (`python scripts/run_jgi_demo.py`) makes `scripts/` the first
-# import root. Add the repository root explicitly so the demo is portable in CI
-# and from a clean checkout without requiring package installation.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from neuruh_workers.founder_runtime import (
-    FounderRuntime,
+    DispatchBridge,
+    DispatchTicket,
     IntelligenceLayer,
-    MissionIntent,
     WorkCandidate,
 )
 from neuruh_workers.ledger import ExecutionLedger
+from neuruh_workers.organ_consumers import FR_API_VERSION
 from neuruh_workers.queue import JobQueue
 from neuruh_workers.runner import WorkflowRunner
 from neuruh_workers.workflows import build_catalog, build_registry
@@ -43,11 +43,20 @@ def main() -> int:
     catalog = build_catalog()
     queue = JobQueue(ledger, registry)
     runner = WorkflowRunner(queue, registry, catalog)
-    runtime = FounderRuntime(queue, catalog, runner)
+    scratch = tempfile.TemporaryDirectory()
+    runtime = DispatchBridge(
+        queue,
+        catalog,
+        runner,
+        receipts_dir=str(Path(scratch.name) / "receipts"),
+        switchboard_root=str(Path(scratch.name) / "switchboard"),
+    )
 
-    mission = MissionIntent(
+    ticket = DispatchTicket(
         mission_id="JGI-DEMO-PROPERTY-RESEARCH-001",
         objective="turn a property question into a receipted research plan without a manual handoff",
+        fr_state="QUEUED",
+        fr_api_version=FR_API_VERSION,
         expected_value_usd=500.0,
         uncertainty=0.2,
         relevance=1.0,
@@ -63,9 +72,10 @@ def main() -> int:
         estimated_latency_minutes=1.0,
         evidence_refs=("neuruh-workers:property-research",),
     )
-    result = runtime.dispatch(mission, [candidate], auto_execute_read_only=True)
-    print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
+    result = runtime.dispatch(ticket, [candidate], auto_execute_read_only=True)
+    print(json.dumps(result.as_dict(), indent=2, sort_keys=True, default=str))
     print(json.dumps({"ledger": ledger.verify()}, indent=2, sort_keys=True))
+    scratch.cleanup()
     return 0 if result.status.value in {"SUCCEEDED", "ALREADY_SUCCEEDED"} else 2
 
 

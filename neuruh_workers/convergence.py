@@ -1,17 +1,16 @@
-"""Ownership seam for JGI Founder Runtime over the existing spine.
+"""Ownership seam for FOUNDER_RUNTIME_TO_WORKERS_DISPATCH_BRIDGE.
 
-This is not a second router, event bus, workflow engine, or economic
-authorizer. It names who already owns each organ and what this package
-may do locally:
+recipe-engine Founder Runtime (FR_API=:19090, API_VERSION=fr-api-v1) remains
+mission-state authority. This package is a consume-only dispatch bridge:
 
-- L0/L1 non-authorizing path pre-filter + read-only dispatch through JobQueue/WorkflowRunner
-- pointer-heavy context compilation
-- hand receipt.sealed to SWITCHAROO via neuruh_workers.events when present; this PR does not mint court.requested
+- accept FR APPROVED/QUEUED tickets
+- enqueue existing JobQueue work
+- seal receipts onto live SWITCHAROO
 - resume existing parent jobs from ExecutionLedger
-- fail-closed handoff to existing owners for everything else
+- attempt an FR evidence update (fail closed; this PR does not persist missions)
 
-Live Switchboard, Git Custodian, Revenue Factory, IAR, Governance,
-Sentinel, and AXON implementations are not copied here.
+This is not a second Founder Runtime, scheduler, model router, event bus,
+or economic authorizer. Ranker stays DELETED.
 """
 from __future__ import annotations
 
@@ -19,17 +18,51 @@ from typing import Any
 
 from .organ_consumers import GSA_AUTHORITY_PATH
 
-# Exact existing owners. Candidate PRs are named; none are treated as merged.
 SPINE_OWNERS: dict[str, dict[str, str]] = {
     "INTENT": {
-        "owner": "NeuruhAI/neuruh-workers#5 FounderRuntime.MissionIntent",
-        "role": "OWN",
-        "note": "mission identity + economic hints; hints are not spend authority",
+        "owner": "NeuruhAI/recipe-engine Founder Runtime FR_API=:19090 fr-api-v1",
+        "role": "CONSUME",
+        "note": "mission identity stays on recipe-engine; this PR accepts tickets only",
+    },
+    "MISSION_PERSISTENCE": {
+        "owner": "NeuruhAI/recipe-engine Founder Runtime missions.sqlite",
+        "role": "CONSUME",
+        "note": "this PR must not persist missions",
+    },
+    "MISSION_IDENTITY": {
+        "owner": "NeuruhAI/recipe-engine Founder Runtime mission_id",
+        "role": "CONSUME",
+        "note": "DispatchTicket.mission_id is FR-issued, never minted here",
+    },
+    "APPROVAL_STATE": {
+        "owner": "NeuruhAI/recipe-engine Founder Runtime approvals",
+        "role": "CONSUME",
+        "note": "APPROVED/QUEUED is an FR fact; this PR never records allow/deny",
+    },
+    "DECISION_PLAN": {
+        "owner": "NeuruhAI/recipe-engine Founder Runtime proposed plan",
+        "role": "CONSUME",
+        "note": "this PR does not compile or authorize a decision plan",
+    },
+    "SCHEDULER": {
+        "owner": "NeuruhAI/neuruh-workers main JobQueue",
+        "role": "REUSE",
+        "note": "no second scheduler",
+    },
+    "MODEL_ROUTER": {
+        "owner": "NeuruhAI/aegis iar_v2 + Revenue Factory InferenceAuthorization",
+        "role": "CONSUME",
+        "note": "this PR does not own a router; L2/L3/L4 fail closed",
     },
     "CONTEXT_COMPILER": {
-        "owner": "NeuruhAI/neuruh-workers#5 FounderRuntime.compile_context",
+        "owner": "NeuruhAI/neuruh-workers#5 DispatchBridge.compile_context",
         "role": "OWN",
-        "note": "<=4 KiB pointer packet; no chat/transcript field",
+        "note": "<=4 KiB pointer packet for dispatch; no chat/transcript; no mission authority",
+    },
+    "DISPATCH_BRIDGE": {
+        "owner": "NeuruhAI/neuruh-workers#5 DispatchBridge",
+        "role": "OWN",
+        "note": "FR APPROVED/QUEUED ticket → JobQueue → ExecutionLedger",
     },
     "CHEAPEST_CAPABLE_ROUTER_L0_L1": {
         "owner": "NeuruhAI/aegis iar_v2 + Revenue Factory (spend); this PR deleted USD utility",
@@ -49,7 +82,7 @@ SPINE_OWNERS: dict[str, dict[str, str]] = {
     "COURT": {
         "owner": "Sentinel independent court organ; SWITCHAROO jobs court.requested",
         "role": "CONSUME",
-        "note": "Switchboard jobs court.requested after receipt.sealed; this PR does not mint it",
+        "note": "Switchboard jobs court.requested after receipt.sealed; this PR does not mint it or PASS",
     },
     "RECEIPT": {
         "owner": "NeuruhAI/neuruh-workers main ExecutionLedger",
@@ -57,24 +90,24 @@ SPINE_OWNERS: dict[str, dict[str, str]] = {
         "note": "hash-chained JSONL; job state is replayed, never stored",
     },
     "RECEIPT_SEALED": {
-        "owner": "NeuruhAI/neuruh-workers#3 Switchboard receipt.sealed",
+        "owner": "NeuruhAI/neuruh-workers main Switchboard receipt.sealed",
         "role": "CONSUME",
-        "note": "emitted onto SWITCHAROO; fail-closed if switchboard.py is not on this branch",
+        "note": "events.build_envelope + Switchboard.ingest_raw + tick; fail-closed if import missing",
     },
     "AUTOMATIC_PARENT_RESUME": {
         "owner": "NeuruhAI/neuruh-workers main JobQueue.resume + WorkflowRunner job.recovered",
         "role": "CONSUME",
-        "note": "child success resumes existing parent jobs from the ledger; no new daemon",
+        "note": "child success resumes existing parent jobs from the ledger; PARENT_RESUME=PROVEN",
     },
     "SWITCHBOARD": {
-        "owner": "NeuruhAI/neuruh-workers#3 SWITCHAROO first seam (Switchboard)",
+        "owner": "NeuruhAI/neuruh-workers main neuruh_workers.switchboard (a0c45700 ancestor)",
         "role": "CONSUME",
-        "note": "import-if-present; this PR does not copy switchboard.py",
+        "note": "live import; this PR does not copy switchboard.py or events.py",
     },
     "GIT_CUSTODIAN": {
-        "owner": "NeuruhAI/neuruh-workers#4 neuruh_workers.git_custodian",
+        "owner": "NeuruhAI/neuruh-workers main neuruh_workers.git_custodian (0923725)",
         "role": "CONSUME",
-        "note": "HONEY POT keeps custody; this PR does not copy git_custodian",
+        "note": "HONEY POT custody; this PR does not copy git_custodian",
     },
     "REVENUE_FACTORY": {
         "owner": "NeuruhAI/neuruh-live-integration#1 revenue_factory",
@@ -94,27 +127,37 @@ SPINE_OWNERS: dict[str, dict[str, str]] = {
     "SENTINEL": {
         "owner": "Sentinel independent court organ",
         "role": "CONSUME",
-        "note": "jobbed by SWITCHAROO after receipt.sealed; SWITCHBOARD_ABSENT if module missing",
+        "note": "jobbed by SWITCHAROO; SENTINEL_MODEL_EXECUTION=BLOCKED; CI court job is not Sentinel",
     },
     "AXON": {
         "owner": "NeuruhAI/neuruh-axon",
         "role": "CONSUME",
-        "note": "HTTP POST 127.0.0.1:8300/execute (proven gateway); fail from the attempt",
+        "note": "write-banned; no POST /execute from this bridge",
+    },
+    "FOUNDER_RUNTIME": {
+        "owner": "NeuruhAI/recipe-engine Founder Runtime FR_API=:19090 fr-api-v1",
+        "role": "CONSUME",
+        "note": "mission-state authority; this PR is not a second FR",
+    },
+    "ETHER": {
+        "owner": "none-in-this-repo",
+        "role": "ABSENT",
+        "note": "no Ether organ is added here",
     },
     "EXECUTION_LEDGER": {
-        "owner": "NeuruhAI/neuruh-workers main ExecutionLedger",
+        "owner": "NeuruhAI/neuruh-workers main ExecutionLedger @ 0923725",
         "role": "REUSE",
-        "note": "already on main @ 05c669af",
+        "note": "already on main",
     },
     "WORKFLOW_RUNNER": {
-        "owner": "NeuruhAI/neuruh-workers main WorkflowRunner",
+        "owner": "NeuruhAI/neuruh-workers main WorkflowRunner @ 0923725",
         "role": "REUSE",
-        "note": "already on main @ 05c669af",
+        "note": "already on main",
     },
     "MISSION_RECOVERY": {
         "owner": "NeuruhAI/neuruh-workers main WorkflowRunner job.recovered",
         "role": "PARTIAL",
-        "note": "job-level crash recovery + parent resume exist; no stale-mission watcher",
+        "note": "job-level crash recovery + parent resume; no stale-mission watcher",
     },
     "OUTCOME_LEARNING": {
         "owner": "NeuruhAI/neuruh-outcome-calibration-ledger + neuruh-live-integration#1 reasoning_debt.py",
@@ -124,8 +167,8 @@ SPINE_OWNERS: dict[str, dict[str, str]] = {
 }
 
 THIS_PR_MAY_OWN = frozenset({
-    "INTENT",
     "CONTEXT_COMPILER",
+    "DISPATCH_BRIDGE",
 })
 
 THIS_PR_REUSES = frozenset({
@@ -133,10 +176,17 @@ THIS_PR_REUSES = frozenset({
     "RECEIPT",
     "EXECUTION_LEDGER",
     "WORKFLOW_RUNNER",
+    "SCHEDULER",
     "AUTOMATIC_PARENT_RESUME",
 })
 
 THIS_PR_MUST_NOT_OWN = frozenset({
+    "INTENT",
+    "MISSION_PERSISTENCE",
+    "MISSION_IDENTITY",
+    "APPROVAL_STATE",
+    "DECISION_PLAN",
+    "MODEL_ROUTER",
     "SWITCHBOARD",
     "GIT_CUSTODIAN",
     "REVENUE_FACTORY",
@@ -144,6 +194,8 @@ THIS_PR_MUST_NOT_OWN = frozenset({
     "GOVERNANCE",
     "SENTINEL",
     "AXON",
+    "FOUNDER_RUNTIME",
+    "ETHER",
     "CHEAPEST_CAPABLE_ROUTER_L0_L1",
     "CHEAPEST_CAPABLE_ROUTER_L2_L4",
     "OUTCOME_LEARNING",
@@ -171,3 +223,7 @@ def reasoning_broker_bind(*, context_digest: str) -> dict[str, Any]:
     """Compatibility wrapper; live bind lives in organ_consumers.bind_iar_rf."""
     from .organ_consumers import bind_iar_rf
     return bind_iar_rf(context_digest=context_digest)
+
+
+# Silence unused import while keeping the authority path name stable for packets.
+_ = GSA_AUTHORITY_PATH

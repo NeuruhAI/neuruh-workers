@@ -1,19 +1,22 @@
-"""JGI Founder Runtime v0: cheapest-capable mission planning over existing workers.
+"""FOUNDER_RUNTIME_TO_WORKERS_DISPATCH_BRIDGE.
 
-This module is deliberately a CONTROL PLANE, not another workflow engine.
-It reuses WorkflowCatalog, WorkerRegistry, JobQueue, WorkflowRunner and the
-hash-chained ExecutionLedger already owned by neuruh-workers.
+recipe-engine Founder Runtime (FR_API=:19090, API_VERSION=fr-api-v1) remains
+mission-state authority. This module consumes APPROVED/QUEUED tickets and
+dispatches them onto the existing workers spine:
 
-V0 autonomy boundary:
-- safe deterministic/read-only workflows may be selected, enqueued and run
-  without a clerical founder handoff;
-- approval-gated work stops at the existing content-bound approval gate;
-- consequential work (money, external message, production mutation,
-  irreversible, private-IP risk, non-read-only) fails closed to
-  Governance → Sentinel → AXON only;
-- L2/L3/L4 reasoning is delegated to the existing IAR / Revenue Factory
-  contract and fails closed when that organ is absent. This layer does not
-  issue spend, call models, or rebuild a router.
+    FR APPROVED/QUEUED
+      → JobQueue
+      → ExecutionLedger
+      → receipt.sealed
+      → SWITCHAROO
+      → independent Sentinel
+      → HONEY POT when code custody is required
+      → child completion
+      → JobQueue.resume(parent)
+      → FR state/evidence update (fail closed; FR owns persistence)
+
+This is not a second Founder Runtime, scheduler, model router, or ranker.
+USD `score_candidate` stays deleted. AXON writes are banned. No Ether.
 """
 from __future__ import annotations
 
@@ -26,13 +29,17 @@ from .contracts import JobStatus, canonical_json, content_sha
 from .convergence import GSA_AUTHORITY_PATH
 from .definitions import WorkflowCatalog
 from .organ_consumers import (
+    FR_API_VERSION,
+    FR_DISPATCHABLE_STATES,
     HttpOpen,
+    bind_founder_runtime,
     bind_iar_rf,
     call_gsa,
-    emit_receipt_sealed_and_court_request,
+    emit_receipt_sealed_and_switcharoo,
     job_succeeded_sha,
     resolve_source_head,
     resume_parent_from_receipts,
+    update_fr_evidence,
 )
 from .queue import JobQueue
 from .runner import WorkflowRunner
@@ -64,13 +71,18 @@ class RuntimeStatus(str, Enum):
     FOUNDER_GATE_REQUIRED = "FOUNDER_GATE_REQUIRED"
     GOVERNANCE_SENTINEL_AXON_REQUIRED = "GOVERNANCE_SENTINEL_AXON_REQUIRED"
     REASONING_BROKER_REQUIRED = "REASONING_BROKER_REQUIRED"
+    FR_STATE_NOT_DISPATCHABLE = "FR_STATE_NOT_DISPATCHABLE"
     BLOCKED = "BLOCKED"
 
 
 @dataclass(frozen=True)
-class MissionIntent:
+class DispatchTicket:
+    """Consumed FR ticket. Not mission persistence, identity, or approval authority."""
+
     mission_id: str
     objective: str
+    fr_state: str = "QUEUED"
+    fr_api_version: str = FR_API_VERSION
     expected_value_usd: float = 0.0
     uncertainty: float = 0.0
     relevance: float = 1.0
@@ -81,16 +93,23 @@ class MissionIntent:
     do_not_rebuild: tuple[str, ...] = ()
     constraints: tuple[str, ...] = ()
     parent_mission_id: str | None = None
+    code_custody_required: bool = False
 
     def __post_init__(self) -> None:
         if not self.mission_id or not self.objective:
             raise ValueError("mission_id and objective are required")
+        if self.fr_api_version != FR_API_VERSION:
+            raise ValueError(f"fr_api_version must be {FR_API_VERSION}")
         for name in ("uncertainty", "relevance"):
             value = float(getattr(self, name))
             if value < 0.0 or value > 1.0:
                 raise ValueError(f"{name} must be between 0 and 1")
         if self.expected_value_usd < 0 or self.model_budget_usd < 0:
             raise ValueError("economic values must be non-negative")
+
+
+# Compatibility name: this is a consumed ticket, not an owned mission identity.
+MissionIntent = DispatchTicket
 
 
 @dataclass(frozen=True)
@@ -149,6 +168,10 @@ class RuntimeResult:
     sealed_receipt: Mapping[str, Any] | None = None
     court_request: Mapping[str, Any] | None = None
     switchboard_emit: Mapping[str, Any] | None = None
+    sentinel: Mapping[str, Any] | None = None
+    honey_pot: Mapping[str, Any] | None = None
+    fr_bind: Mapping[str, Any] | None = None
+    fr_evidence_update: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -171,7 +194,7 @@ def founder_gate_reasons(candidate: WorkCandidate) -> tuple[str, ...]:
     return tuple(reasons)
 
 
-def rank_candidates(mission: MissionIntent, candidates: Sequence[WorkCandidate]) -> list[WorkCandidate]:
+def rank_candidates(mission: DispatchTicket, candidates: Sequence[WorkCandidate]) -> list[WorkCandidate]:
     """Layer + capability order only. Not spend authority. USD ranker deleted."""
     del mission  # economic hints are metadata, not a local utility function
     if not candidates:
@@ -187,7 +210,7 @@ def rank_candidates(mission: MissionIntent, candidates: Sequence[WorkCandidate])
 
 
 def compile_context(
-    mission: MissionIntent,
+    mission: DispatchTicket,
     candidate: WorkCandidate,
     *,
     state_delta: Mapping[str, Any] | None = None,
@@ -198,6 +221,8 @@ def compile_context(
         "mission_id": mission.mission_id,
         "parent_mission_id": mission.parent_mission_id,
         "objective": mission.objective,
+        "fr_state": mission.fr_state,
+        "fr_api_version": mission.fr_api_version,
         "candidate": {
             "candidate_id": candidate.candidate_id,
             "workflow": candidate.workflow_name,
@@ -214,8 +239,9 @@ def compile_context(
         "authority_path": GSA_AUTHORITY_PATH,
         "reasoning_broker": "revenue_factory.authorization+aegis.iar_v2",
         "spend_authority": "iar_rf",
+        "mission_authority": "recipe-engine.founder_runtime.fr-api-v1",
+        "code_custody_required": mission.code_custody_required,
     }
-    # Trim pointer arrays before ever truncating semantic mission/task fields.
     trim_order = ["canonical_refs", "evidence_refs", "known_failures", "blockers", "do_not_rebuild", "constraints"]
     while len(canonical_json(packet).encode("utf-8")) > max_bytes:
         trimmed = False
@@ -230,8 +256,8 @@ def compile_context(
     return packet
 
 
-class FounderRuntime:
-    """Select and autonomously run the best safe existing workflow path."""
+class DispatchBridge:
+    """Consume an FR ticket and dispatch it onto existing workers primitives."""
 
     def __init__(
         self,
@@ -244,6 +270,7 @@ class FounderRuntime:
         source_head: str | None = None,
         iar_probe: Callable[[], Mapping[str, Any]] | None = None,
         http_open: HttpOpen | None = None,
+        fr_token: str | None = None,
     ) -> None:
         self.queue = queue
         self.catalog = catalog
@@ -253,15 +280,36 @@ class FounderRuntime:
         self.source_head = source_head
         self.iar_probe = iar_probe
         self.http_open = http_open
+        self.fr_token = fr_token
+        self.last_switchboard = None
 
     def dispatch(
         self,
-        mission: MissionIntent,
+        mission: DispatchTicket,
         candidates: Sequence[WorkCandidate],
         *,
         auto_execute_read_only: bool = True,
         state_delta: Mapping[str, Any] | None = None,
     ) -> RuntimeResult:
+        fr_bind = bind_founder_runtime(opener=self.http_open)
+        if mission.fr_state not in FR_DISPATCHABLE_STATES:
+            candidate = rank_candidates(mission, candidates)[0]
+            context = compile_context(mission, candidate, state_delta=state_delta)
+            return RuntimeResult(
+                mission_id=mission.mission_id,
+                status=RuntimeStatus.FR_STATE_NOT_DISPATCHABLE,
+                candidate_id=candidate.candidate_id,
+                workflow_name=candidate.workflow_name,
+                layer=candidate.layer.value,
+                utility_usd=0.0,
+                founder_gate_reasons=(),
+                context_digest=content_sha(context),
+                compiled_context=context,
+                authority_path="recipe-engine.founder_runtime",
+                fr_bind=fr_bind,
+                note="ticket is not FR APPROVED/QUEUED; bridge does not invent approval",
+            )
+
         candidate = rank_candidates(mission, candidates)[0]
         context = compile_context(mission, candidate, state_delta=state_delta)
         context_digest = content_sha(context)
@@ -281,6 +329,7 @@ class FounderRuntime:
                 compiled_context=context,
                 authority_path=GSA_AUTHORITY_PATH,
                 broker_bind=bind,
+                fr_bind=fr_bind,
                 note="consequential action; Governance → Sentinel → AXON required; no job enqueued",
             )
 
@@ -302,6 +351,7 @@ class FounderRuntime:
                 compiled_context=context,
                 authority_path="revenue_factory.authorization->aegis.iar_v2",
                 broker_bind=bind,
+                fr_bind=fr_bind,
                 note="L2/L3/L4 delegated to existing IAR/RF contract; no local spend or model call",
             )
 
@@ -321,6 +371,7 @@ class FounderRuntime:
                 compiled_context=context,
                 authority_path=GSA_AUTHORITY_PATH,
                 broker_bind=bind,
+                fr_bind=fr_bind,
                 note="non-read-only work is consequential; Governance → Sentinel → AXON required",
             )
 
@@ -356,8 +407,11 @@ class FounderRuntime:
         court = None
         switchboard_emit = None
         parent_resume = None
+        sentinel = None
+        honey = None
+        fr_update = None
         if status in {RuntimeStatus.SUCCEEDED, RuntimeStatus.ALREADY_SUCCEEDED}:
-            emission = emit_receipt_sealed_and_court_request(
+            emission = emit_receipt_sealed_and_switcharoo(
                 mission_id=mission.mission_id,
                 job_id=job_id,
                 ledger_tail_sha=chain["tail_sha"],
@@ -367,10 +421,14 @@ class FounderRuntime:
                 source_head=resolve_source_head(self.source_head),
                 receipts_dir=self.receipts_dir,
                 switchboard_root=self.switchboard_root,
+                code_custody_required=mission.code_custody_required,
             )
             sealed = emission["sealed"]
             court = emission["court_request"]
             switchboard_emit = emission["emit"]
+            sentinel = emission["sentinel"]
+            honey = emission["honey_pot"]
+            self.last_switchboard = emission.get("board")
             if mission.parent_mission_id:
                 parent_resume = resume_parent_from_receipts(
                     self.queue,
@@ -379,10 +437,24 @@ class FounderRuntime:
                     child_job_id=job_id,
                 )
                 chain = self.queue.ledger.verify()
+            fr_update = update_fr_evidence(
+                mission.mission_id,
+                {
+                    "job_id": job_id,
+                    "ledger_tail_sha": chain["tail_sha"],
+                    "job_status": state.status.value,
+                    "parent_resume": parent_resume,
+                    "switchboard_bind": (switchboard_emit or {}).get("bind_status"),
+                    "sentinel_bind": (sentinel or {}).get("bind_status"),
+                },
+                opener=self.http_open,
+                token=self.fr_token,
+            )
         elif mission.parent_mission_id:
             parent_resume = {
                 "parent_mission_id": mission.parent_mission_id,
                 "automatic": False,
+                "proven": False,
                 "status": "CHILD_NOT_RECEIPTED",
                 "note": "parent resume waits for a receipted child success",
             }
@@ -405,5 +477,13 @@ class FounderRuntime:
             sealed_receipt=sealed,
             court_request=court,
             switchboard_emit=switchboard_emit,
-            note="existing deterministic workflow reused; queue/runner/ledger remain canonical",
+            sentinel=sentinel,
+            honey_pot=honey,
+            fr_bind=fr_bind,
+            fr_evidence_update=fr_update,
+            note="FR ticket dispatched onto existing queue/runner/ledger; no second FR",
         )
+
+
+# Compatibility alias: this class is the dispatch bridge, not a new Founder Runtime.
+FounderRuntime = DispatchBridge
