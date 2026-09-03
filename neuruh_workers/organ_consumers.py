@@ -42,11 +42,7 @@ FR_API_PORT = 19090
 FR_API_VERSION = "fr-api-v1"
 FR_HEALTH_URL = f"http://{FR_API_HOST}:{FR_API_PORT}/v1/health"
 FR_MISSIONS_URL = f"http://{FR_API_HOST}:{FR_API_PORT}/v1/missions"
-FR_DISPATCHABLE_STATES = frozenset({
-    "APPROVED",
-    "QUEUED",
-    "APPROVED_NO_EXECUTION",
-})
+FR_DISPATCHABLE_STATES = frozenset({"QUEUED"})
 
 RF_IMPORT_PATHS = (
     "revenue_factory.authorization",
@@ -357,15 +353,11 @@ def pull_dispatchable_tickets(
     tickets = []
     for item in missions:
         state = str(item.get("state") or "")
-        authority = ((item.get("authority") or {}).get("state") or "")
-        if state in FR_DISPATCHABLE_STATES or authority == "APPROVED":
-            tickets.append({
-                "mission_id": item.get("mission_id"),
-                "state": state,
-                "authority": authority,
-                "version": item.get("version"),
-                "api_version": item.get("api_version") or FR_API_VERSION,
-            })
+        if state in FR_DISPATCHABLE_STATES:
+            # Preserve the authoritative FR envelope verbatim. The Workers
+            # boundary factory validates its consumed gate, work-spec hash,
+            # workflow and layer before constructing execution types.
+            tickets.append(dict(item))
     return {
         "attempted": True,
         "ok": bool(listed.get("ok")),

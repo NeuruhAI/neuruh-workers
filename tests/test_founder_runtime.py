@@ -1,4 +1,6 @@
+import hashlib
 import inspect
+import json
 import os
 import tempfile
 import unittest
@@ -22,6 +24,7 @@ from neuruh_workers.founder_runtime import (
     RuntimeStatus,
     WorkCandidate,
     compile_context,
+    map_founder_runtime_dispatch,
     rank_candidates,
 )
 from neuruh_workers.events import EventType
@@ -105,6 +108,162 @@ class FounderRuntimeCourt(unittest.TestCase):
         )
         base.update(kwargs)
         return WorkCandidate(**base)
+
+    def fr_envelope(self, **updates):
+        work_spec = {
+            "schema": "fr.work_spec.v1",
+            "candidate_id": "candidate-fr-boundary",
+            "workflow_name": "property-research",
+            "params": {
+                "address": "123 Main St, Benton Harbor, MI",
+                "county": "Berrien",
+            },
+            "intelligence_layer": "L0_DETERMINISTIC",
+            "evidence_refs": ["workflow:property-research@1.0.0"],
+            "production_mutation": False,
+            "external_message": False,
+            "money_move": False,
+            "irreversible": False,
+            "private_ip_risk": False,
+            "code_custody_required": False,
+        }
+        work_spec_sha256 = hashlib.sha256(
+            json.dumps(
+                work_spec,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8"),
+        ).hexdigest()
+        envelope = {
+            "api_version": FR_API_VERSION,
+            "mission_id": "msn-fr-boundary",
+            "state": "QUEUED",
+            "version": 12,
+            "objective": "Read-only public-record research.",
+            "work_spec": work_spec,
+            "work_spec_sha256": work_spec_sha256,
+            "authority": {
+                "state": "APPROVED",
+                "work_spec_sha256": work_spec_sha256,
+                "work_spec_execution_authorized": True,
+                "execution_authorized": True,
+                "dispatch_approval_id": "appr-fr-boundary",
+            },
+        }
+        envelope.update(updates)
+        return envelope
+
+    def rebind_work_spec(self, envelope):
+        work_spec_sha256 = hashlib.sha256(
+            json.dumps(
+                envelope["work_spec"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8"),
+        ).hexdigest()
+        envelope["work_spec_sha256"] = work_spec_sha256
+        envelope["authority"]["work_spec_sha256"] = work_spec_sha256
+        return envelope
+
+    def test_maps_authority_bound_fr_envelope_to_real_workers_types(self):
+        ticket, candidate = map_founder_runtime_dispatch(
+            self.fr_envelope(),
+            catalog=self.catalog,
+        )
+        self.assertIsInstance(ticket, DispatchTicket)
+        self.assertIsInstance(candidate, WorkCandidate)
+        self.assertIs(candidate.layer, IntelligenceLayer.L0)
+        self.assertTrue(self.catalog.get(candidate.workflow_name).read_only)
+        context = compile_context(ticket, candidate)
+        self.assertEqual(context["candidate"]["layer"], "L0_DETERMINISTIC")
+        self.assertEqual(context["fr_state"], "QUEUED")
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+    def test_pulled_fr_envelope_reaches_production_mapping_without_loss(self):
+        envelope = self.fr_envelope()
+
+        class _Response:
+            status = 200
+
+            def __init__(self, url):
+                self.url = url
+
+            def read(self):
+                if self.url.endswith("/v1/health"):
+                    return b'{"status":"ok","api_version":"fr-api-v1","auth_configured":true}'
+                return json.dumps({
+                    "count": 1,
+                    "missions": [envelope],
+                }).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        pulled = pull_dispatchable_tickets(
+            opener=lambda request, timeout=None: _Response(request.full_url),
+            token="court",
+        )
+        self.assertTrue(pulled["ok"])
+        self.assertEqual(pulled["tickets"], [envelope])
+        ticket, candidate = map_founder_runtime_dispatch(
+            pulled["tickets"][0],
+            catalog=self.catalog,
+        )
+        self.assertIsInstance(ticket, DispatchTicket)
+        self.assertIsInstance(candidate, WorkCandidate)
+        self.assertIs(candidate.layer, IntelligenceLayer.L0)
+        compile_context(ticket, candidate)
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+    def test_fr_envelope_mapping_fails_closed_without_execution_authority(self):
+        for update in (
+            {"state": "APPROVED_NO_EXECUTION"},
+            {"state": "PAUSED"},
+            {"authority": {
+                "state": "PLAN_APPROVED_NO_EXECUTION",
+                "work_spec_sha256": self.fr_envelope()["work_spec_sha256"],
+                "work_spec_execution_authorized": False,
+                "execution_authorized": False,
+                "dispatch_approval_id": None,
+            }},
+        ):
+            with self.subTest(update=update):
+                with self.assertRaises(ValueError):
+                    map_founder_runtime_dispatch(
+                        self.fr_envelope(**update),
+                        catalog=self.catalog,
+                    )
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+    def test_fr_envelope_mapping_rejects_invalid_work_spec_material(self):
+        cases = []
+        unknown_workflow = self.fr_envelope()
+        unknown_workflow["work_spec"]["workflow_name"] = "unknown-workflow"
+        cases.append(self.rebind_work_spec(unknown_workflow))
+        malformed_params = self.fr_envelope()
+        malformed_params["work_spec"]["params"] = ["not", "an", "object"]
+        cases.append(self.rebind_work_spec(malformed_params))
+        nested_float = self.fr_envelope()
+        nested_float["work_spec"]["params"] = {"nested": [{"confidence": 1.5}]}
+        cases.append(self.rebind_work_spec(nested_float))
+        unknown_layer = self.fr_envelope()
+        unknown_layer["work_spec"]["intelligence_layer"] = "L5_UNKNOWN"
+        cases.append(self.rebind_work_spec(unknown_layer))
+        wrong_hash = self.fr_envelope(work_spec_sha256="0" * 64)
+        cases.append(wrong_hash)
+        for envelope in cases:
+            with self.subTest(envelope=envelope):
+                with self.assertRaises(ValueError):
+                    map_founder_runtime_dispatch(
+                        envelope,
+                        catalog=self.catalog,
+                    )
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
 
     def test_aliases_are_dispatch_bridge_not_a_new_fr(self):
         self.assertIs(FounderRuntime, DispatchBridge)
@@ -272,7 +431,6 @@ class FounderRuntimeCourt(unittest.TestCase):
             blockers=tuple(f"blocker-{i}" for i in range(20)),
         )
         packet = compile_context(mission, self.property_candidate(), max_bytes=1800)
-        import json
         raw = json.dumps(packet, sort_keys=True).encode("utf-8")
         self.assertLessEqual(len(raw), 1800)
         self.assertNotIn("chat_history", packet)
@@ -525,10 +683,32 @@ class FounderRuntimeCourt(unittest.TestCase):
             def read(self):
                 if self.url.endswith("/v1/health"):
                     return b'{"status":"ok","api_version":"fr-api-v1","auth_configured":true}'
-                return (
-                    b'{"count":1,"missions":[{"mission_id":"FR-1","state":"QUEUED",'
-                    b'"api_version":"fr-api-v1","authority":{"state":"APPROVED"}}]}'
-                )
+                return json.dumps({
+                    "count": 2,
+                    "missions": [
+                        {
+                            "mission_id": "FR-1",
+                            "state": "QUEUED",
+                            "api_version": "fr-api-v1",
+                            "objective": "read-only research",
+                            "work_spec": {"schema": "fr.work_spec.v1"},
+                            "work_spec_sha256": "a" * 64,
+                            "authority": {
+                                "state": "APPROVED",
+                                "execution_authorized": True,
+                            },
+                        },
+                        {
+                            "mission_id": "FR-PLAN",
+                            "state": "APPROVED_NO_EXECUTION",
+                            "api_version": "fr-api-v1",
+                            "authority": {
+                                "state": "PLAN_APPROVED_NO_EXECUTION",
+                                "execution_authorized": False,
+                            },
+                        },
+                    ],
+                }).encode("utf-8")
 
             def __enter__(self):
                 return self
@@ -541,7 +721,14 @@ class FounderRuntimeCourt(unittest.TestCase):
             token="t",
         )
         self.assertEqual(pulled["bind_status"], "FR_TICKETS_CONSUMED")
+        self.assertEqual(len(pulled["tickets"]), 1)
         self.assertEqual(pulled["tickets"][0]["mission_id"], "FR-1")
+        self.assertEqual(pulled["tickets"][0]["objective"], "read-only research")
+        self.assertEqual(
+            pulled["tickets"][0]["work_spec"]["schema"],
+            "fr.work_spec.v1",
+        )
+        self.assertTrue(pulled["tickets"][0]["authority"]["execution_authorized"])
         self.assertFalse(pulled["this_pr_persists_missions"])
 
     def test_ownership_seam_does_not_claim_foreign_organs(self):
