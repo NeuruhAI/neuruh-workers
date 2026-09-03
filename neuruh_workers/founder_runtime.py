@@ -20,12 +20,14 @@ USD `score_candidate` stays deleted. AXON writes are banned. No Ether.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import asdict, dataclass
 from enum import Enum
 from math import isfinite
 from typing import Any, Callable, Mapping, Sequence
 
-from .contracts import JobStatus, canonical_json, content_sha
+from .contracts import DefinitionError, JobStatus, canonical_json, content_sha
 from .convergence import GSA_AUTHORITY_PATH
 from .definitions import WorkflowCatalog
 from .organ_consumers import (
@@ -145,6 +147,154 @@ class WorkCandidate:
             value = float(getattr(self, name))
             if value < 0 or not isfinite(value):
                 raise ValueError(f"{name} must be finite and non-negative")
+
+
+FR_WORK_SPEC_SCHEMA = "fr.work_spec.v1"
+_WORK_SPEC_FIELDS = frozenset({
+    "schema",
+    "candidate_id",
+    "workflow_name",
+    "params",
+    "intelligence_layer",
+    "evidence_refs",
+    "production_mutation",
+    "external_message",
+    "money_move",
+    "irreversible",
+    "private_ip_risk",
+    "code_custody_required",
+})
+_WORK_SPEC_FLAGS = (
+    "production_mutation",
+    "external_message",
+    "money_move",
+    "irreversible",
+    "private_ip_risk",
+    "code_custody_required",
+)
+
+
+def _validate_work_params(value: Any, path: str = "$.params") -> Any:
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if isinstance(value, float):
+        raise ValueError(f"{path}: floats are not valid FR work-spec params")
+    if isinstance(value, list):
+        return [
+            _validate_work_params(item, f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, Mapping):
+        normalized = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"{path}: parameter keys must be non-empty strings")
+            normalized[key] = _validate_work_params(item, f"{path}.{key}")
+        return normalized
+    raise ValueError(f"{path}: value is not JSON-compatible")
+
+
+def _fr_work_spec_sha256(work_spec: Mapping[str, Any]) -> str:
+    serialized = json.dumps(
+        work_spec,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def map_founder_runtime_dispatch(
+    envelope: Mapping[str, Any],
+    *,
+    catalog: WorkflowCatalog,
+) -> tuple[DispatchTicket, WorkCandidate]:
+    """Map one authority-bound FR envelope into Workers types without inference."""
+    if not isinstance(envelope, Mapping):
+        raise ValueError("Founder Runtime envelope must be an object")
+    if envelope.get("state") != "QUEUED":
+        raise ValueError("Founder Runtime mission is not QUEUED")
+    if envelope.get("api_version") != FR_API_VERSION:
+        raise ValueError(f"Founder Runtime api_version must be {FR_API_VERSION}")
+
+    authority = envelope.get("authority")
+    if not isinstance(authority, Mapping):
+        raise ValueError("Founder Runtime authority truth is missing")
+    if authority.get("state") != "APPROVED":
+        raise ValueError("Founder Runtime execution gate is not approved")
+    if authority.get("execution_authorized") is not True:
+        raise ValueError("Founder Runtime execution authorization is absent")
+    if authority.get("work_spec_execution_authorized") is not True:
+        raise ValueError("Founder Runtime work spec is not execution-authorized")
+    if not isinstance(authority.get("dispatch_approval_id"), str) or not authority["dispatch_approval_id"]:
+        raise ValueError("Founder Runtime consumed dispatch approval identity is missing")
+
+    work_spec = envelope.get("work_spec")
+    if not isinstance(work_spec, Mapping):
+        raise ValueError("Founder Runtime work_spec is missing")
+    if set(work_spec) != _WORK_SPEC_FIELDS:
+        raise ValueError("Founder Runtime work_spec fields are incomplete or extended")
+    if work_spec.get("schema") != FR_WORK_SPEC_SCHEMA:
+        raise ValueError(f"work_spec schema must be {FR_WORK_SPEC_SCHEMA}")
+
+    work_spec_sha256 = envelope.get("work_spec_sha256")
+    if not isinstance(work_spec_sha256, str) or len(work_spec_sha256) != 64:
+        raise ValueError("Founder Runtime work_spec_sha256 is malformed")
+    if authority.get("work_spec_sha256") != work_spec_sha256:
+        raise ValueError("Founder Runtime authority is bound to a different work spec")
+    if _fr_work_spec_sha256(work_spec) != work_spec_sha256:
+        raise ValueError("Founder Runtime work_spec hash mismatch")
+
+    candidate_id = work_spec.get("candidate_id")
+    workflow_name = work_spec.get("workflow_name")
+    if not isinstance(candidate_id, str) or not candidate_id:
+        raise ValueError("work_spec candidate_id is required")
+    if not isinstance(workflow_name, str) or not workflow_name:
+        raise ValueError("work_spec workflow_name is required")
+    try:
+        catalog.get(workflow_name)
+    except DefinitionError as exc:
+        raise ValueError("work_spec workflow_name is not registered") from exc
+
+    params = work_spec.get("params")
+    if not isinstance(params, Mapping):
+        raise ValueError("work_spec params must be an object")
+    params = _validate_work_params(params)
+    evidence_refs = work_spec.get("evidence_refs")
+    if (
+        not isinstance(evidence_refs, list)
+        or any(not isinstance(ref, str) or not ref for ref in evidence_refs)
+    ):
+        raise ValueError("work_spec evidence_refs must be non-empty strings")
+    for flag in _WORK_SPEC_FLAGS:
+        if type(work_spec.get(flag)) is not bool:
+            raise ValueError(f"work_spec {flag} must be boolean")
+    try:
+        layer = IntelligenceLayer(work_spec.get("intelligence_layer"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("work_spec intelligence_layer is unsupported") from exc
+
+    ticket = DispatchTicket(
+        mission_id=str(envelope.get("mission_id") or ""),
+        objective=str(envelope.get("objective") or ""),
+        fr_state=str(envelope["state"]),
+        fr_api_version=str(envelope["api_version"]),
+        code_custody_required=work_spec["code_custody_required"],
+    )
+    candidate = WorkCandidate(
+        candidate_id=candidate_id,
+        workflow_name=workflow_name,
+        params=params,
+        layer=layer,
+        evidence_refs=tuple(evidence_refs),
+        production_mutation=work_spec["production_mutation"],
+        external_message=work_spec["external_message"],
+        money_move=work_spec["money_move"],
+        irreversible=work_spec["irreversible"],
+        private_ip_risk=work_spec["private_ip_risk"],
+    )
+    return ticket, candidate
 
 
 @dataclass(frozen=True)
