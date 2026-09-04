@@ -492,12 +492,15 @@ class FounderRuntimeCourt(unittest.TestCase):
                 envelope["authority"]["dispatch_approval_id"] = approval_id
                 with self.assertRaises(ValueError):
                     map_founder_runtime_dispatch(envelope, catalog=self.catalog)
-        # An empty objective is still no objective at all.
-        with self.assertRaises(ValueError):
-            map_founder_runtime_dispatch(
-                self.fr_envelope(objective=""),
-                catalog=self.catalog,
-            )
+        # An empty objective is still no objective at all -- and widening the
+        # newline rule must not let whitespace impersonate mission intent.
+        for empty in ("", " ", "\t", "\n", "\r\n", "\n\n\n"):
+            with self.subTest(objective=repr(empty)):
+                with self.assertRaises(ValueError):
+                    map_founder_runtime_dispatch(
+                        self.fr_envelope(objective=empty),
+                        catalog=self.catalog,
+                    )
         self.assertEqual(self.ledger.verify()["receipts"], 0)
 
     def test_pulled_fr_envelope_reaches_production_mapping_without_loss(self):

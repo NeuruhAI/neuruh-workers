@@ -105,7 +105,10 @@ class DispatchTicket:
     code_custody_required: bool = False
 
     def __post_init__(self) -> None:
-        if not self.mission_id or not self.objective:
+        # `.strip()` here tests emptiness only -- the stored objective is never
+        # rewritten. Widening the newline rule below must not make "\n" a
+        # substitute for the mission intent this field is supposed to carry.
+        if not self.mission_id or not self.objective.strip():
             raise ValueError("mission_id and objective are required")
         if type(self.mission_version) is not int or self.mission_version < 1:
             raise ValueError("mission_version must be a positive integer")
