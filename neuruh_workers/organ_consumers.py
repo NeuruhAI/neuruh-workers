@@ -12,13 +12,21 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import stat
 import subprocess
+import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 from .contracts import JobStatus, ReceiptType, canonical_json
+from .prime_receipts import (
+    FR_DISPATCH_RECEIPT_SCHEMA,
+    parse_prime_receipt,
+    seal_receipt_text,
+)
 from .queue import JobQueue
 from .runner import WorkflowRunner
 
@@ -56,17 +64,14 @@ GSA_AUTHORITY_PATH = "governance->sentinel->axon"
 PARENT_REQUESTED_BY_PREFIX = "jgi:"
 DISPATCH_SOURCE_ROLE = "DISPATCH_BRIDGE"
 DISPATCH_SOURCE_COMPONENT = "fr-to-workers-dispatch-bridge"
-DISPATCH_AUTHORITY_REF = "fr-api-v1:approved-queued-dispatch"
-REQUIRED_SEALED_INVARIANTS = (
-    "envelope.valid",
-    "hash.matches_if_provided",
-    "source_identity.coherent",
-    "mission_stage.unambiguous",
-    "authority.present",
-    "loopback_only",
-    "sentinel_closure_in_receipt_is_not_pass",
-    "ci_job_named_court_is_not_sentinel",
-)
+
+
+@dataclass(frozen=True)
+class DispatchSourceIdentity:
+    head: str
+    branch: str
+    worktree: str
+    remote: str
 
 HttpOpen = Callable[..., Any]
 
@@ -102,8 +107,85 @@ def resolve_source_head(explicit: str | None = None) -> str:
     return "0" * 40
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+def resolve_dispatch_source_identity(
+    source_root: str,
+    explicit_head: str | None,
+) -> DispatchSourceIdentity:
+    root = os.path.realpath(source_root)
+    try:
+        top = os.path.realpath(subprocess.check_output(
+            ["git", "-C", root, "rev-parse", "--show-toplevel"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip())
+        head = subprocess.check_output(
+            ["git", "-C", root, "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip().lower()
+        branch = subprocess.check_output(
+            ["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "-C", root, "status", "--porcelain"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        remote = subprocess.check_output(
+            ["git", "-C", root, "remote", "get-url", "origin"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("Workers source identity is unavailable") from exc
+    if top != root:
+        raise RuntimeError("Workers source root is not the git worktree root")
+    if explicit_head is not None and explicit_head.lower() != head:
+        raise RuntimeError("Workers explicit source head differs from checkout HEAD")
+    if dirty:
+        raise RuntimeError("Workers source checkout is dirty")
+    if branch != "main":
+        raise RuntimeError("Workers source checkout must be canonical main")
+    approved_remotes = {
+        "https://github.com/NeuruhAI/neuruh-workers.git",
+        "git@github.com:NeuruhAI/neuruh-workers.git",
+    }
+    if remote not in approved_remotes:
+        raise RuntimeError("Workers source origin is not NeuruhAI/neuruh-workers")
+    try:
+        origin_main = subprocess.check_output(
+            ["git", "-C", root, "rev-parse", "origin/main"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip().lower()
+        remote_main = _remote_main_head(root)
+    except (
+        OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, TimeoutError,
+    ) as exc:
+        raise RuntimeError("Workers canonical remote main is unavailable") from exc
+    if head != origin_main or head != remote_main:
+        raise RuntimeError("Workers source HEAD differs from fetched origin/main")
+    return DispatchSourceIdentity(
+        head=head,
+        branch=branch,
+        worktree=root,
+        remote=remote,
+    )
+
+
+def _remote_main_head(root: str) -> str:
+    output = subprocess.check_output(
+        ["git", "-C", root, "ls-remote", "--exit-code", "origin", "refs/heads/main"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+    ).strip()
+    fields = output.split()
+    if len(fields) != 2 or fields[1] != "refs/heads/main" or not _looks_head(fields[0]):
+        raise RuntimeError("Workers canonical remote returned an invalid main ref")
+    return fields[0].lower()
 
 
 def http_get_json(
@@ -304,6 +386,7 @@ def bind_founder_runtime(
         bool(probe.get("ok"))
         and api_version == FR_API_VERSION
         and data.get("status") == "ok"
+        and data.get("auth_configured") is True
     )
     return {
         "owner": "NeuruhAI/recipe-engine Founder Runtime",
@@ -369,6 +452,37 @@ def pull_dispatchable_tickets(
     }
 
 
+def pull_authoritative_mission(
+    mission_id: str,
+    *,
+    opener: HttpOpen | None = None,
+    token: str | None = None,
+    timeout_s: float = 0.25,
+) -> dict[str, Any]:
+    if not token:
+        return {
+            "attempted": False,
+            "ok": False,
+            "error": "FR_API_OPERATOR_TOKEN_REQUIRED",
+            "envelope": None,
+        }
+    quoted = urllib.parse.quote(mission_id, safe="")
+    result = http_get_json(
+        f"{FR_MISSIONS_URL}/{quoted}",
+        timeout_s=timeout_s,
+        opener=opener,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    data = result.get("data")
+    envelope = data.get("envelope") if isinstance(data, Mapping) else None
+    return {
+        "attempted": True,
+        "ok": bool(result.get("ok")) and isinstance(envelope, Mapping),
+        "error": result.get("error"),
+        "envelope": dict(envelope) if isinstance(envelope, Mapping) else None,
+    }
+
+
 def update_fr_evidence(
     mission_id: str,
     evidence: Mapping[str, Any],
@@ -386,14 +500,15 @@ def update_fr_evidence(
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    quoted = urllib.parse.quote(mission_id, safe="")
     read = http_get_json(
-        f"{FR_MISSIONS_URL}/{mission_id}",
+        f"{FR_MISSIONS_URL}/{quoted}",
         timeout_s=timeout_s,
         opener=opener,
         headers=headers,
     )
     write = http_post_json(
-        f"{FR_MISSIONS_URL}/{mission_id}/evidence",
+        f"{FR_MISSIONS_URL}/{quoted}/evidence",
         {
             "api_version": FR_API_VERSION,
             "mission_id": mission_id,
@@ -578,43 +693,97 @@ def events_present() -> bool:
     return try_import(EVENTS_MODULE) is not None
 
 
-def _prime_receipt_text(
+def _fr_dispatch_receipt_text(
     *,
     mission_id: str,
+    mission_version: int,
+    work_spec_sha256: str,
+    idempotency_key: str,
+    dispatch_result: str,
     job_id: str,
     ledger_tail_sha: str,
     context_digest: str,
     evidence_refs: Sequence[str],
     job_succeeded_sha: str | None,
     source_head: str,
+    source_branch: str,
+    source_worktree: str,
+    authority_ref: str,
     code_custody_required: bool,
 ) -> str:
-    refs = ",".join(evidence_refs)
-    lines = [
-        f"MISSION_ID={mission_id}",
-        "STAGE_ID=fr-to-workers-dispatch",
-        f"TASK_ID={job_id}",
-        f"SOURCE_HEAD={source_head}",
-        f"AUTHORITY_REFERENCE={DISPATCH_AUTHORITY_REF}",
-        "EVENT_TARGET=receipt.sealed",
-        "EVENT_IMPLEMENTATION_STATUS=EMITTED",
-        "REPO=NeuruhAI/neuruh-workers",
-        "BRANCH=feature/jgi-founder-runtime-v0-20260901",
-        f"LEDGER_TAIL_SHA={ledger_tail_sha}",
-        f"JOB_ID={job_id}",
-        f"CONTEXT_DIGEST={context_digest}",
-        f"EVIDENCE_REFS={refs}",
-        f"JOB_SUCCEEDED_SHA={job_succeeded_sha or ''}",
-        "SENTINEL_MODEL_EXECUTION=BLOCKED",
-        "SENTINEL_CLOSURE=NOT_JUDGED",
-        "PRIME_VERDICT=NOT_JUDGED",
-        "NETWORK_POLICY=loopback_only",
-        f"SOURCE_ROLE={DISPATCH_SOURCE_ROLE}",
-        f"SOURCE_COMPONENT={DISPATCH_SOURCE_COMPONENT}",
-        f"CLAIMER={DISPATCH_SOURCE_ROLE}",
-        f"CODE_CUSTODY_REQUIRED={'YES' if code_custody_required else 'NO'}",
+    values = [
+        ("RECEIPT_SCHEMA", FR_DISPATCH_RECEIPT_SCHEMA),
+        ("MISSION_ID", mission_id),
+        ("MISSION_VERSION", str(mission_version)),
+        ("WORK_SPEC_SHA256", work_spec_sha256),
+        ("IDEMPOTENCY_KEY", idempotency_key),
+        ("DISPATCH_RESULT", dispatch_result),
+        ("STAGE_ID", "fr-to-workers-dispatch"),
+        ("TASK_ID", job_id),
+        ("SOURCE_HEAD", source_head),
+        ("AUTHORITY_REFERENCE", authority_ref),
+        ("EVENT_TARGET", "receipt.sealed"),
+        ("EVENT_IMPLEMENTATION_STATUS", "EMITTED"),
+        ("REPO", "NeuruhAI/neuruh-workers"),
+        ("WORKTREE", source_worktree),
+        ("BRANCH", source_branch),
+        ("REMOTE", "origin"),
+        ("LEDGER_TAIL_SHA", ledger_tail_sha),
+        ("JOB_ID", job_id),
+        ("CONTEXT_DIGEST", context_digest),
+        ("EVIDENCE_REFS", ",".join(evidence_refs)),
+        ("JOB_SUCCEEDED_SHA", job_succeeded_sha or ""),
+        ("SENTINEL_MODEL_EXECUTION", "BLOCKED"),
+        ("SENTINEL_CLOSURE", "NOT_JUDGED"),
+        ("PRIME_VERDICT", "NOT_JUDGED"),
+        ("NETWORK_POLICY", "127.0.0.1:local-only"),
+        ("SOURCE_ROLE", DISPATCH_SOURCE_ROLE),
+        ("SOURCE_COMPONENT", DISPATCH_SOURCE_COMPONENT),
+        ("CODE_CUSTODY_REQUIRED", "YES" if code_custody_required else "NO"),
     ]
-    return "\n".join(lines) + "\n"
+    lines = []
+    for key, value in values:
+        if "\r" in value or "\n" in value or "\x00" in value:
+            raise ValueError(f"{key} must be a single-line receipt scalar")
+        lines.append(f"{key}={value}")
+    return seal_receipt_text("\n".join(lines) + "\n")
+
+
+def _write_immutable(path: str, text: str) -> None:
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o444)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            existing = os.lstat(path)
+            if (
+                not stat.S_ISREG(existing.st_mode)
+                or existing.st_mode & 0o222
+            ):
+                raise RuntimeError(
+                    "existing sealed receipt is not an immutable regular file")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            existing_fd = os.open(path, flags)
+            with os.fdopen(existing_fd, encoding="utf-8") as handle:
+                if handle.read() != text:
+                    raise RuntimeError(
+                        "immutable sealed receipt already exists with other bytes")
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def emit_receipt_sealed_and_switcharoo(
@@ -625,7 +794,14 @@ def emit_receipt_sealed_and_switcharoo(
     context_digest: str,
     evidence_refs: Sequence[str],
     job_succeeded_sha: str | None,
+    dispatch_approval_id: str,
+    work_spec_sha256: str,
+    mission_version: int,
+    idempotency_key: str,
+    dispatch_result: str,
     source_head: str | None = None,
+    source_root: str | None = None,
+    source_identity: DispatchSourceIdentity | None = None,
     receipts_dir: str | None = None,
     switchboard_root: str | None = None,
     code_custody_required: bool = False,
@@ -721,99 +897,129 @@ def emit_receipt_sealed_and_switcharoo(
             "board": None,
         }
 
-    head = resolve_source_head(source_head)
-    os.makedirs(receipts_dir, exist_ok=True)
-    os.makedirs(switchboard_root, exist_ok=True)
-    receipt_ref = os.path.abspath(os.path.join(receipts_dir, f"{job_id}.txt"))
-    with open(receipt_ref, "w", encoding="utf-8") as fh:
-        fh.write(_prime_receipt_text(
+    try:
+        identity = source_identity or resolve_dispatch_source_identity(
+            source_root or os.getcwd(), source_head)
+        current_identity = resolve_dispatch_source_identity(
+            identity.worktree, identity.head)
+        if current_identity != identity:
+            raise RuntimeError("Workers source identity changed before receipt sealing")
+        authority_ref = (
+            f"{FR_API_VERSION}:approval:{dispatch_approval_id}:"
+            f"work-spec:{work_spec_sha256}"
+        )
+        stable_tail = job_succeeded_sha or ledger_tail_sha
+        receipt_text = _fr_dispatch_receipt_text(
             mission_id=mission_id,
+            mission_version=mission_version,
+            work_spec_sha256=work_spec_sha256,
+            idempotency_key=idempotency_key,
+            dispatch_result=dispatch_result,
             job_id=job_id,
-            ledger_tail_sha=ledger_tail_sha,
+            ledger_tail_sha=stable_tail,
             context_digest=context_digest,
             evidence_refs=evidence_refs,
             job_succeeded_sha=job_succeeded_sha,
-            source_head=head,
+            source_head=identity.head,
+            source_branch=identity.branch,
+            source_worktree=identity.worktree,
+            authority_ref=authority_ref,
             code_custody_required=code_custody_required,
-        ))
-
-    payload = {
-        "receipt_ref": receipt_ref,
-        "receipt_sha": job_succeeded_sha or ledger_tail_sha,
-        "mission": mission_id,
-        "stage": "fr-to-workers-dispatch",
-        "claimer": DISPATCH_SOURCE_ROLE,
-        "repo": "NeuruhAI/neuruh-workers",
-        "worktree": os.getcwd(),
-        "branch": "feature/jgi-founder-runtime-v0-20260901",
-        "head": head,
-        "remote": "origin",
-        "job_id": job_id,
-        "ledger_tail_sha": ledger_tail_sha,
-        "context_digest": context_digest,
-        "evidence_refs": list(evidence_refs),
-        "job_succeeded_sha": job_succeeded_sha,
-        "sentinel_closure_in_receipt": "NOT_JUDGED",
-        "required_invariants": list(REQUIRED_SEALED_INVARIANTS),
-        "code_custody_required": code_custody_required,
-    }
-    sealed = events.build_envelope(
-        event_type=events.EventType.RECEIPT_SEALED,
-        mission_id=mission_id,
-        plan_id="fr-to-workers-dispatch",
-        task_id=job_id,
-        correlation_id="corr-" + (job_succeeded_sha or ledger_tail_sha)[:24],
-        causation_id="",
-        source_role=DISPATCH_SOURCE_ROLE,
-        source_component=DISPATCH_SOURCE_COMPONENT,
-        source_repo="NeuruhAI/neuruh-workers",
-        source_head=head,
-        created_at=utc_now(),
-        authority_ref=DISPATCH_AUTHORITY_REF,
-        payload=payload,
-        idempotency_key=f"receipt.sealed|{job_succeeded_sha or ledger_tail_sha}",
-    )
-
-    try:
+        )
+        os.makedirs(switchboard_root, exist_ok=True)
+        receipt_ref = os.path.abspath(os.path.join(receipts_dir, f"{job_id}.txt"))
+        _write_immutable(receipt_ref, receipt_text)
+        expected_receipt_sha = parse_prime_receipt(receipt_ref).content_sha
         board = switchboard_cls(
             switchboard_root,
             receipts_dir=receipts_dir,
             known_missions=frozenset({mission_id}),
         )
-        stored = board.ingest_raw(dict(sealed))
         report = board.tick()
-        court_events = board.events(events.EventType.COURT_REQUESTED)
-        passed = board.events(events.EventType.COURT_PASSED)
+        sealed_events = [
+            item for item in board.events(events.EventType.RECEIPT_SEALED)
+            if (
+                item.get("mission_id") == mission_id
+                and item.get("task_id") == job_id
+                and (item.get("payload_ref_or_payload") or {}).get("receipt_sha")
+                == expected_receipt_sha
+            )
+        ]
+        court_events = [
+            item for item in board.events(events.EventType.COURT_REQUESTED)
+            if (
+                len(sealed_events) == 1
+                and item.get("mission_id") == mission_id
+                and item.get("task_id") == job_id
+                and item.get("causation_id") == sealed_events[0].get("event_id")
+            )
+        ]
+        passed = [
+            item for item in board.events(events.EventType.COURT_PASSED)
+            if (
+                len(court_events) == 1
+                and item.get("mission_id") == mission_id
+                and item.get("correlation_id") == court_events[0].get("correlation_id")
+                and item.get("causation_id") == court_events[0].get("event_id")
+            )
+        ]
+        failed = [
+            item for item in board.events(events.EventType.COURT_FAILED)
+            if (
+                len(court_events) == 1
+                and item.get("mission_id") == mission_id
+                and item.get("correlation_id") == court_events[0].get("correlation_id")
+                and item.get("causation_id") == court_events[0].get("event_id")
+            )
+        ]
         jobs_mod = try_import("neuruh_workers.switchboard_jobs")
-        sentinel_workflow = getattr(jobs_mod, "SENTINEL_WORKFLOW", "sentinel-court-artifact")
         honey_workflow = getattr(jobs_mod, "HONEY_POT_WORKFLOW", "honey-pot-candidate-push")
         model_exec = getattr(jobs_mod, "SENTINEL_MODEL_EXECUTION", "BLOCKED")
-        sentinel_jobs = board.jobs_for(sentinel_workflow)
         honey_jobs = board.jobs_for(honey_workflow)
-        court_request = court_events[-1] if court_events else None
+        sealed = sealed_events[0] if len(sealed_events) == 1 else None
+        court_request = court_events[0] if len(court_events) == 1 else None
+        deadlettered = list(getattr(report, "deadlettered", []))
+        consumed = (
+            len(sealed_events) == 1
+            and len(court_events) == 1
+            and len(passed) <= 1
+            and len(failed) <= 1
+            and not (passed and failed)
+            and not deadlettered
+        )
         emit = {
             "attempted": True,
             "switchboard_present": True,
-            "consumed": True,
-            "error": None,
-            "bind_status": "SWITCHBOARD_CONSUMED",
-            "stored_event_id": stored.get("event_id") if isinstance(stored, dict) else None,
+            "consumed": consumed,
+            "error": None if consumed else "SWITCHBOARD_RECEIPT_NOT_CONSUMED",
+            "bind_status": (
+                "SWITCHBOARD_CONSUMED"
+                if consumed
+                else "SWITCHBOARD_RECEIPT_REJECTED_FAIL_CLOSED"
+            ),
+            "stored_event_id": (
+                sealed.get("event_id") if isinstance(sealed, dict) else None
+            ),
             "jobs_created": list(getattr(report, "jobs_created", [])),
+            "deadlettered": deadlettered,
+            "matching_sealed_count": len(sealed_events),
+            "matching_court_count": len(court_events),
         }
-        if passed:
-            # Dispatch must never be the source of a court PASS.
-            emit["consumed"] = False
-            emit["error"] = "FAKE_SENTINEL_PASS_REFUSED"
-            emit["bind_status"] = "SENTINEL_PASS_FORGED_FAIL_CLOSED"
+        prior_verdict = "PASS" if passed else ("FAIL" if failed else None)
         sentinel = {
             "independent": True,
-            "judged": False,
-            "verdict": None,
+            "judged": prior_verdict is not None,
+            "verdict": prior_verdict,
             "model_execution": model_exec,
             "ci_job_named_court_is_not_sentinel": True,
-            "court_job_ids": list(sentinel_jobs),
+            "court_job_ids": (
+                [court_request["payload_ref_or_payload"]["court_job_id"]]
+                if court_request is not None else []
+            ),
             "bind_status": (
-                "SENTINEL_COURT_JOBBED_INDEPENDENT"
+                f"SENTINEL_ALREADY_COURTED_{prior_verdict}"
+                if prior_verdict is not None
+                else "SENTINEL_COURT_JOBBED_INDEPENDENT"
                 if court_request is not None
                 else "SENTINEL_NOT_JOBBED"
             ),
@@ -827,7 +1033,7 @@ def emit_receipt_sealed_and_switcharoo(
                 "note": "HONEY POT waits for independent Sentinel court.passed; this PR does not PASS",
             }
         return {
-            "sealed": sealed,
+            "sealed": sealed or {**absent, "events_present": True},
             "court_request": court_request,
             "emit": emit,
             "honey_pot": honey,

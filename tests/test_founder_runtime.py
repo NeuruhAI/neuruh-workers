@@ -2,9 +2,14 @@ import hashlib
 import inspect
 import json
 import os
+import stat
+import subprocess
 import tempfile
+import threading
 import unittest
+import urllib.parse
 from pathlib import Path
+from unittest.mock import patch
 
 from neuruh_workers.contracts import JobStatus, ReceiptType
 from neuruh_workers.convergence import (
@@ -40,7 +45,9 @@ from neuruh_workers.organ_consumers import (
     honey_pot_bind,
     pull_dispatchable_tickets,
     switchboard_present,
+    _write_immutable,
 )
+from neuruh_workers.prime_receipts import parse_prime_receipt
 from neuruh_workers.queue import JobQueue
 from neuruh_workers.runner import WorkflowRunner
 from neuruh_workers.switchboard import INDEPENDENT_COURT_KIND, SwitchboardError
@@ -54,11 +61,140 @@ from neuruh_workers.workflows import build_catalog, build_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# The source-identity court builds throwaway repositories.  A developer's own global
+# git config must not decide whether they pass: commit signing with no pinentry, or a
+# global hooks path, made every one of these fixtures fail on a signing host while CI
+# stayed green.  Same isolation the custodian fixtures already use.
+_FIXTURE_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "Court",
+    "GIT_AUTHOR_EMAIL": "court@local",
+    "GIT_COMMITTER_NAME": "Court",
+    "GIT_COMMITTER_EMAIL": "court@local",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+
+
+def _fixture_git(*args: str, capture: bool = False):
+    """Run git against a fixture repository with the host's identity kept out."""
+    env = os.environ.copy()
+    env.update(_FIXTURE_GIT_ENV)
+    argv = [
+        "git",
+        "-c", "commit.gpgsign=false",
+        "-c", "tag.gpgsign=false",
+        "-c", "core.hooksPath=",
+        "-c", "init.defaultBranch=main",
+        *args,
+    ]
+    if capture:
+        return subprocess.check_output(argv, text=True, env=env)
+    subprocess.run(argv, check=True, env=env)
+    return None
+
 
 class FounderRuntimeCourt(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ledger = ExecutionLedger(os.path.join(self.tmp.name, "ledger.jsonl"))
+        self.source_root = os.path.join(self.tmp.name, "workers-source")
+        os.makedirs(self.source_root)
+        _fixture_git("init", "-q", "-b", "main", self.source_root)
+        Path(self.source_root, "README").write_text("workers\n", encoding="utf-8")
+        _fixture_git("-C", self.source_root, "add", "README")
+        _fixture_git("-C", self.source_root, "commit", "-qm", "source")
+        _fixture_git(
+            "-C", self.source_root, "remote", "add", "origin",
+            "https://github.com/NeuruhAI/neuruh-workers.git",
+        )
+        self.default_work_spec = {
+            "schema": "fr.work_spec.v1",
+            "candidate_id": "property-research-existing-v1",
+            "workflow_name": "property-research",
+            "params": {
+                "address": "123 Main St, Benton Harbor, MI",
+                "county": "Berrien",
+            },
+            "intelligence_layer": "L0_DETERMINISTIC",
+            "evidence_refs": ["workflow:property-research@1.0.0"],
+            "production_mutation": False,
+            "external_message": False,
+            "money_move": False,
+            "irreversible": False,
+            "private_ip_risk": False,
+            "code_custody_required": False,
+        }
+        self.default_work_spec_sha = hashlib.sha256(json.dumps(
+            self.default_work_spec,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")).hexdigest()
+        self.authoritative_envelopes = {}
+        self.source_sha = _fixture_git(
+            "-C", self.source_root, "rev-parse", "HEAD", capture=True).strip()
+        _fixture_git(
+            "-C", self.source_root, "update-ref",
+            "refs/remotes/origin/main", self.source_sha,
+        )
+        remote_head_patch = patch(
+            "neuruh_workers.organ_consumers._remote_main_head",
+            return_value=self.source_sha,
+        )
+        remote_head_patch.start()
+        self.addCleanup(remote_head_patch.stop)
+
+        class _HealthResponse:
+            status = 200
+
+            def __init__(self, body):
+                self.body = body
+
+            def read(self):
+                return self.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def health_opener(request, timeout=None):
+            if request.get_method() != "GET":
+                raise OSError("non-health endpoint unavailable in court")
+            if request.full_url == FR_HEALTH_URL:
+                return _HealthResponse(
+                    b'{"status":"ok","api_version":"fr-api-v1","auth_configured":true}')
+            if "/v1/missions/" in request.full_url:
+                mission_id = urllib.parse.unquote(
+                    request.full_url.rsplit("/", 1)[-1])
+                authoritative = self.authoritative_envelopes.get(mission_id)
+                if authoritative is None:
+                    authoritative = {
+                        "api_version": FR_API_VERSION,
+                        "mission_id": mission_id,
+                        "version": 1,
+                        "state": "QUEUED",
+                        "objective": (
+                            "finish a safe existing workflow without a clerical handoff"
+                        ),
+                        "work_spec": self.default_work_spec,
+                        "work_spec_sha256": self.default_work_spec_sha,
+                        "authority": {
+                            "state": "APPROVED",
+                            "execution_authorized": True,
+                            "work_spec_execution_authorized": True,
+                            "dispatch_approval_id": "appr-jgi-court-001",
+                            "work_spec_sha256": self.default_work_spec_sha,
+                        },
+                    }
+                return _HealthResponse(json.dumps({"envelope": {
+                    **authoritative,
+                }}).encode("utf-8"))
+            raise OSError("unknown endpoint unavailable in court")
+
+        self.health_opener = health_opener
+        self.ledger_path = os.path.join(self.tmp.name, "ledger.jsonl")
+        self.ledger = ExecutionLedger(self.ledger_path)
         self.registry = build_registry()
         self.catalog = build_catalog()
         self.queue = JobQueue(self.ledger, self.registry)
@@ -71,7 +207,10 @@ class FounderRuntimeCourt(unittest.TestCase):
             self.runner,
             receipts_dir=self.receipts_dir,
             switchboard_root=self.switchboard_root,
-            source_head="a" * 40,
+            source_head=self.source_sha,
+            source_root=self.source_root,
+            http_open=self.health_opener,
+            fr_token="court-token",
         )
 
     def tearDown(self):
@@ -81,6 +220,11 @@ class FounderRuntimeCourt(unittest.TestCase):
         base = dict(
             mission_id="JGI-COURT-001",
             objective="finish a safe existing workflow without a clerical handoff",
+            mission_version=1,
+            dispatch_approval_id="appr-jgi-court-001",
+            work_spec_sha256=self.default_work_spec_sha,
+            execution_authorized=True,
+            work_spec_execution_authorized=True,
             fr_state="QUEUED",
             fr_api_version=FR_API_VERSION,
             expected_value_usd=500.0,
@@ -108,6 +252,119 @@ class FounderRuntimeCourt(unittest.TestCase):
         )
         base.update(kwargs)
         return WorkCandidate(**base)
+
+    def sentinel_evidence(self, sealed, court, *, passed=True):
+        path = os.path.join(self.tmp.name, "independent-sentinel.json")
+        record = {
+            "kind": INDEPENDENT_COURT_KIND,
+            "source_role": "SENTINEL",
+            "independent": True,
+            "verdict": "PASS" if passed else "FAIL",
+            "court_id": "court-" + hashlib.sha256(
+                court["payload_ref_or_payload"]["court_job_id"].encode("utf-8")
+            ).hexdigest()[:24],
+            "ref": path,
+            "mission_id": sealed["mission_id"],
+            "job_id": court["payload_ref_or_payload"]["court_job_id"],
+            "receipt_ref": sealed["payload_ref_or_payload"]["receipt_ref"],
+            "receipt_sha": sealed["payload_ref_or_payload"]["receipt_sha"],
+            "candidate_sha": sealed["source_head"],
+            "canonical_sha": sealed["source_head"],
+            "plan_id": sealed["plan_id"],
+            "task_id": sealed["task_id"],
+            "correlation_id": sealed["correlation_id"],
+            "causation_id": court["event_id"],
+            "source_head": sealed["source_head"],
+            "source_repo": sealed["source_repo"],
+            "authority_ref": sealed["authority_ref"],
+            "workers_sentinel_model_execution": "BLOCKED",
+            "observed_sha": hashlib.sha256(
+                Path(sealed["payload_ref_or_payload"]["receipt_ref"]).read_bytes()
+            ).hexdigest(),
+            "base_relation": "equal",
+            "findings": [] if passed else [{"code": "TEST_FAIL"}],
+            "exceptions": [],
+            "required_repairs": [] if passed else ["repair test failure"],
+            "iar_provenance": {
+                "authorized": passed,
+                "authorization_ref": "iar:test" if passed else "",
+                "provenance_intact": passed,
+                "binding": {
+                    "repo_sha": sealed["source_head"],
+                    "ledger_sha256_prefix": "beef",
+                    "ledger_line_count": 1,
+                },
+            },
+        }
+        Path(path).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        return {
+            "kind": INDEPENDENT_COURT_KIND,
+            "source_role": "SENTINEL",
+            "independent": True,
+            "ref": path,
+        }
+
+    def record_outcome(self, result, *, passed=True):
+        board = self.runtime.last_switchboard
+        sealed = result.sealed_receipt
+        court = result.court_request
+        outcome = board.record_court_outcome(
+            passed=passed,
+            court_job_id=court["payload_ref_or_payload"]["court_job_id"],
+            mission_id=sealed["mission_id"],
+            plan_id=sealed["plan_id"],
+            task_id=sealed["task_id"],
+            correlation_id=sealed["correlation_id"],
+            causation_id=court["event_id"],
+            source_head=sealed["source_head"],
+            authority_ref=sealed["authority_ref"],
+            source_repo=sealed["source_repo"],
+            receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
+            evidence=self.sentinel_evidence(sealed, court, passed=passed),
+        )
+        board.tick()
+        return outcome
+
+    def authorized_pair(self, mission_id, candidate, *, parent_mission_id=None):
+        work_spec = {
+            "schema": "fr.work_spec.v1",
+            "candidate_id": candidate.candidate_id,
+            "workflow_name": candidate.workflow_name,
+            "params": dict(candidate.params),
+            "intelligence_layer": candidate.layer.value,
+            "evidence_refs": list(candidate.evidence_refs),
+            "production_mutation": candidate.production_mutation,
+            "external_message": candidate.external_message,
+            "money_move": candidate.money_move,
+            "irreversible": candidate.irreversible,
+            "private_ip_risk": candidate.private_ip_risk,
+            "code_custody_required": False,
+        }
+        work_spec_sha = hashlib.sha256(json.dumps(
+            work_spec,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")).hexdigest()
+        envelope = {
+            "api_version": FR_API_VERSION,
+            "mission_id": mission_id,
+            "version": 1,
+            "state": "QUEUED",
+            "objective": "finish a safe existing workflow without a clerical handoff",
+            "parent_mission_id": parent_mission_id,
+            "work_spec": work_spec,
+            "work_spec_sha256": work_spec_sha,
+            "authority": {
+                "state": "APPROVED",
+                "execution_authorized": True,
+                "work_spec_execution_authorized": True,
+                "dispatch_approval_id": "appr-jgi-court-001",
+                "work_spec_sha256": work_spec_sha,
+            },
+        }
+        self.authoritative_envelopes[mission_id] = envelope
+        return map_founder_runtime_dispatch(envelope, catalog=self.catalog)
 
     def fr_envelope(self, **updates):
         work_spec = {
@@ -175,6 +432,10 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertIsInstance(ticket, DispatchTicket)
         self.assertIsInstance(candidate, WorkCandidate)
         self.assertIs(candidate.layer, IntelligenceLayer.L0)
+        self.assertEqual(ticket.dispatch_approval_id, "appr-fr-boundary")
+        self.assertEqual(ticket.work_spec_sha256, self.fr_envelope()["work_spec_sha256"])
+        self.assertTrue(ticket.execution_authorized)
+        self.assertTrue(ticket.work_spec_execution_authorized)
         self.assertTrue(self.catalog.get(candidate.workflow_name).read_only)
         context = compile_context(ticket, candidate)
         self.assertEqual(context["candidate"]["layer"], "L0_DETERMINISTIC")
@@ -256,6 +517,11 @@ class FounderRuntimeCourt(unittest.TestCase):
         cases.append(self.rebind_work_spec(unknown_layer))
         wrong_hash = self.fr_envelope(work_spec_sha256="0" * 64)
         cases.append(wrong_hash)
+        injected_receipt_field = self.fr_envelope()
+        injected_receipt_field["work_spec"]["evidence_refs"] = [
+            "workflow:property-research@1.0.0\nSOURCE_HEAD=" + "0" * 40,
+        ]
+        cases.append(self.rebind_work_spec(injected_receipt_field))
         for envelope in cases:
             with self.subTest(envelope=envelope):
                 with self.assertRaises(ValueError):
@@ -284,16 +550,145 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(result.compiled_context["mission_authority"], "recipe-engine.founder_runtime.fr-api-v1")
         receipts = self.ledger.receipts(result.job_id)
         self.assertTrue(any(r.receipt_type == "job.succeeded" for r in receipts))
+        receipt = parse_prime_receipt(
+            result.sealed_receipt["payload_ref_or_payload"]["receipt_ref"])
+        self.assertEqual(
+            receipt.get("RECEIPT_SCHEMA"), "nrh.receipt.fr-dispatch.v1")
+        self.assertEqual(receipt.get("MISSION_VERSION"), "1")
+        self.assertEqual(receipt.get("WORK_SPEC_SHA256"), self.default_work_spec_sha)
+        self.assertEqual(receipt.get("DISPATCH_RESULT"), "SUCCEEDED")
+        self.assertEqual(receipt.get("CODE_CUSTODY_REQUIRED"), "NO")
+
+    def test_dispatch_rejects_caller_state_delta_and_candidate_multiplicity(self):
+        result = self.runtime.dispatch(
+            self.mission(),
+            [self.property_candidate()],
+            state_delta={"caller": "changes-dedupe-identity"},
+        )
+        self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+        self.assertIsNone(result.job_id)
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+        with self.assertRaises(ValueError):
+            self.runtime.dispatch(
+                self.mission(),
+                [self.property_candidate(), self.property_candidate()],
+            )
 
     def test_repeated_dispatch_is_idempotent_and_does_not_reexecute_success(self):
         first = self.runtime.dispatch(self.mission(), [self.property_candidate()])
+        receipt_path = first.sealed_receipt["payload_ref_or_payload"]["receipt_ref"]
+        first_receipt = Path(receipt_path).read_bytes()
         first_count = len(self.ledger.receipts(first.job_id))
         second = self.runtime.dispatch(self.mission(), [self.property_candidate()])
         self.assertEqual(first.job_id, second.job_id)
         self.assertEqual(second.status, RuntimeStatus.ALREADY_SUCCEEDED)
+        self.assertTrue(second.switchboard_emit["consumed"])
+        self.assertEqual(second.switchboard_emit["deadlettered"], [])
+        self.assertEqual(Path(receipt_path).read_bytes(), first_receipt)
+        board = self.runtime.last_switchboard
+        self.assertEqual(board.deadletters(), [])
+        self.assertEqual(len(board.events(EventType.RECEIPT_SEALED)), 1)
+        self.assertEqual(len(board.events(EventType.COURT_REQUESTED)), 1)
+        reopened_ledger = ExecutionLedger(self.ledger_path)
+        reopened_queue = JobQueue(reopened_ledger, self.registry)
+        reopened_runtime = DispatchBridge(
+            reopened_queue,
+            self.catalog,
+            WorkflowRunner(reopened_queue, self.registry, self.catalog),
+            receipts_dir=self.receipts_dir,
+            switchboard_root=self.switchboard_root,
+            source_head=self.source_sha,
+            source_root=self.source_root,
+            http_open=self.health_opener,
+            fr_token="court-token",
+        )
+        third = reopened_runtime.dispatch(
+            self.mission(), [self.property_candidate()])
+        self.assertEqual(third.status, RuntimeStatus.ALREADY_SUCCEEDED)
+        self.assertTrue(third.switchboard_emit["consumed"])
+        self.assertEqual(third.switchboard_emit["deadlettered"], [])
+        self.assertEqual(
+            len(reopened_runtime.last_switchboard.events(EventType.RECEIPT_SEALED)), 1)
+        self.assertEqual(
+            len(reopened_runtime.last_switchboard.events(EventType.COURT_REQUESTED)), 1)
         receipts = self.ledger.receipts(first.job_id)
         self.assertGreater(len(receipts), first_count)
         self.assertEqual(sum(r.receipt_type == "job.succeeded" for r in receipts), 1)
+
+    def test_replay_after_independent_sentinel_pass_is_idempotent_success(self):
+        first = self.runtime.dispatch(
+            self.mission(), [self.property_candidate()])
+        board = self.runtime.last_switchboard
+        evidence = self.sentinel_evidence(
+            first.sealed_receipt, first.court_request)
+        board.record_court_outcome(
+            passed=True,
+            court_job_id=first.court_request[
+                "payload_ref_or_payload"]["court_job_id"],
+            mission_id=first.sealed_receipt["mission_id"],
+            plan_id=first.sealed_receipt["plan_id"],
+            task_id=first.sealed_receipt["task_id"],
+            correlation_id=first.sealed_receipt["correlation_id"],
+            causation_id=first.court_request["event_id"],
+            source_head=first.sealed_receipt["source_head"],
+            authority_ref=first.sealed_receipt["authority_ref"],
+            source_repo=first.sealed_receipt["source_repo"],
+            receipt_ref=first.sealed_receipt[
+                "payload_ref_or_payload"]["receipt_ref"],
+            evidence=evidence,
+        )
+        succeeded_before = sum(
+            receipt.receipt_type == "job.succeeded"
+            for receipt in self.ledger.receipts(first.job_id)
+        )
+        replay = self.runtime.dispatch(
+            self.mission(), [self.property_candidate()])
+        self.assertEqual(replay.status, RuntimeStatus.ALREADY_SUCCEEDED)
+        succeeded_after = sum(
+            receipt.receipt_type == "job.succeeded"
+            for receipt in self.ledger.receipts(first.job_id)
+        )
+        self.assertEqual(succeeded_after, succeeded_before)
+        self.assertTrue(replay.sentinel["judged"])
+        self.assertEqual(replay.sentinel["verdict"], "PASS")
+        self.assertEqual(
+            replay.sentinel["bind_status"], "SENTINEL_ALREADY_COURTED_PASS")
+        self.assertEqual(
+            len(self.runtime.last_switchboard.events(EventType.COURT_REQUESTED)), 1)
+        self.assertEqual(
+            len(self.runtime.last_switchboard.events(EventType.COURT_PASSED)), 1)
+
+    def test_sentinel_fail_blocks_parent_and_fr_update_on_replay(self):
+        parent_def = self.catalog.get("property-research")
+        parent_job = self.queue.enqueue(
+            parent_def,
+            {"address": "1 Blocked Parent St", "county": "Berrien"},
+            requested_by="jgi:JGI-PARENT-FAIL",
+        )
+        self.queue.pause(parent_job)
+        ticket, candidate = self.authorized_pair(
+            "JGI-CHILD-FAIL",
+            self.property_candidate(candidate_id="child-fail"),
+            parent_mission_id="JGI-PARENT-FAIL",
+        )
+        first = self.runtime.dispatch(ticket, [candidate])
+        self.assertIsNone(first.parent_resume)
+        self.assertIsNone(first.fr_evidence_update)
+        self.record_outcome(first, passed=False)
+        replay = self.runtime.dispatch(ticket, [candidate])
+        self.assertEqual(replay.status, RuntimeStatus.BLOCKED)
+        self.assertIsNone(replay.parent_resume)
+        self.assertIsNone(replay.fr_evidence_update)
+        self.assertEqual(self.queue.load(parent_job).status, JobStatus.PAUSED)
+
+    def test_sentinel_pass_without_custody_intent_emits_no_honey_pot(self):
+        first = self.runtime.dispatch(
+            self.mission(), [self.property_candidate()])
+        self.record_outcome(first)
+        board = self.runtime.last_switchboard
+        self.assertEqual(board.jobs_for(HONEY_POT_WORKFLOW), [])
+        self.assertEqual(
+            board.events(EventType.CANDIDATE_PUSH_REQUESTED), [])
 
     def test_rejects_ticket_that_is_not_fr_approved_or_queued(self):
         result = self.runtime.dispatch(
@@ -305,9 +700,161 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(self.ledger.verify()["receipts"], 0)
         self.assertFalse(result.fr_bind["this_pr_duplicates_founder_runtime"])
 
+    def test_safe_execution_fails_closed_if_fr_becomes_unavailable(self):
+        runtime = DispatchBridge(
+            self.queue,
+            self.catalog,
+            self.runner,
+            receipts_dir=self.receipts_dir,
+            switchboard_root=self.switchboard_root,
+            source_head=self.source_sha,
+            source_root=self.source_root,
+            http_open=lambda _request, timeout=None: (_ for _ in ()).throw(
+                OSError("Founder Runtime unavailable")),
+            fr_token="court-token",
+        )
+        result = runtime.dispatch(self.mission(), [self.property_candidate()])
+        self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+        self.assertIsNone(result.job_id)
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+    def test_safe_execution_rechecks_exact_authenticated_fr_authority(self):
+        for forged in (
+            self.mission(dispatch_approval_id="forged-approval"),
+            self.mission(work_spec_sha256="b" * 64),
+            self.mission(mission_version=2),
+        ):
+            with self.subTest(forged=forged):
+                result = self.runtime.dispatch(
+                    forged, [self.property_candidate()])
+                self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+                self.assertIsNone(result.job_id)
+        result = self.runtime.dispatch(
+            self.mission(),
+            [self.property_candidate(params={
+                "address": "attacker-selected",
+                "county": "Elsewhere",
+            })],
+        )
+        self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+        self.assertIsNone(result.job_id)
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+    def test_execution_success_is_not_dispatch_success_when_sealing_refuses(self):
+        refused = {
+            "sealed": {"bind_status": "SWITCHBOARD_EMIT_REFUSED"},
+            "court_request": None,
+            "emit": {
+                "consumed": False,
+                "bind_status": "SWITCHBOARD_EMIT_REFUSED",
+            },
+            "sentinel": {"bind_status": "SENTINEL_NOT_JOBBED"},
+            "honey_pot": {"activated": False},
+            "board": None,
+        }
+        with patch.object(
+            founder_runtime_mod,
+            "emit_receipt_sealed_and_switcharoo",
+            return_value=refused,
+        ):
+            result = self.runtime.dispatch(
+                self.mission(),
+                [self.property_candidate()],
+            )
+        self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+        self.assertEqual(result.job_status, JobStatus.SUCCEEDED.value)
+        self.assertIsNone(result.parent_resume)
+        self.assertIsNone(result.fr_evidence_update)
+
+    def test_safe_execution_fails_closed_on_source_provenance_drift(self):
+        source_file = Path(self.source_root, "README")
+        source_file.write_text("dirty\n", encoding="utf-8")
+        try:
+            result = self.runtime.dispatch(
+                self.mission(), [self.property_candidate()])
+        finally:
+            source_file.write_text("workers\n", encoding="utf-8")
+        self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+        self.assertIsNone(result.job_id)
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+        self.runtime.source_head = "0" * 40
+        result = self.runtime.dispatch(self.mission(), [self.property_candidate()])
+        self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+        self.assertIsNone(result.job_id)
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+        with patch(
+            "neuruh_workers.organ_consumers._remote_main_head",
+            return_value="f" * 40,
+        ):
+            result = self.runtime.dispatch(
+                self.mission(), [self.property_candidate()])
+        self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+        self.assertIsNone(result.job_id)
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+        _fixture_git(
+            "-C", self.source_root, "remote", "set-url", "origin",
+            "https://github.com/attacker/neuruh-workers.git",
+        )
+        try:
+            result = self.runtime.dispatch(
+                self.mission(), [self.property_candidate()])
+        finally:
+            _fixture_git(
+                "-C", self.source_root, "remote", "set-url", "origin",
+                "https://github.com/NeuruhAI/neuruh-workers.git",
+            )
+        self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+        self.assertIsNone(result.job_id)
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+    def test_source_drift_during_execution_refuses_receipt_and_dispatch_success(self):
+        source_file = Path(self.source_root, "README")
+        original_execute = self.runner.execute
+
+        def execute_then_drift(job_id):
+            state = original_execute(job_id)
+            source_file.write_text("dirty during execution\n", encoding="utf-8")
+            return state
+
+        try:
+            with patch.object(self.runner, "execute", side_effect=execute_then_drift):
+                result = self.runtime.dispatch(
+                    self.mission(), [self.property_candidate()])
+        finally:
+            source_file.write_text("workers\n", encoding="utf-8")
+        self.assertEqual(result.status, RuntimeStatus.BLOCKED)
+        self.assertEqual(result.job_status, JobStatus.SUCCEEDED.value)
+        self.assertFalse(result.switchboard_emit["consumed"])
+        self.assertIsNone(result.fr_evidence_update)
+
+    def test_immutable_receipt_write_is_race_safe_and_read_only(self):
+        path = os.path.join(self.tmp.name, "immutable", "receipt.txt")
+        barrier = threading.Barrier(4)
+        errors = []
+
+        def write():
+            try:
+                barrier.wait()
+                _write_immutable(path, "sealed\n")
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(Path(path).read_text(encoding="utf-8"), "sealed\n")
+        self.assertEqual(stat.S_IMODE(os.lstat(path).st_mode), 0o444)
+
     def test_material_authority_gate_never_enqueues(self):
         candidate = self.property_candidate(production_mutation=True)
-        result = self.runtime.dispatch(self.mission(), [candidate])
+        ticket, candidate = self.authorized_pair("JGI-MATERIAL", candidate)
+        result = self.runtime.dispatch(ticket, [candidate])
         self.assertEqual(result.status, RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED)
         self.assertNotEqual(result.status, RuntimeStatus.FOUNDER_GATE_REQUIRED)
         self.assertIn("PRODUCTION_MUTATION", result.founder_gate_reasons)
@@ -340,10 +887,11 @@ class FounderRuntimeCourt(unittest.TestCase):
             "private_ip_risk",
         ):
             with self.subTest(flag=flag):
-                result = self.runtime.dispatch(
-                    self.mission(mission_id=f"JGI-{flag}"),
-                    [self.property_candidate(**{flag: True})],
+                ticket, candidate = self.authorized_pair(
+                    f"JGI-{flag}",
+                    self.property_candidate(**{flag: True}),
                 )
+                result = self.runtime.dispatch(ticket, [candidate])
                 self.assertEqual(result.status, RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED)
                 self.assertIsNone(result.job_id)
                 self.assertFalse(result.broker_bind["caller_approved"])
@@ -356,7 +904,8 @@ class FounderRuntimeCourt(unittest.TestCase):
             estimated_model_cost_usd=0.5,
             ambiguity=0.95,
         )
-        result = self.runtime.dispatch(self.mission(), [candidate])
+        ticket, candidate = self.authorized_pair("JGI-L4", candidate)
+        result = self.runtime.dispatch(ticket, [candidate])
         self.assertEqual(result.status, RuntimeStatus.REASONING_BROKER_REQUIRED)
         self.assertIsNone(result.job_id)
         self.assertEqual(self.ledger.verify()["receipts"], 0)
@@ -372,10 +921,12 @@ class FounderRuntimeCourt(unittest.TestCase):
     def test_l2_l3_l4_fail_closed_without_iar_rf(self):
         for layer in (IntelligenceLayer.L2, IntelligenceLayer.L3, IntelligenceLayer.L4):
             with self.subTest(layer=layer.value):
-                result = self.runtime.dispatch(
-                    self.mission(mission_id=f"JGI-{layer.value}"),
-                    [self.property_candidate(layer=layer, estimated_model_cost_usd=0.1)],
+                ticket, candidate = self.authorized_pair(
+                    f"JGI-{layer.value}",
+                    self.property_candidate(
+                        layer=layer, estimated_model_cost_usd=0.1),
                 )
+                result = self.runtime.dispatch(ticket, [candidate])
                 self.assertEqual(result.status, RuntimeStatus.REASONING_BROKER_REQUIRED)
                 self.assertTrue(result.broker_bind["organ_absent"])
                 self.assertFalse(result.broker_bind["authorized"])
@@ -393,11 +944,19 @@ class FounderRuntimeCourt(unittest.TestCase):
                 "health": {"status": "ok"},
                 "authorized": False,
             },
+            receipts_dir=self.receipts_dir,
+            switchboard_root=self.switchboard_root,
+            source_head=self.source_sha,
+            source_root=self.source_root,
+            http_open=self.health_opener,
+            fr_token="court-token",
         )
-        result = runtime.dispatch(
-            self.mission(),
-            [self.property_candidate(layer=IntelligenceLayer.L3, estimated_model_cost_usd=0.1)],
+        ticket, candidate = self.authorized_pair(
+            "JGI-L3-IAR-UP",
+            self.property_candidate(
+                layer=IntelligenceLayer.L3, estimated_model_cost_usd=0.1),
         )
+        result = runtime.dispatch(ticket, [candidate])
         self.assertEqual(result.status, RuntimeStatus.REASONING_BROKER_REQUIRED)
         self.assertTrue(result.broker_bind["iar_health"]["present"])
         self.assertFalse(result.broker_bind["rf_present"])
@@ -447,9 +1006,12 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertTrue(switchboard_present())
         self.assertEqual(result.switchboard_emit["bind_status"], "SWITCHBOARD_CONSUMED")
         self.assertTrue(result.switchboard_emit["consumed"])
+        self.assertEqual(result.switchboard_emit["deadlettered"], [])
+        self.assertEqual(result.switchboard_emit["matching_sealed_count"], 1)
+        self.assertEqual(result.switchboard_emit["matching_court_count"], 1)
         self.assertEqual(result.sealed_receipt["schema_version"], "nrh.event.v1")
         self.assertEqual(result.sealed_receipt["source_role"], "DISPATCH_BRIDGE")
-        self.assertNotEqual(result.sealed_receipt.get("source_role"), "SWITCHAROO")
+        self.assertNotEqual(result.sealed_receipt.get("source_role"), "PRIME")
         self.assertIsNotNone(result.court_request)
         self.assertEqual(result.court_request["event_type"], EventType.COURT_REQUESTED.value)
         self.assertEqual(result.court_request["source_role"], "SWITCHAROO")
@@ -459,6 +1021,15 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertFalse(result.sentinel["judged"])
         self.assertIsNone(result.sentinel["verdict"])
         self.assertTrue(result.sentinel["ci_job_named_court_is_not_sentinel"])
+        board = self.runtime.last_switchboard
+        self.assertEqual(board.deadletters(), [])
+        self.assertEqual(len(board.events(EventType.RECEIPT_SEALED)), 1)
+        self.assertEqual(len(board.events(EventType.COURT_REQUESTED)), 1)
+        receipt_text = Path(
+            result.sealed_receipt["payload_ref_or_payload"]["receipt_ref"]
+        ).read_text(encoding="utf-8")
+        self.assertIn("AUTHORITY_REFERENCE=fr-api-v1:approval:appr-jgi-court-001", receipt_text)
+        self.assertIn("work-spec:" + self.default_work_spec_sha, receipt_text)
         board = self.runtime.last_switchboard
         self.assertIsNotNone(board)
         self.assertEqual(len(board.events(EventType.COURT_PASSED)), 0)
@@ -517,10 +1088,13 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(len(board.events(EventType.COURT_PASSED)), 0)
 
     def test_honey_pot_consumed_after_independent_sentinel_when_code_custody_required(self):
-        result = self.runtime.dispatch(
-            self.mission(code_custody_required=True),
-            [self.property_candidate()],
-        )
+        envelope = self.fr_envelope(mission_id="msn-code-custody")
+        envelope["work_spec"]["code_custody_required"] = True
+        self.rebind_work_spec(envelope)
+        self.authoritative_envelopes[envelope["mission_id"]] = envelope
+        ticket, candidate = map_founder_runtime_dispatch(
+            envelope, catalog=self.catalog)
+        result = self.runtime.dispatch(ticket, [candidate])
         self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
         self.assertEqual(result.honey_pot["bind_status"], "GIT_CUSTODIAN_CONSUMED")
         self.assertTrue(result.honey_pot["present"])
@@ -544,21 +1118,7 @@ class FounderRuntimeCourt(unittest.TestCase):
             authority_ref=sealed["authority_ref"],
             source_repo=sealed["source_repo"],
             receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
-            evidence={
-                "kind": INDEPENDENT_COURT_KIND,
-                "source_role": "SENTINEL",
-                "independent": True,
-                "ref": "test://sentinel-independent-dispatch-bridge",
-            },
-            extra_payload={
-                "honey_pot_expected": {
-                    "repo": "NeuruhAI/neuruh-workers",
-                    "branch": "feature/jgi-founder-runtime-v0-20260901",
-                    "head": "a" * 40,
-                    "worktree": "/tmp/dispatch-bridge-worktree",
-                    "remote": "origin",
-                },
-            },
+            evidence=self.sentinel_evidence(sealed, court),
         )
         board.tick()
         passed = board.events(EventType.COURT_PASSED)
@@ -571,6 +1131,9 @@ class FounderRuntimeCourt(unittest.TestCase):
         artifact = board.queue.load(honey_jobs[0]).step_results["materialize"]
         self.assertEqual(artifact["git_push"], GIT_PUSH)
         self.assertEqual(artifact["repo"], "NeuruhAI/neuruh-workers")
+        self.assertEqual(artifact["branch"], "main")
+        self.assertEqual(artifact["head"], self.source_sha)
+        self.assertEqual(artifact["worktree"], os.path.realpath(self.source_root))
         self.assertNotEqual(artifact["repo"], "NeuruhAI/neuruh-axon")
 
     def test_parent_resume_from_paused_parent_job(self):
@@ -583,14 +1146,21 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.queue.pause(parent_job)
         self.assertEqual(self.queue.load(parent_job).status, JobStatus.PAUSED)
 
-        result = self.runtime.dispatch(
-            self.mission(mission_id="JGI-CHILD-001", parent_mission_id="JGI-PARENT-001"),
-            [self.property_candidate(
+        ticket, candidate = self.authorized_pair(
+            "JGI-CHILD-001",
+            self.property_candidate(
                 candidate_id="child",
                 params={"address": "2 Child St, Benton Harbor, MI", "county": "Berrien"},
-            )],
+            ),
+            parent_mission_id="JGI-PARENT-001",
         )
+        result = self.runtime.dispatch(ticket, [candidate])
         self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
+        self.assertIsNone(result.parent_resume)
+        self.assertEqual(self.queue.load(parent_job).status, JobStatus.PAUSED)
+        self.record_outcome(result)
+        result = self.runtime.dispatch(ticket, [candidate])
+        self.assertEqual(result.status, RuntimeStatus.ALREADY_SUCCEEDED)
         self.assertTrue(result.parent_resume["automatic"])
         self.assertTrue(result.parent_resume["proven"])
         self.assertEqual(result.parent_resume["status"], "PARENT_RESUME=PROVEN")
@@ -615,14 +1185,20 @@ class FounderRuntimeCourt(unittest.TestCase):
         })
         self.assertEqual(self.queue.load(parent_job).open_steps, {"normalize_subject": 1})
 
-        result = self.runtime.dispatch(
-            self.mission(mission_id="JGI-CHILD-RECOVER", parent_mission_id="JGI-PARENT-RECOVER"),
-            [self.property_candidate(
+        ticket, candidate = self.authorized_pair(
+            "JGI-CHILD-RECOVER",
+            self.property_candidate(
                 candidate_id="child-recover",
                 params={"address": "8 Child Recover St", "county": "Berrien"},
-            )],
+            ),
+            parent_mission_id="JGI-PARENT-RECOVER",
         )
+        result = self.runtime.dispatch(ticket, [candidate])
         self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
+        self.assertIsNone(result.parent_resume)
+        self.record_outcome(result)
+        result = self.runtime.dispatch(ticket, [candidate])
+        self.assertEqual(result.status, RuntimeStatus.ALREADY_SUCCEEDED)
         self.assertTrue(result.parent_resume["automatic"])
         self.assertTrue(result.parent_resume["proven"])
         self.assertEqual(result.parent_resume["status"], "PARENT_RESUME=PROVEN")
@@ -631,11 +1207,17 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertIn(ReceiptType.JOB_RECOVERED, types)
 
     def test_parent_resume_absent_parent_is_precise_gap(self):
-        result = self.runtime.dispatch(
-            self.mission(parent_mission_id="JGI-PARENT-MISSING"),
-            [self.property_candidate()],
+        ticket, candidate = self.authorized_pair(
+            "JGI-COURT-001",
+            self.property_candidate(),
+            parent_mission_id="JGI-PARENT-MISSING",
         )
+        result = self.runtime.dispatch(ticket, [candidate])
         self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
+        self.assertIsNone(result.parent_resume)
+        self.record_outcome(result)
+        result = self.runtime.dispatch(ticket, [candidate])
+        self.assertEqual(result.status, RuntimeStatus.ALREADY_SUCCEEDED)
         self.assertFalse(result.parent_resume["automatic"])
         self.assertFalse(result.parent_resume["proven"])
         self.assertEqual(result.parent_resume["status"], "PARENT_JOB_ABSENT_IN_LEDGER")
@@ -644,6 +1226,10 @@ class FounderRuntimeCourt(unittest.TestCase):
     def test_fr_evidence_update_is_attempted_and_not_persisted_here(self):
         result = self.runtime.dispatch(self.mission(), [self.property_candidate()])
         self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
+        self.assertIsNone(result.fr_evidence_update)
+        self.record_outcome(result)
+        result = self.runtime.dispatch(self.mission(), [self.property_candidate()])
+        self.assertEqual(result.status, RuntimeStatus.ALREADY_SUCCEEDED)
         update = result.fr_evidence_update
         self.assertTrue(update["attempted"])
         self.assertFalse(update["persisted_locally"])
@@ -652,6 +1238,26 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertFalse(update["fr_write"]["ok"])
         self.assertIn("/v1/missions/", update["fr_write"]["url"])
         self.assertEqual(update["owner"], "NeuruhAI/recipe-engine Founder Runtime")
+
+    def test_fr_api_health_without_auth_configuration_fails_closed(self):
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return (
+                    b'{"status":"ok","api_version":"fr-api-v1",'
+                    b'"auth_configured":false}'
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        bind = bind_founder_runtime(opener=lambda request, timeout=None: _Resp())
+        self.assertFalse(bind["present"])
+        self.assertEqual(bind["bind_status"], "FR_API_ABSENT_FAIL_CLOSED")
 
     def test_fr_api_bind_consumes_fr_api_v1_identity(self):
         class _Resp:
@@ -763,15 +1369,26 @@ class FounderRuntimeCourt(unittest.TestCase):
 
         def opener(request, timeout=None):
             seen.append(request.full_url)
+            if request.full_url.startswith("http://127.0.0.1:19090/"):
+                return self.health_opener(request, timeout=timeout)
             raise OSError("organ unreachable")
 
         runtime = DispatchBridge(
-            self.queue, self.catalog, self.runner, http_open=opener,
+            self.queue,
+            self.catalog,
+            self.runner,
+            receipts_dir=self.receipts_dir,
+            switchboard_root=self.switchboard_root,
+            source_head=self.source_sha,
+            source_root=self.source_root,
+            http_open=opener,
+            fr_token="court-token",
         )
-        result = runtime.dispatch(
-            self.mission(),
-            [self.property_candidate(money_move=True)],
+        ticket, candidate = self.authorized_pair(
+            "JGI-CONSEQUENTIAL-CALLS",
+            self.property_candidate(money_move=True),
         )
+        result = runtime.dispatch(ticket, [candidate])
         self.assertEqual(result.status, RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED)
         self.assertIsNone(result.job_id)
         self.assertIn(GOVERNANCE_EVALUATE_URL, seen)

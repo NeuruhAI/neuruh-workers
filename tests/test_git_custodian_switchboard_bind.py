@@ -1,10 +1,14 @@
 """Switchboard bind: Git Custodian consumes nrh.event.v1 candidate.push.requested."""
 from __future__ import annotations
 
+import json
 import os
+import shutil
+import tempfile
 import unittest
 
 from neuruh_workers import Switchboard
+from neuruh_workers.contracts import content_sha
 from neuruh_workers.events import EventType, SCHEMA_VERSION, validate_envelope
 from neuruh_workers.git_custodian import (
     FOUNDER_CANDIDATE_V1,
@@ -31,7 +35,11 @@ from tests.test_switchboard_first_seam import _independent_evidence, _write_rece
 MISSION = "LOCAL_CUSTODIAN_SWITCHAROO_BIND"
 
 
-def _receipt_body(pair, *, mission=MISSION, stage="BARE_REMOTE_PUSH"):
+def _receipt_body(
+    pair, candidate, *, mission=MISSION, stage="BARE_REMOTE_PUSH",
+):
+    candidate_json = json.dumps(
+        candidate, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return "\n".join([
         f"MISSION={mission}",
         f"STAGE={stage}",
@@ -47,13 +55,14 @@ def _receipt_body(pair, *, mission=MISSION, stage="BARE_REMOTE_PUSH"):
         f"AUTHORITY_REF={T07_AUTHORITY_REF}",
         "BIND=127.0.0.1:9",
         "CLAIMANT=PRIME",
-        "EXPECTED_GIT_OUTCOME_PR=",
+        "CODE_CUSTODY_REQUIRED=YES",
+        f"CANDIDATE_JSON={candidate_json}",
+        f"CANDIDATE_SHA256={content_sha(candidate)}",
     ]) + "\n"
 
 
 class SwitchboardGitCustodianBindTests(unittest.TestCase):
     def setUp(self):
-        import tempfile
         self.tmpdir = tempfile.mkdtemp(prefix="neuruh-bind-")
         self.addCleanup(_rmtree, self.tmpdir)
         self.pair = make_seeded_pair(self.tmpdir)
@@ -86,7 +95,7 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
 
     def test_switchboard_emits_envelope_git_custodian_consumes_and_pushes(self):
         _write_receipt(self.board.receipts_dir, "BIND_RECEIPT.txt",
-                       _receipt_body(self.pair))
+                       _receipt_body(self.pair, self.candidate))
         self.board.tick()
         self.assertEqual(len(self.board.events(EventType.CANDIDATE_PUSH_REQUESTED)), 0)
 
@@ -104,13 +113,8 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
             authority_ref=sealed["authority_ref"],
             source_repo=sealed["source_repo"],
             receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
-            evidence=_independent_evidence(),
-            extra_payload={"honey_pot_expected": {
-                "repo": self.candidate["repo"],
-                "branch": self.candidate["branch"],
-                "head": self.candidate["expected_local_head"],
-                "candidate": self.candidate,
-            }},
+            evidence=_independent_evidence(
+                self.board, sealed, court, passed=True),
         )
         self.board.tick()  # court.passed → emit candidate.push.requested
         pushes = self.board.events(EventType.CANDIDATE_PUSH_REQUESTED)
@@ -142,7 +146,7 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
 
     def test_court_fail_does_not_dispatch_git_custodian(self):
         _write_receipt(self.board.receipts_dir, "BIND_RECEIPT.txt",
-                       _receipt_body(self.pair))
+                       _receipt_body(self.pair, self.candidate))
         self.board.tick()
         sealed = self.board.events(EventType.RECEIPT_SEALED)[-1]
         court = self.board.events(EventType.COURT_REQUESTED)[-1]
@@ -158,7 +162,8 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
             authority_ref=sealed["authority_ref"],
             source_repo=sealed["source_repo"],
             receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
-            evidence=_independent_evidence(),
+            evidence=_independent_evidence(
+                self.board, sealed, court, passed=False),
         )
         self.board.tick()
         self.board.tick()
@@ -172,7 +177,7 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
         self.worker.court_store = MemoryCourtStore(
             {"court://local/bare-remote": "PASS"})
         _write_receipt(self.board.receipts_dir, "BIND_RECEIPT.txt",
-                       _receipt_body(self.pair))
+                       _receipt_body(self.pair, self.candidate))
         self.board.tick()
         sealed = self.board.events(EventType.RECEIPT_SEALED)[-1]
         court = self.board.events(EventType.COURT_REQUESTED)[-1]
@@ -188,10 +193,8 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
             authority_ref=sealed["authority_ref"],
             source_repo=sealed["source_repo"],
             receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
-            evidence=_independent_evidence(),
-            extra_payload={"honey_pot_expected": {
-                "candidate": self.candidate,
-            }},
+            evidence=_independent_evidence(
+                self.board, sealed, court, passed=True),
         )
         self.board.tick()  # emit candidate.push.requested
         self.board.tick()  # consume attempt 1 (refuses bare PASS)
@@ -206,7 +209,6 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
 
 
 def _rmtree(path):
-    import shutil
     shutil.rmtree(path, ignore_errors=True)
 
 

@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""Run one safe dispatch-bridge demo against the existing workflow layer.
-
-Consumes an FR APPROVED/QUEUED ticket shape and dispatches it onto JobQueue.
-No network, no external action, no production mutation. The demo creates a
-local ledger, autonomously executes the existing property-research workflow,
-hands receipt.sealed to live SWITCHAROO, then prints the structured result.
-"""
+"""Dispatch one real authority-bound FR mission through the Workers seam."""
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -20,12 +15,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from neuruh_workers.founder_runtime import (
     DispatchBridge,
-    DispatchTicket,
-    IntelligenceLayer,
-    WorkCandidate,
+    map_founder_runtime_dispatch,
 )
 from neuruh_workers.ledger import ExecutionLedger
-from neuruh_workers.organ_consumers import FR_API_VERSION
+from neuruh_workers.organ_consumers import pull_authoritative_mission
 from neuruh_workers.queue import JobQueue
 from neuruh_workers.runner import WorkflowRunner
 from neuruh_workers.workflows import build_catalog, build_registry
@@ -34,8 +27,7 @@ from neuruh_workers.workflows import build_catalog, build_registry
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ledger", default="jgi-demo-ledger.jsonl")
-    parser.add_argument("--address", default="123 Main St, Benton Harbor, MI")
-    parser.add_argument("--county", default="Berrien")
+    parser.add_argument("--mission-id", required=True)
     args = parser.parse_args()
 
     ledger = ExecutionLedger(args.ledger)
@@ -43,6 +35,15 @@ def main() -> int:
     catalog = build_catalog()
     queue = JobQueue(ledger, registry)
     runner = WorkflowRunner(queue, registry, catalog)
+    token = os.environ.get("FR_API_OPERATOR_TOKEN")
+    if not token:
+        parser.error("FR_API_OPERATOR_TOKEN is required")
+    pulled = pull_authoritative_mission(args.mission_id, token=token)
+    if not pulled.get("ok"):
+        print(json.dumps(pulled, indent=2, sort_keys=True), file=sys.stderr)
+        return 2
+    ticket, candidate = map_founder_runtime_dispatch(
+        pulled["envelope"], catalog=catalog)
     scratch = tempfile.TemporaryDirectory()
     runtime = DispatchBridge(
         queue,
@@ -50,27 +51,8 @@ def main() -> int:
         runner,
         receipts_dir=str(Path(scratch.name) / "receipts"),
         switchboard_root=str(Path(scratch.name) / "switchboard"),
-    )
-
-    ticket = DispatchTicket(
-        mission_id="JGI-DEMO-PROPERTY-RESEARCH-001",
-        objective="turn a property question into a receipted research plan without a manual handoff",
-        fr_state="QUEUED",
-        fr_api_version=FR_API_VERSION,
-        expected_value_usd=500.0,
-        uncertainty=0.2,
-        relevance=1.0,
-        model_budget_usd=0.0,
-        canonical_refs=("workflow:property-research@1.0.0",),
-        do_not_rebuild=("WorkflowRunner", "JobQueue", "ExecutionLedger"),
-    )
-    candidate = WorkCandidate(
-        candidate_id="existing-property-research-v1",
-        workflow_name="property-research",
-        params={"address": args.address, "county": args.county},
-        layer=IntelligenceLayer.L0,
-        estimated_latency_minutes=1.0,
-        evidence_refs=("neuruh-workers:property-research",),
+        source_root=str(REPO_ROOT),
+        fr_token=token,
     )
     result = runtime.dispatch(ticket, [candidate], auto_execute_read_only=True)
     print(json.dumps(result.as_dict(), indent=2, sort_keys=True, default=str))

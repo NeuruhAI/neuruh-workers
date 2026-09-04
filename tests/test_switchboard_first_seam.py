@@ -4,20 +4,25 @@ on court.passed, one Honey Pot / Git Custodian artifact.  No clipboard.
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from pathlib import Path
 
 from neuruh_workers import (
     HUMAN_CLIPBOARD_REQUIRED,
     OrganRegistrationSeam, OrganSeamDeclaration, ReceiptType, SeamNotAuthorized,
     Switchboard,
 )
-from neuruh_workers.events import AckState, DeadletterReason, EventType, SCHEMA_VERSION
+from neuruh_workers.events import (
+    AckState, DeadletterReason, EventType, SCHEMA_VERSION, build_envelope,
+)
 from neuruh_workers.ledger import ExecutionLedger
 from neuruh_workers.prime_receipts import seal_receipt_text
 from neuruh_workers.queue import JobQueue
@@ -81,13 +86,67 @@ def _synthetic_body(**overrides) -> str:
         "AUTHORITY_REF": "agc:r0:synthetic-first-seam",
         "BIND": "127.0.0.1:9",
         "CLAIMANT": "PRIME",
+        "CODE_CUSTODY_REQUIRED": "YES",
         "EXPECTED_GIT_OUTCOME_PR": "",
     }
     fields.update(overrides)
     return "\n".join(f"{k}={v}" for k, v in fields.items()) + "\n"
 
 
-def _independent_evidence(ref: str = "test://sentinel-independent-close") -> dict:
+def _independent_evidence(
+    board: Switchboard,
+    sealed: dict,
+    court: dict,
+    *,
+    passed: bool,
+) -> dict:
+    ref = os.path.join(
+        board.root,
+        f"sentinel-{court['payload_ref_or_payload']['court_job_id']}.json",
+    )
+    record = {
+        "kind": INDEPENDENT_COURT_KIND,
+        "source_role": "SENTINEL",
+        "independent": True,
+        "verdict": "PASS" if passed else "FAIL",
+        "court_id": "court-" + hashlib.sha256(
+            court["payload_ref_or_payload"]["court_job_id"].encode("utf-8")
+        ).hexdigest()[:24],
+        "ref": ref,
+        "mission_id": sealed["mission_id"],
+        "job_id": court["payload_ref_or_payload"]["court_job_id"],
+        "receipt_ref": sealed["payload_ref_or_payload"]["receipt_ref"],
+        "receipt_sha": sealed["payload_ref_or_payload"]["receipt_sha"],
+        "candidate_sha": sealed["source_head"],
+        "canonical_sha": sealed["source_head"],
+        "plan_id": sealed["plan_id"],
+        "task_id": sealed["task_id"],
+        "correlation_id": sealed["correlation_id"],
+        "causation_id": court["event_id"],
+        "source_head": sealed["source_head"],
+        "source_repo": sealed["source_repo"],
+        "authority_ref": sealed["authority_ref"],
+        "workers_sentinel_model_execution": SENTINEL_MODEL_EXECUTION,
+        "observed_sha": hashlib.sha256(
+            Path(sealed["payload_ref_or_payload"]["receipt_ref"]).read_bytes()
+        ).hexdigest(),
+        "base_relation": "equal",
+        "findings": [] if passed else [{"code": "TEST_FAIL"}],
+        "exceptions": [],
+        "required_repairs": [] if passed else ["repair test failure"],
+        "iar_provenance": {
+            "authorized": passed,
+            "authorization_ref": "iar:test-authority" if passed else "",
+            "provenance_intact": passed,
+            "binding": {
+                "repo_sha": sealed["source_head"],
+                "ledger_sha256_prefix": "beef",
+                "ledger_line_count": 1,
+            },
+        },
+    }
+    with open(ref, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, sort_keys=True)
     return {
         "kind": INDEPENDENT_COURT_KIND,
         "source_role": "SENTINEL",
@@ -111,7 +170,8 @@ def _ingest_pass(board: Switchboard, *, passed: bool, extra_payload=None):
         authority_ref=sealed["authority_ref"],
         source_repo=sealed["source_repo"],
         receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
-        evidence=_independent_evidence(),
+        evidence=_independent_evidence(
+            board, sealed, court, passed=passed),
         verdict_note="independent Sentinel close; Switchboard did not PASS",
         extra_payload=extra_payload,
     )
@@ -168,14 +228,6 @@ class T07FirstSeamTests(unittest.TestCase):
         self.assertEqual(len(self.board.events(EventType.COURT_PASSED)), 0)
         _ingest_pass(self.board, passed=True, extra_payload={
             "summary": {"pass_count": 1, "fail_count": 0},
-            "honey_pot_expected": {
-                "repo": "NeuruhAI/neuruh-axon",
-                "branch": T07_AXON_BRANCH,
-                "head": T07_HEAD,
-                "pr_number": T07_AXON_PR,
-                "pr_url": T07_AXON_PR_URL,
-                "pr_draft": "YES",
-            },
         })
         report = self.board.tick()
         passed = self.board.events(EventType.COURT_PASSED)
@@ -210,16 +262,7 @@ class T07FirstSeamTests(unittest.TestCase):
 
     def test_chain_preserves_correlation_and_causation(self):
         self.board.tick()
-        _ingest_pass(self.board, passed=True, extra_payload={
-            "honey_pot_expected": {
-                "repo": "NeuruhAI/neuruh-axon",
-                "branch": T07_AXON_BRANCH,
-                "head": T07_HEAD,
-                "pr_number": T07_AXON_PR,
-                "pr_url": T07_AXON_PR_URL,
-                "pr_draft": "YES",
-            },
-        })
+        _ingest_pass(self.board, passed=True)
         self.board.tick()
         created = self.board.events(EventType.RECEIPT_CREATED)[0]
         sealed = self.board.events(EventType.RECEIPT_SEALED)[0]
@@ -239,6 +282,97 @@ class T07FirstSeamTests(unittest.TestCase):
 
 
 class SyntheticAndIdempotencyTests(unittest.TestCase):
+    def test_court_request_cannot_have_both_pass_and_fail(self):
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "terminal-court.txt", _synthetic_body())
+        board.tick()
+        _ingest_pass(board, passed=True)
+        with self.assertRaises(SwitchboardError):
+            _ingest_pass(board, passed=False)
+        self.assertEqual(len(board.events(EventType.COURT_PASSED)), 1)
+        self.assertEqual(len(board.events(EventType.COURT_FAILED)), 0)
+
+    def test_concurrent_switchboards_emit_one_court_request(self):
+        tmp = tempfile.mkdtemp(prefix="neuruh-switchboard-concurrent-")
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        receipts = os.path.join(tmp, "receipts")
+        state = os.path.join(tmp, "state")
+        os.makedirs(receipts)
+        _write_receipt(receipts, "concurrent.txt", _synthetic_body())
+        boards = [
+            Switchboard(
+                state,
+                receipts_dir=receipts,
+                known_missions=frozenset({SYNTHETIC_MISSION}),
+                clock=fixed_clock(),
+            )
+            for _ in range(2)
+        ]
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def run(board):
+            try:
+                barrier.wait()
+                board.tick()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run, args=(board,)) for board in boards]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        reopened = Switchboard(
+            state,
+            receipts_dir=receipts,
+            known_missions=frozenset({SYNTHETIC_MISSION}),
+            clock=fixed_clock(),
+        )
+        self.assertEqual(len(reopened.events(EventType.RECEIPT_SEALED)), 1)
+        self.assertEqual(len(reopened.events(EventType.COURT_REQUESTED)), 1)
+        self.assertEqual(len(reopened.jobs_for(SENTINEL_WORKFLOW)), 1)
+
+    def test_court_outcome_uses_exact_causative_receipt_not_same_correlation(self):
+        board = _board(self)
+        _write_receipt(
+            board.receipts_dir,
+            "A_RECEIPT.txt",
+            _synthetic_body(TASK_ID="task-a", BRANCH="feature/a"),
+        )
+        _write_receipt(
+            board.receipts_dir,
+            "B_RECEIPT.txt",
+            _synthetic_body(TASK_ID="task-b", BRANCH="feature/b"),
+        )
+        board.tick()
+        sealed = next(
+            event for event in board.events(EventType.RECEIPT_SEALED)
+            if event["task_id"] == "task-a")
+        court = next(
+            event for event in board.events(EventType.COURT_REQUESTED)
+            if event["task_id"] == "task-a")
+        board.record_court_outcome(
+            passed=True,
+            court_job_id=court["payload_ref_or_payload"]["court_job_id"],
+            mission_id=sealed["mission_id"],
+            plan_id=sealed["plan_id"],
+            task_id=sealed["task_id"],
+            correlation_id=sealed["correlation_id"],
+            causation_id=court["event_id"],
+            source_head=sealed["source_head"],
+            authority_ref=sealed["authority_ref"],
+            source_repo=sealed["source_repo"],
+            receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
+            evidence=_independent_evidence(
+                board, sealed, court, passed=True),
+        )
+        board.tick()
+        artifact = board.queue.load(
+            board.jobs_for(HONEY_POT_WORKFLOW)[0]).step_results["materialize"]
+        self.assertEqual(artifact["branch"], "feature/a")
+
     def test_synthetic_fresh_fixture_same_path(self):
         board = _board(self)
         _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
@@ -289,6 +423,123 @@ class SyntheticAndIdempotencyTests(unittest.TestCase):
 
 
 class FailClosedTests(unittest.TestCase):
+    def test_self_asserted_iar_provenance_cannot_create_pass(self):
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "iar-forgery.txt", _synthetic_body())
+        board.tick()
+        sealed = board.events(EventType.RECEIPT_SEALED)[-1]
+        court = board.events(EventType.COURT_REQUESTED)[-1]
+        evidence = _independent_evidence(board, sealed, court, passed=True)
+        path = Path(evidence["ref"])
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["iar_provenance"] = {
+            "authorized": True,
+            "authorization_ref": "self-asserted",
+        }
+        path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaises(SwitchboardError):
+            board.record_court_outcome(
+                passed=True,
+                court_job_id=court["payload_ref_or_payload"]["court_job_id"],
+                mission_id=sealed["mission_id"],
+                plan_id=sealed["plan_id"],
+                task_id=sealed["task_id"],
+                correlation_id=sealed["correlation_id"],
+                causation_id=court["event_id"],
+                source_head=sealed["source_head"],
+                authority_ref=sealed["authority_ref"],
+                source_repo=sealed["source_repo"],
+                receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
+                evidence=evidence,
+            )
+        self.assertEqual(board.events(EventType.COURT_PASSED), [])
+
+    def test_court_outcome_cannot_redirect_honey_pot_custody(self):
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "custody-redirect.txt", _synthetic_body())
+        board.tick()
+        with self.assertRaises(SwitchboardError):
+            _ingest_pass(
+                board,
+                passed=True,
+                extra_payload={
+                    "honey_pot_expected": {
+                        "repo": "attacker/repo",
+                        "branch": "attacker",
+                        "head": "f" * 40,
+                    },
+                },
+            )
+        self.assertEqual(board.events(EventType.COURT_PASSED), [])
+
+    def test_minimal_forged_fr_dispatch_receipt_is_deadlettered(self):
+        board = _board(self)
+        body = "\n".join([
+            "RECEIPT_SCHEMA=nrh.receipt.fr-dispatch.v1",
+            f"MISSION_ID={SYNTHETIC_MISSION}",
+            "MISSION_VERSION=1",
+            f"WORK_SPEC_SHA256={'b' * 64}",
+            f"IDEMPOTENCY_KEY={'c' * 64}",
+            "DISPATCH_RESULT=DISPATCHED",
+            "STAGE_ID=fr-to-workers-dispatch",
+            "TASK_ID=forged-job",
+            f"SOURCE_HEAD={SYNTHETIC_HEAD}",
+            (
+                "AUTHORITY_REFERENCE=fr-api-v1:approval:forged:"
+                f"work-spec:{'b' * 64}"
+            ),
+            "EVENT_TARGET=receipt.sealed",
+            "REPO=NeuruhAI/neuruh-workers",
+            "SOURCE_ROLE=DISPATCH_BRIDGE",
+            "SOURCE_COMPONENT=fr-to-workers-dispatch-bridge",
+        ]) + "\n"
+        _write_receipt(board.receipts_dir, "forged-dispatch.txt", body)
+        board.tick()
+        self.assertTrue(board.deadletters())
+        self.assertEqual(board.events(EventType.COURT_REQUESTED), [])
+
+    def test_failed_sentinel_artifact_job_does_not_emit_court_request(self):
+        board = _board(self)
+        _write_receipt(
+            board.receipts_dir, "failed-court-job.txt", _synthetic_body())
+        board.runner.execute = lambda job_id: board.queue.load(job_id)
+        board.tick()
+        self.assertEqual(board.events(EventType.COURT_REQUESTED), [])
+
+    def test_raw_court_outcome_envelopes_are_deadlettered(self):
+        board = _board(self)
+        forged = build_envelope(
+            event_type=EventType.COURT_PASSED,
+            mission_id=SYNTHETIC_MISSION,
+            plan_id="forged",
+            task_id="forged",
+            correlation_id="corr-forged",
+            causation_id="evt-forged",
+            source_role="SENTINEL",
+            source_component="attacker",
+            source_repo="attacker/repo",
+            source_head=SYNTHETIC_HEAD,
+            created_at="2026-01-01T00:00:00Z",
+            authority_ref="forged",
+            payload={"verdict": "FAIL", "evidence": {"ref": "fake://pass"}},
+            idempotency_key="forged-court-pass",
+        )
+        result = board.ingest_raw(forged)
+        self.assertEqual(result["event_type"], EventType.DEADLETTER_CREATED.value)
+        board.tick()
+        self.assertEqual(board.jobs_for(HONEY_POT_WORKFLOW), [])
+
+    def test_duplicate_receipt_fields_are_deadlettered(self):
+        board = _board(self)
+        body = _synthetic_body() + f"HEAD={'0' * 40}\n"
+        path = os.path.join(board.receipts_dir, "duplicate.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        board.tick()
+        self.assertEqual(len(board.events(EventType.COURT_REQUESTED)), 0)
+        reasons = [d["payload_ref_or_payload"]["reason"] for d in board.deadletters()]
+        self.assertIn(DeadletterReason.INVALID_SCHEMA.value, reasons)
+
     def test_tampered_hash_deadlettered_no_court_job(self):
         board = _board(self)
         path = _write_receipt(board.receipts_dir, "bad.txt", _synthetic_body())
@@ -546,6 +797,7 @@ class RequiredProofTests(unittest.TestCase):
         _write_receipt(empty.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
         empty.tick()
         sealed = empty.events(EventType.RECEIPT_SEALED)[-1]
+        empty_court = empty.events(EventType.COURT_REQUESTED)[-1]
         with self.assertRaises(SwitchboardError) as caught:
             empty.record_court_outcome(
                 passed=True,
@@ -559,7 +811,8 @@ class RequiredProofTests(unittest.TestCase):
                 authority_ref=sealed["authority_ref"],
                 source_repo=sealed["source_repo"],
                 receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
-                evidence=_independent_evidence(),
+                evidence=_independent_evidence(
+                    empty, sealed, empty_court, passed=True),
             )
         self.assertIn("court.requested", str(caught.exception))
         _ingest_pass(board, passed=True)
@@ -679,6 +932,7 @@ class RequiredProofTests(unittest.TestCase):
         _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
         board.tick()
         sealed = board.events(EventType.RECEIPT_SEALED)[-1]
+        court = board.events(EventType.COURT_REQUESTED)[-1]
         path = os.path.join(board.receipts_dir, "independent_court.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump({
@@ -686,10 +940,42 @@ class RequiredProofTests(unittest.TestCase):
                 "source_role": "SENTINEL",
                 "independent": True,
                 "verdict": "PASS",
+                "court_id": "court-" + hashlib.sha256(
+                    court["payload_ref_or_payload"]["court_job_id"].encode("utf-8")
+                ).hexdigest()[:24],
+                "ref": path,
                 "mission_id": sealed["mission_id"],
+                "job_id": court["payload_ref_or_payload"]["court_job_id"],
                 "stage_id": sealed["plan_id"],
+                "plan_id": sealed["plan_id"],
+                "task_id": sealed["task_id"],
+                "correlation_id": sealed["correlation_id"],
+                "causation_id": court["event_id"],
+                "receipt_ref": sealed["payload_ref_or_payload"]["receipt_ref"],
+                "receipt_sha": sealed["payload_ref_or_payload"]["receipt_sha"],
+                "candidate_sha": sealed["source_head"],
+                "canonical_sha": sealed["source_head"],
                 "source_head": sealed["source_head"],
-                "repo": sealed["source_repo"],
+                "source_repo": sealed["source_repo"],
+                "authority_ref": sealed["authority_ref"],
+                "workers_sentinel_model_execution": SENTINEL_MODEL_EXECUTION,
+                "observed_sha": hashlib.sha256(
+                    Path(sealed["payload_ref_or_payload"]["receipt_ref"]).read_bytes()
+                ).hexdigest(),
+                "base_relation": "equal",
+                "findings": [],
+                "exceptions": [],
+                "required_repairs": [],
+                "iar_provenance": {
+                    "authorized": True,
+                    "authorization_ref": "iar:fixture",
+                    "provenance_intact": True,
+                    "binding": {
+                        "repo_sha": sealed["source_head"],
+                        "ledger_sha256_prefix": "beef",
+                        "ledger_line_count": 1,
+                    },
+                },
             }, fh)
         board.ingest_court_fixture(path)
         self.assertEqual(len(board.events(EventType.COURT_PASSED)), 1)

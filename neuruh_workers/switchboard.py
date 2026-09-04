@@ -11,12 +11,16 @@ Loopback/local file observation only; no public listener.
 """
 from __future__ import annotations
 
+import fcntl
+import functools
 import json
 import os
+import stat
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from .contracts import DefinitionError, JobStatus, content_sha
+from .contracts import DefinitionError, JobStatus, ReceiptType, content_sha
 from .definitions import WorkflowCatalog
 from .events import (
     AckState,
@@ -28,11 +32,12 @@ from .events import (
 )
 from .ledger import Clock, ExecutionLedger, utc_clock
 from .prime_receipts import (
+    FR_DISPATCH_RECEIPT_SCHEMA,
     contains_secret_shape,
     looks_like_path,
     parse_prime_receipt,
     redact_secrets,
-    validate_prime_receipt,
+    validate_receipt,
 )
 from .queue import JobQueue
 from .registry import WorkerRegistry
@@ -110,6 +115,17 @@ def _atomic_write(path: str, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _synchronized(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._exclusive_lock():
+            self._cursor = self._load_cursor()
+            self._rebuild_seen_from_ledger()
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class Switchboard:
     """Durable observe → validate → court job → ack, plus court.passed wrap."""
 
@@ -150,6 +166,7 @@ class Switchboard:
         self.queue = JobQueue(self.job_ledger, self.registry)
         self.runner = WorkflowRunner(self.queue, self.registry, self.catalog)
         self.cursor_path = os.path.join(self.root, CURSOR_NAME)
+        self.lock_path = os.path.join(self.root, ".switchboard.lock")
         self._cursor = self._load_cursor()
         self._rebuild_seen_from_ledger()
         consumers: list[ConsumerSpec] = [
@@ -174,6 +191,15 @@ class Switchboard:
         self.consumers = tuple(consumers)
 
     # -- persistence ------------------------------------------------------- #
+
+    @contextmanager
+    def _exclusive_lock(self):
+        with open(self.lock_path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load_cursor(self) -> dict[str, Any]:
         if not os.path.exists(self.cursor_path):
@@ -222,6 +248,7 @@ class Switchboard:
         raise SwitchboardError(
             "no network listener in first seam; file observation only")
 
+    @_synchronized
     def tick(self) -> TickReport:
         report = TickReport()
         self._observe_receipts(report)
@@ -266,6 +293,7 @@ class Switchboard:
                 ids.append(job_id)
         return ids
 
+    @_synchronized
     def record_court_outcome(
         self,
         *,
@@ -287,10 +315,36 @@ class Switchboard:
         """Ingest Sentinel's independent verdict.  Switchboard does not PASS."""
         normalized = self._require_independent_court_evidence(
             evidence=evidence,
+            passed=passed,
             court_job_id=court_job_id,
+            mission_id=mission_id,
+            plan_id=plan_id,
+            task_id=task_id,
             correlation_id=correlation_id,
+            causation_id=causation_id,
+            source_head=source_head,
+            authority_ref=authority_ref,
+            source_repo=source_repo,
+            receipt_ref=receipt_ref,
         )
         event_type = EventType.COURT_PASSED if passed else EventType.COURT_FAILED
+        prior = [
+            event for event in (
+                self.events(EventType.COURT_PASSED)
+                + self.events(EventType.COURT_FAILED)
+            )
+            if event.get("causation_id") == causation_id
+        ]
+        if prior:
+            if (
+                len(prior) == 1
+                and prior[0].get("event_type") == event_type.value
+                and (prior[0].get("payload_ref_or_payload") or {})
+                .get("evidence", {}).get("record_sha") == normalized["record_sha"]
+            ):
+                return prior[0]
+            raise SwitchboardError(
+                "court request already has a different terminal outcome")
         payload = {
             "court_job_id": court_job_id,
             "verdict": "PASS" if passed else "FAIL",
@@ -300,6 +354,15 @@ class Switchboard:
                 "independent Sentinel verdict ingested; Switchboard did not judge"),
         }
         if extra_payload:
+            forbidden_extra = {
+                "honey_pot_expected",
+                "evidence",
+                "verdict",
+                "sentinel_model_execution",
+            }
+            if forbidden_extra.intersection(extra_payload):
+                raise SwitchboardError(
+                    "court outcome extras cannot redirect custody or override verdict evidence")
             payload.update(dict(extra_payload))
         # Evidence and verdict are pinned after extra_payload so a caller
         # cannot overwrite them into a fake PASS.
@@ -374,11 +437,10 @@ class Switchboard:
                 "court fixture requires a prior court.requested job artifact")
         court = court_events[-1]
         summary = data.get("summary") or {}
-        expected = data.get("honey_pot_expected") or {}
         evidence = {
-            "kind": data.get("kind") or INDEPENDENT_COURT_KIND,
-            "source_role": data.get("source_role") or "SENTINEL",
-            "independent": data.get("independent", True),
+            "kind": data.get("kind"),
+            "source_role": data.get("source_role"),
+            "independent": data.get("independent"),
             "ref": os.path.abspath(path),
         }
         return self.record_court_outcome(
@@ -391,7 +453,7 @@ class Switchboard:
             causation_id=court["event_id"],
             source_head=sealed["source_head"],
             authority_ref=sealed["authority_ref"],
-            source_repo=str(data.get("repo") or sealed["source_repo"]),
+            source_repo=sealed["source_repo"],
             receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
             evidence=evidence,
             verdict_note=(
@@ -411,7 +473,6 @@ class Switchboard:
                     "mutations": summary.get("mutations"),
                 },
                 "secret_pointer": pointer,
-                "honey_pot_expected": expected,
                 "secret_file_ingested": False,
             },
         )
@@ -420,8 +481,17 @@ class Switchboard:
         self,
         *,
         evidence: Mapping[str, Any],
+        passed: bool,
         court_job_id: str,
+        mission_id: str,
+        plan_id: str,
+        task_id: str,
         correlation_id: str,
+        causation_id: str,
+        source_head: str,
+        authority_ref: str,
+        source_repo: str,
+        receipt_ref: str,
     ) -> dict[str, Any]:
         """Fail closed unless evidence is independent Sentinel court, not a fake."""
         if not isinstance(evidence, Mapping) or not evidence:
@@ -431,33 +501,80 @@ class Switchboard:
             raise SwitchboardError(
                 "reconstruction is not independent Sentinel court evidence; "
                 "refusing fake Sentinel PASS")
-        if evidence.get("independent") is False:
+        if evidence.get("independent") is not True:
             raise SwitchboardError(
-                "court evidence marked independent=false is refused")
+                "court evidence must explicitly declare independent=true")
         kind = str(evidence.get("kind") or evidence.get("evidence_kind") or "").strip()
-        if not kind or kind.lower() in _FAKE_EVIDENCE_KINDS:
+        if kind != INDEPENDENT_COURT_KIND or kind.lower() in _FAKE_EVIDENCE_KINDS:
             raise SwitchboardError(
-                "court evidence kind is missing or is a fake/reconstruction PASS")
+                "court evidence kind is not the independent Sentinel contract")
         source_role = str(evidence.get("source_role") or "").strip().upper()
         if source_role != "SENTINEL":
             raise SwitchboardError(
                 "court outcome source_role must be independent SENTINEL")
         ref = evidence.get("ref") or evidence.get("evidence_ref")
-        if not isinstance(ref, str) or not ref.strip():
-            raise SwitchboardError("court evidence requires a non-empty ref")
-        sealed = self._prior_on_chain(correlation_id, EventType.RECEIPT_SEALED)
-        if sealed is None:
-            raise SwitchboardError(
-                "court outcome requires a sealed receipt on the correlation chain")
+        if (
+            not isinstance(ref, str)
+            or not os.path.isabs(ref)
+            or not os.path.isfile(ref)
+        ):
+            raise SwitchboardError("court evidence requires an existing absolute file ref")
         court_events = [
-            e for e in self.events(EventType.COURT_REQUESTED)
-            if (e.get("payload_ref_or_payload") or {}).get("court_job_id")
-            == court_job_id
+            event for event in self.events(EventType.COURT_REQUESTED)
+            if (
+                event.get("event_id") == causation_id
+                and event.get("correlation_id") == correlation_id
+                and (event.get("payload_ref_or_payload") or {}).get("court_job_id")
+                == court_job_id
+            )
         ]
-        if not court_events:
+        if len(court_events) != 1:
             raise SwitchboardError(
-                "court.passed/failed requires a prior court.requested job artifact")
+                "court outcome requires one exact prior court.requested event")
+        court = court_events[0]
+        sealed_events = [
+            event for event in self.events(EventType.RECEIPT_SEALED)
+            if event.get("event_id") == court.get("causation_id")
+        ]
+        if len(sealed_events) != 1:
+            raise SwitchboardError(
+                "court outcome requires one exact causative sealed receipt")
+        sealed = sealed_events[0]
         receipt_payload = sealed.get("payload_ref_or_payload") or {}
+        expected = {
+            "mission_id": mission_id,
+            "plan_id": plan_id,
+            "task_id": task_id,
+            "correlation_id": correlation_id,
+            "source_head": source_head,
+            "authority_ref": authority_ref,
+        }
+        for field, value in expected.items():
+            if sealed.get(field) != value or court.get(field) != value:
+                raise SwitchboardError(
+                    f"court outcome {field} differs from its exact receipt chain")
+        if sealed.get("source_repo") != source_repo:
+            raise SwitchboardError(
+                "court outcome source_repo differs from its sealed receipt")
+        if os.path.realpath(str(receipt_payload.get("receipt_ref") or "")) != os.path.realpath(
+                receipt_ref):
+            raise SwitchboardError("court outcome receipt_ref differs from sealed receipt")
+        try:
+            current_receipt = parse_prime_receipt(receipt_ref)
+            receipt_stat = os.lstat(receipt_ref)
+        except OSError as exc:
+            raise SwitchboardError("sealed receipt is no longer readable") from exc
+        if current_receipt.content_sha != receipt_payload.get("receipt_sha"):
+            raise SwitchboardError("sealed receipt bytes changed before court outcome")
+        if (
+            current_receipt.receipt_schema == FR_DISPATCH_RECEIPT_SCHEMA
+            and (
+                not stat.S_ISREG(receipt_stat.st_mode)
+                or receipt_stat.st_mode & 0o222
+            )
+        ):
+            raise SwitchboardError(
+                "FR dispatch receipt is not an immutable regular file")
         forbidden_refs = {
             "PRIME_VERDICT",
             "SENTINEL_CLOSURE",
@@ -467,13 +584,94 @@ class Switchboard:
         if ref in forbidden_refs:
             raise SwitchboardError(
                 "PRIME_VERDICT / SENTINEL_CLOSURE in the receipt is not court evidence")
+        try:
+            with open(ref, encoding="utf-8") as handle:
+                record = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SwitchboardError("Sentinel evidence record is unreadable") from exc
+        if not isinstance(record, Mapping):
+            raise SwitchboardError("Sentinel evidence record must be an object")
+        record_expected = {
+            "kind": INDEPENDENT_COURT_KIND,
+            "source_role": "SENTINEL",
+            "independent": True,
+            "mission_id": mission_id,
+            "job_id": court_job_id,
+            "receipt_ref": receipt_ref,
+            "receipt_sha": receipt_payload.get("receipt_sha"),
+            "candidate_sha": source_head,
+            "canonical_sha": source_head,
+            "plan_id": plan_id,
+            "task_id": task_id,
+            "correlation_id": correlation_id,
+            "causation_id": causation_id,
+            "source_head": source_head,
+            "source_repo": source_repo,
+            "authority_ref": authority_ref,
+            "workers_sentinel_model_execution": SENTINEL_MODEL_EXECUTION,
+        }
+        for field, value in record_expected.items():
+            if record.get(field) != value:
+                raise SwitchboardError(
+                    f"Sentinel evidence {field} is not bound to the court request")
+        verdict = str(record.get("verdict") or "")
+        if verdict != ("PASS" if passed else "FAIL"):
+            raise SwitchboardError("Sentinel evidence verdict differs from outcome")
+        court_id = record.get("court_id")
+        if (
+            not isinstance(court_id, str)
+            or len(court_id) != 30
+            or not court_id.startswith("court-")
+            or any(char not in "0123456789abcdef" for char in court_id[6:])
+        ):
+            raise SwitchboardError("Sentinel evidence court_id is missing")
+        if os.path.realpath(str(record.get("ref") or "")) != os.path.realpath(ref):
+            raise SwitchboardError("Sentinel evidence ref is not self-bound")
+        if (
+            type(record.get("findings")) is not list
+            or type(record.get("exceptions")) is not list
+            or type(record.get("required_repairs")) is not list
+            or not isinstance(record.get("observed_sha"), str)
+            or len(record["observed_sha"]) != 64
+            or any(char not in "0123456789abcdef" for char in record["observed_sha"])
+        ):
+            raise SwitchboardError(
+                "Sentinel evidence findings and observed digest are malformed")
+        if passed:
+            if (
+                record["findings"]
+                or record["exceptions"]
+                or record["required_repairs"]
+                or record.get("base_relation") == "unverified"
+            ):
+                raise SwitchboardError("Sentinel PASS carries findings or exceptions")
+            iar = record.get("iar_provenance")
+            binding = iar.get("binding") if isinstance(iar, Mapping) else None
+            if (
+                not isinstance(iar, Mapping)
+                or iar.get("authorized") is not True
+                or not isinstance(iar.get("authorization_ref"), str)
+                or not iar["authorization_ref"].startswith("iar:")
+                or iar.get("provenance_intact") is not True
+                or not isinstance(binding, Mapping)
+                or not _looks_head(binding.get("repo_sha"))
+                or type(binding.get("ledger_line_count")) is not int
+                or binding["ledger_line_count"] < 1
+                or not isinstance(binding.get("ledger_sha256_prefix"), str)
+                or len(binding["ledger_sha256_prefix"]) < 4
+            ):
+                raise SwitchboardError(
+                    "Sentinel PASS lacks IAR authorization provenance")
         return {
             "kind": kind,
             "source_role": "SENTINEL",
             "independent": True,
             "ref": ref,
+            "court_id": court_id,
+            "record_sha": content_sha(record),
         }
 
+    @_synchronized
     def ingest_raw(self, record: Mapping[str, Any]) -> dict[str, Any]:
         """Ingest a caller-supplied envelope.  Invalid schema is deadlettered."""
         try:
@@ -501,10 +699,16 @@ class Switchboard:
                 authority_ref="deadletter:invalid-schema",
             )
         try:
-            EventType(envelope["event_type"])
+            event_type = EventType(envelope["event_type"])
         except ValueError:
             return self._deadletter_envelope(
                 envelope, DeadletterReason.UNROUTABLE_EVENT, "unknown event_type")
+        if event_type in {EventType.COURT_PASSED, EventType.COURT_FAILED}:
+            return self._deadletter_envelope(
+                envelope,
+                DeadletterReason.CONTRADICTION,
+                "court outcomes must enter through validated record_court_outcome",
+            )
         known_types = {t.value for t in EventType}
         if envelope["event_type"] not in known_types:
             return self._deadletter_envelope(
@@ -582,7 +786,7 @@ class Switchboard:
             idempotency_key=f"receipt.created|{receipt.content_sha}",
         )
         report.events_emitted.append(created["event_id"])
-        verdict = validate_prime_receipt(receipt, known_missions=self.known_missions)
+        verdict = validate_receipt(receipt, known_missions=self.known_missions)
         self._cursor.setdefault("observed", {})[name] = {
             "sha": receipt.content_sha,
             "correlation_id": correlation_id,
@@ -636,7 +840,7 @@ class Switchboard:
             task_id=task_id,
             correlation_id=correlation_id,
             causation_id=created["event_id"],
-            source_role="PRIME",
+            source_role=receipt.source_role,
             source_component=receipt.get("SOURCE_COMPONENT") or "prime-builder",
             source_repo=receipt.repo or SOURCE_REPO,
             source_head=head,
@@ -655,6 +859,9 @@ class Switchboard:
                 "expected_pr": receipt.expected_pr,
                 "expected_pr_url": receipt.expected_pr_url,
                 "expected_pr_draft": receipt.expected_pr_draft,
+                "code_custody_required": receipt.code_custody_required,
+                "candidate": receipt.candidate,
+                "candidate_sha256": receipt.get("CANDIDATE_SHA256") or None,
                 "bind": receipt.bind,
                 "sentinel_closure_in_receipt": receipt.get("SENTINEL_CLOSURE"),
                 "clipboard_defect": receipt.clipboard_defect,
@@ -820,6 +1027,14 @@ class Switchboard:
         state = self.queue.load(enqueued)
         if state.status == JobStatus.QUEUED:
             self.runner.execute(enqueued)
+            state = self.queue.load(enqueued)
+        succeeded = [
+            receipt for receipt in self.job_ledger.receipts(enqueued)
+            if receipt.receipt_type == ReceiptType.JOB_SUCCEEDED
+        ]
+        if state.status != JobStatus.SUCCEEDED or len(succeeded) != 1:
+            raise SwitchboardError(
+                "Sentinel court artifact job did not seal exactly one success")
         court_payload = {
             "court_job_id": enqueued,
             "mission": params["mission"],
@@ -848,42 +1063,54 @@ class Switchboard:
         )
         return enqueued
 
-    def _on_court_passed(self, envelope: dict) -> str:
+    def _on_court_passed(self, envelope: dict) -> str | None:
         if envelope.get("authority_ref") in {"", "unsigned", "none"}:
             self._deadletter_envelope(
                 envelope, DeadletterReason.AUTHORITY_INVALID,
                 "candidate push requires authority")
             raise SwitchboardError("authority invalid")
-        # Find the sealed receipt payload on this correlation chain.
-        sealed = self._prior_on_chain(envelope["correlation_id"],
-                                      EventType.RECEIPT_SEALED)
-        if sealed is None:
+        court_requested = self._event_by_id(envelope.get("causation_id", ""))
+        sealed = (
+            self._event_by_id(court_requested.get("causation_id", ""))
+            if court_requested is not None
+            and court_requested.get("event_type") == EventType.COURT_REQUESTED.value
+            else None
+        )
+        if (
+            sealed is None
+            or sealed.get("event_type") != EventType.RECEIPT_SEALED.value
+            or court_requested.get("correlation_id") != envelope.get("correlation_id")
+            or sealed.get("correlation_id") != envelope.get("correlation_id")
+            or sealed.get("mission_id") != envelope.get("mission_id")
+            or sealed.get("task_id") != envelope.get("task_id")
+        ):
             self._deadletter_envelope(
                 envelope, DeadletterReason.CONTRADICTION,
-                "court.passed without a sealed receipt on the chain")
-            raise SwitchboardError("missing sealed receipt")
+                "court.passed is not bound through exact causation to its sealed receipt")
+            raise SwitchboardError("court.passed receipt chain mismatch")
         src = sealed["payload_ref_or_payload"]
         court = envelope["payload_ref_or_payload"]
-        expected = court.get("honey_pot_expected") or {}
+        if src.get("code_custody_required") is not True:
+            return None
         params = {
             "mission_id": envelope["mission_id"],
             "task_id": envelope["task_id"],
-            "repo": expected.get("repo") or src.get("repo", ""),
+            "repo": src.get("repo", ""),
             "worktree": src.get("worktree", ""),
-            "branch": expected.get("branch") or src.get("branch", ""),
-            "head": expected.get("head") or src.get("head", envelope["source_head"]),
+            "branch": src.get("branch", ""),
+            "head": src.get("head", envelope["source_head"]),
             "remote": src.get("remote", "origin"),
             "court_receipt": court.get("court_job_id", envelope["causation_id"]),
             "authority_ref": envelope["authority_ref"],
             "idempotency_key": f"candidate.push.requested|{src.get('receipt_sha')}",
-            "expected_pr": expected.get("pr_number") or src.get("expected_pr") or None,
-            "expected_pr_url": expected.get("pr_url") or src.get("expected_pr_url") or None,
-            "expected_pr_draft": expected.get("pr_draft") or src.get("expected_pr_draft") or None,
+            "expected_pr": src.get("expected_pr") or None,
+            "expected_pr_url": src.get("expected_pr_url") or None,
+            "expected_pr_draft": src.get("expected_pr_draft") or None,
         }
+        if src.get("candidate") is not None:
+            params["candidate"] = src["candidate"]
         if params["expected_pr"] == "":
             params["expected_pr"] = None
-        if expected.get("candidate"):
-            params["candidate"] = expected["candidate"]
         wf = self.catalog.get(HONEY_POT_WORKFLOW)
         job_id = self.queue.enqueue(
             wf, params, requested_by=SOURCE_ROLE,
@@ -891,6 +1118,14 @@ class Switchboard:
         state = self.queue.load(job_id)
         if state.status == JobStatus.QUEUED:
             self.runner.execute(job_id)
+            state = self.queue.load(job_id)
+        succeeded = [
+            receipt for receipt in self.job_ledger.receipts(job_id)
+            if receipt.receipt_type == ReceiptType.JOB_SUCCEEDED
+        ]
+        if state.status != JobStatus.SUCCEEDED or len(succeeded) != 1:
+            raise SwitchboardError(
+                "Honey Pot custody artifact did not seal exactly one success")
         self._emit(
             EventType.CANDIDATE_PUSH_REQUESTED,
             mission_id=envelope["mission_id"],
@@ -958,14 +1193,12 @@ class Switchboard:
         )
         return job_id
 
-    def _prior_on_chain(self, correlation_id: str,
-                        event_type: EventType) -> dict | None:
-        found = None
-        for envelope in self.events():
-            if (envelope.get("correlation_id") == correlation_id
-                    and envelope.get("event_type") == event_type.value):
-                found = envelope
-        return found
+    def _event_by_id(self, event_id: str) -> dict | None:
+        matches = [
+            envelope for envelope in self.events()
+            if envelope.get("event_id") == event_id
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     # -- emit / deadletter ------------------------------------------------- #
 
