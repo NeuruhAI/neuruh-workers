@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
 from enum import Enum
 from math import isfinite
@@ -39,7 +40,8 @@ from .organ_consumers import (
     call_gsa,
     emit_receipt_sealed_and_switcharoo,
     job_succeeded_sha,
-    resolve_source_head,
+    pull_authoritative_mission,
+    resolve_dispatch_source_identity,
     resume_parent_from_receipts,
     update_fr_evidence,
 )
@@ -83,6 +85,11 @@ class DispatchTicket:
 
     mission_id: str
     objective: str
+    mission_version: int
+    dispatch_approval_id: str
+    work_spec_sha256: str
+    execution_authorized: bool
+    work_spec_execution_authorized: bool
     fr_state: str = "QUEUED"
     fr_api_version: str = FR_API_VERSION
     expected_value_usd: float = 0.0
@@ -100,6 +107,23 @@ class DispatchTicket:
     def __post_init__(self) -> None:
         if not self.mission_id or not self.objective:
             raise ValueError("mission_id and objective are required")
+        if type(self.mission_version) is not int or self.mission_version < 1:
+            raise ValueError("mission_version must be a positive integer")
+        for name in ("mission_id", "objective", "dispatch_approval_id"):
+            if "\r" in getattr(self, name) or "\n" in getattr(self, name):
+                raise ValueError(f"{name} must be a single-line value")
+        if not self.dispatch_approval_id:
+            raise ValueError("dispatch_approval_id is required")
+        if (
+            len(self.work_spec_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.work_spec_sha256)
+        ):
+            raise ValueError("work_spec_sha256 must be lowercase 64-hex")
+        if (
+            self.execution_authorized is not True
+            or self.work_spec_execution_authorized is not True
+        ):
+            raise ValueError("execution and work-spec authority must both be true")
         if self.fr_api_version != FR_API_VERSION:
             raise ValueError(f"fr_api_version must be {FR_API_VERSION}")
         for name in ("uncertainty", "relevance"):
@@ -264,7 +288,13 @@ def map_founder_runtime_dispatch(
     evidence_refs = work_spec.get("evidence_refs")
     if (
         not isinstance(evidence_refs, list)
-        or any(not isinstance(ref, str) or not ref for ref in evidence_refs)
+        or any(
+            not isinstance(ref, str)
+            or not ref
+            or "\r" in ref
+            or "\n" in ref
+            for ref in evidence_refs
+        )
     ):
         raise ValueError("work_spec evidence_refs must be non-empty strings")
     for flag in _WORK_SPEC_FLAGS:
@@ -278,8 +308,17 @@ def map_founder_runtime_dispatch(
     ticket = DispatchTicket(
         mission_id=str(envelope.get("mission_id") or ""),
         objective=str(envelope.get("objective") or ""),
+        mission_version=envelope.get("version"),
+        dispatch_approval_id=authority["dispatch_approval_id"],
+        work_spec_sha256=work_spec_sha256,
+        execution_authorized=authority["execution_authorized"],
+        work_spec_execution_authorized=authority["work_spec_execution_authorized"],
         fr_state=str(envelope["state"]),
         fr_api_version=str(envelope["api_version"]),
+        parent_mission_id=(
+            str(envelope["parent_mission_id"])
+            if envelope.get("parent_mission_id") else None
+        ),
         code_custody_required=work_spec["code_custody_required"],
     )
     candidate = WorkCandidate(
@@ -295,6 +334,36 @@ def map_founder_runtime_dispatch(
         private_ip_risk=work_spec["private_ip_risk"],
     )
     return ticket, candidate
+
+
+def _dispatch_ticket_authority_identity(ticket: DispatchTicket) -> tuple[Any, ...]:
+    return (
+        ticket.mission_id,
+        ticket.objective,
+        ticket.mission_version,
+        ticket.dispatch_approval_id,
+        ticket.work_spec_sha256,
+        ticket.execution_authorized,
+        ticket.work_spec_execution_authorized,
+        ticket.fr_state,
+        ticket.fr_api_version,
+        ticket.parent_mission_id,
+    )
+
+
+def _candidate_execution_identity(candidate: WorkCandidate) -> tuple[Any, ...]:
+    return (
+        candidate.candidate_id,
+        candidate.workflow_name,
+        dict(candidate.params),
+        candidate.layer,
+        tuple(candidate.evidence_refs),
+        candidate.production_mutation,
+        candidate.external_message,
+        candidate.money_move,
+        candidate.irreversible,
+        candidate.private_ip_risk,
+    )
 
 
 @dataclass(frozen=True)
@@ -418,9 +487,11 @@ class DispatchBridge:
         receipts_dir: str | None = None,
         switchboard_root: str | None = None,
         source_head: str | None = None,
+        source_root: str | None = None,
         iar_probe: Callable[[], Mapping[str, Any]] | None = None,
         http_open: HttpOpen | None = None,
         fr_token: str | None = None,
+        fr_timeout_s: float = 0.25,
     ) -> None:
         self.queue = queue
         self.catalog = catalog
@@ -428,9 +499,11 @@ class DispatchBridge:
         self.receipts_dir = receipts_dir
         self.switchboard_root = switchboard_root
         self.source_head = source_head
+        self.source_root = source_root
         self.iar_probe = iar_probe
         self.http_open = http_open
         self.fr_token = fr_token
+        self.fr_timeout_s = fr_timeout_s
         self.last_switchboard = None
 
     def dispatch(
@@ -441,10 +514,30 @@ class DispatchBridge:
         auto_execute_read_only: bool = True,
         state_delta: Mapping[str, Any] | None = None,
     ) -> RuntimeResult:
-        fr_bind = bind_founder_runtime(opener=self.http_open)
+        fr_bind = bind_founder_runtime(
+            opener=self.http_open, timeout_s=self.fr_timeout_s)
+        if len(candidates) != 1:
+            raise ValueError(
+                "DispatchBridge requires exactly one FR-mapped WorkCandidate")
+        candidate = candidates[0]
+        context = compile_context(mission, candidate)
+        context_digest = content_sha(context)
+        if state_delta:
+            return RuntimeResult(
+                mission_id=mission.mission_id,
+                status=RuntimeStatus.BLOCKED,
+                candidate_id=candidate.candidate_id,
+                workflow_name=candidate.workflow_name,
+                layer=candidate.layer.value,
+                utility_usd=0.0,
+                founder_gate_reasons=(),
+                context_digest=context_digest,
+                compiled_context=context,
+                authority_path="recipe-engine.founder_runtime",
+                fr_bind=fr_bind,
+                note="caller state_delta is not part of the authority-bound FR work spec",
+            )
         if mission.fr_state not in FR_DISPATCHABLE_STATES:
-            candidate = rank_candidates(mission, candidates)[0]
-            context = compile_context(mission, candidate, state_delta=state_delta)
             return RuntimeResult(
                 mission_id=mission.mission_id,
                 status=RuntimeStatus.FR_STATE_NOT_DISPATCHABLE,
@@ -460,11 +553,128 @@ class DispatchBridge:
                 note="ticket is not FR APPROVED/QUEUED; bridge does not invent approval",
             )
 
-        candidate = rank_candidates(mission, candidates)[0]
-        context = compile_context(mission, candidate, state_delta=state_delta)
-        context_digest = content_sha(context)
-        gates = founder_gate_reasons(candidate)
+        if not fr_bind.get("present"):
+            return RuntimeResult(
+                mission_id=mission.mission_id,
+                status=RuntimeStatus.BLOCKED,
+                candidate_id=candidate.candidate_id,
+                workflow_name=candidate.workflow_name,
+                layer=candidate.layer.value,
+                utility_usd=0.0,
+                founder_gate_reasons=(),
+                context_digest=context_digest,
+                compiled_context=context,
+                authority_path="recipe-engine.founder_runtime",
+                fr_bind=fr_bind,
+                note="Founder Runtime became unavailable before execution",
+            )
 
+        try:
+            verified_source = resolve_dispatch_source_identity(
+                self.source_root or os.getcwd(), self.source_head)
+        except RuntimeError as exc:
+            return RuntimeResult(
+                mission_id=mission.mission_id,
+                status=RuntimeStatus.BLOCKED,
+                candidate_id=candidate.candidate_id,
+                workflow_name=candidate.workflow_name,
+                layer=candidate.layer.value,
+                utility_usd=0.0,
+                founder_gate_reasons=(),
+                context_digest=context_digest,
+                compiled_context=context,
+                authority_path="recipe-engine.founder_runtime",
+                fr_bind=fr_bind,
+                note=f"Workers source provenance refused: {exc}",
+            )
+
+        refreshed = pull_authoritative_mission(
+            mission.mission_id,
+            opener=self.http_open,
+            token=self.fr_token,
+            timeout_s=self.fr_timeout_s,
+        )
+        refreshed_envelope = refreshed.get("envelope")
+        refreshed_authority = (
+            refreshed_envelope.get("authority")
+            if isinstance(refreshed_envelope, Mapping) else None
+        )
+        authority_matches = (
+            refreshed.get("ok") is True
+            and isinstance(refreshed_envelope, Mapping)
+            and isinstance(refreshed_authority, Mapping)
+            and refreshed_envelope.get("mission_id") == mission.mission_id
+            and refreshed_envelope.get("version") == mission.mission_version
+            and refreshed_envelope.get("state") == "QUEUED"
+            and refreshed_envelope.get("work_spec_sha256") == mission.work_spec_sha256
+            and refreshed_authority.get("state") == "APPROVED"
+            and refreshed_authority.get("execution_authorized") is True
+            and refreshed_authority.get("work_spec_execution_authorized") is True
+            and refreshed_authority.get("dispatch_approval_id")
+            == mission.dispatch_approval_id
+            and refreshed_authority.get("work_spec_sha256")
+            == mission.work_spec_sha256
+        )
+        if not authority_matches:
+            return RuntimeResult(
+                mission_id=mission.mission_id,
+                status=RuntimeStatus.BLOCKED,
+                candidate_id=candidate.candidate_id,
+                workflow_name=candidate.workflow_name,
+                layer=candidate.layer.value,
+                utility_usd=0.0,
+                founder_gate_reasons=(),
+                context_digest=context_digest,
+                compiled_context=context,
+                authority_path="recipe-engine.founder_runtime",
+                fr_bind=fr_bind,
+                note="authenticated Founder Runtime mission authority recheck failed",
+            )
+
+        try:
+            trusted_mission, trusted_candidate = map_founder_runtime_dispatch(
+                refreshed_envelope, catalog=self.catalog)
+        except (TypeError, ValueError) as exc:
+            return RuntimeResult(
+                mission_id=mission.mission_id,
+                status=RuntimeStatus.BLOCKED,
+                candidate_id=candidate.candidate_id,
+                workflow_name=candidate.workflow_name,
+                layer=candidate.layer.value,
+                utility_usd=0.0,
+                founder_gate_reasons=(),
+                context_digest=context_digest,
+                compiled_context=context,
+                authority_path="recipe-engine.founder_runtime",
+                fr_bind=fr_bind,
+                note=f"authenticated Founder Runtime envelope was rejected: {exc}",
+            )
+        if (
+            _dispatch_ticket_authority_identity(trusted_mission)
+            != _dispatch_ticket_authority_identity(mission)
+            or _candidate_execution_identity(trusted_candidate)
+            != _candidate_execution_identity(candidate)
+        ):
+            return RuntimeResult(
+                mission_id=mission.mission_id,
+                status=RuntimeStatus.BLOCKED,
+                candidate_id=candidate.candidate_id,
+                workflow_name=candidate.workflow_name,
+                layer=candidate.layer.value,
+                utility_usd=0.0,
+                founder_gate_reasons=(),
+                context_digest=context_digest,
+                compiled_context=context,
+                authority_path="recipe-engine.founder_runtime",
+                fr_bind=fr_bind,
+                note="caller ticket/candidate differ from authenticated Founder Runtime",
+            )
+        mission = trusted_mission
+        candidate = trusted_candidate
+        context = compile_context(mission, candidate)
+        context_digest = content_sha(context)
+
+        gates = founder_gate_reasons(candidate)
         if gates:
             bind = call_gsa(reasons=gates, opener=self.http_open)
             return RuntimeResult(
@@ -483,7 +693,9 @@ class DispatchBridge:
                 note="consequential action; Governance → Sentinel → AXON required; no job enqueued",
             )
 
-        if candidate.layer in {IntelligenceLayer.L2, IntelligenceLayer.L3, IntelligenceLayer.L4}:
+        if candidate.layer in {
+            IntelligenceLayer.L2, IntelligenceLayer.L3, IntelligenceLayer.L4,
+        }:
             bind = bind_iar_rf(
                 context_digest=context_digest,
                 health_probe=self.iar_probe,
@@ -525,10 +737,46 @@ class DispatchBridge:
                 note="non-read-only work is consequential; Governance → Sentinel → AXON required",
             )
 
+        try:
+            execution_source = resolve_dispatch_source_identity(
+                self.source_root or os.getcwd(), self.source_head)
+        except RuntimeError as exc:
+            return RuntimeResult(
+                mission_id=mission.mission_id,
+                status=RuntimeStatus.BLOCKED,
+                candidate_id=candidate.candidate_id,
+                workflow_name=candidate.workflow_name,
+                layer=candidate.layer.value,
+                utility_usd=0.0,
+                founder_gate_reasons=(),
+                context_digest=context_digest,
+                compiled_context=context,
+                authority_path="recipe-engine.founder_runtime",
+                fr_bind=fr_bind,
+                note=f"Workers source provenance drifted before enqueue: {exc}",
+            )
+        if execution_source != verified_source:
+            return RuntimeResult(
+                mission_id=mission.mission_id,
+                status=RuntimeStatus.BLOCKED,
+                candidate_id=candidate.candidate_id,
+                workflow_name=candidate.workflow_name,
+                layer=candidate.layer.value,
+                utility_usd=0.0,
+                founder_gate_reasons=(),
+                context_digest=context_digest,
+                compiled_context=context,
+                authority_path="recipe-engine.founder_runtime",
+                fr_bind=fr_bind,
+                note="Workers source identity changed before enqueue",
+            )
+
         dedupe_key = content_sha({
             "mission_id": mission.mission_id,
             "candidate_id": candidate.candidate_id,
             "context_digest": context_digest,
+            "dispatch_approval_id": mission.dispatch_approval_id,
+            "work_spec_sha256": mission.work_spec_sha256,
         })
         job_id = self.queue.enqueue(
             definition,
@@ -560,6 +808,7 @@ class DispatchBridge:
         sentinel = None
         honey = None
         fr_update = None
+        emission_complete = False
         if status in {RuntimeStatus.SUCCEEDED, RuntimeStatus.ALREADY_SUCCEEDED}:
             emission = emit_receipt_sealed_and_switcharoo(
                 mission_id=mission.mission_id,
@@ -568,7 +817,15 @@ class DispatchBridge:
                 context_digest=context_digest,
                 evidence_refs=candidate.evidence_refs,
                 job_succeeded_sha=job_succeeded_sha(self.queue, job_id),
-                source_head=resolve_source_head(self.source_head),
+                source_head=verified_source.head,
+                source_root=self.source_root,
+                source_identity=verified_source,
+                dispatch_approval_id=mission.dispatch_approval_id,
+                work_spec_sha256=mission.work_spec_sha256,
+                mission_version=mission.mission_version,
+                idempotency_key=dedupe_key,
+                # Immutable receipt records the stable terminal job result.
+                dispatch_result=state.status.value,
                 receipts_dir=self.receipts_dir,
                 switchboard_root=self.switchboard_root,
                 code_custody_required=mission.code_custody_required,
@@ -579,27 +836,40 @@ class DispatchBridge:
             sentinel = emission["sentinel"]
             honey = emission["honey_pot"]
             self.last_switchboard = emission.get("board")
-            if mission.parent_mission_id:
-                parent_resume = resume_parent_from_receipts(
-                    self.queue,
-                    self.runner,
-                    parent_mission_id=mission.parent_mission_id,
-                    child_job_id=job_id,
-                )
-                chain = self.queue.ledger.verify()
-            fr_update = update_fr_evidence(
-                mission.mission_id,
-                {
-                    "job_id": job_id,
-                    "ledger_tail_sha": chain["tail_sha"],
-                    "job_status": state.status.value,
-                    "parent_resume": parent_resume,
-                    "switchboard_bind": (switchboard_emit or {}).get("bind_status"),
-                    "sentinel_bind": (sentinel or {}).get("bind_status"),
-                },
-                opener=self.http_open,
-                token=self.fr_token,
+            emission_complete = (
+                isinstance(sealed, Mapping)
+                and sealed.get("event_type") == "receipt.sealed"
+                and isinstance(court, Mapping)
+                and court.get("event_type") == "court.requested"
+                and isinstance(switchboard_emit, Mapping)
+                and switchboard_emit.get("consumed") is True
             )
+            if not emission_complete:
+                status = RuntimeStatus.BLOCKED
+            elif sentinel and sentinel.get("verdict") == "FAIL":
+                status = RuntimeStatus.BLOCKED
+            elif sentinel and sentinel.get("verdict") == "PASS":
+                if mission.parent_mission_id:
+                    parent_resume = resume_parent_from_receipts(
+                        self.queue,
+                        self.runner,
+                        parent_mission_id=mission.parent_mission_id,
+                        child_job_id=job_id,
+                    )
+                    chain = self.queue.ledger.verify()
+                fr_update = update_fr_evidence(
+                    mission.mission_id,
+                    {
+                        "job_id": job_id,
+                        "ledger_tail_sha": chain["tail_sha"],
+                        "job_status": state.status.value,
+                        "parent_resume": parent_resume,
+                        "switchboard_bind": (switchboard_emit or {}).get("bind_status"),
+                        "sentinel_bind": (sentinel or {}).get("bind_status"),
+                    },
+                    opener=self.http_open,
+                    token=self.fr_token,
+                )
         elif mission.parent_mission_id:
             parent_resume = {
                 "parent_mission_id": mission.parent_mission_id,
@@ -631,7 +901,15 @@ class DispatchBridge:
             honey_pot=honey,
             fr_bind=fr_bind,
             fr_evidence_update=fr_update,
-            note="FR ticket dispatched onto existing queue/runner/ledger; no second FR",
+            note=(
+                "FR ticket dispatched, independently courted, and sealed"
+                if emission_complete and sentinel and sentinel.get("verdict") == "PASS"
+                else "FR ticket execution sealed; independent court is pending"
+                if emission_complete and not (sentinel or {}).get("verdict")
+                else "independent court failed; downstream effects refused"
+                if emission_complete and (sentinel or {}).get("verdict") == "FAIL"
+                else "Workers execution did not complete the sealed Switchboard seam"
+            ),
         )
 
 
