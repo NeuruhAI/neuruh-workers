@@ -442,6 +442,67 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(context["fr_state"], "QUEUED")
         self.assertEqual(self.ledger.verify()["receipts"], 0)
 
+    def test_multiline_founder_objective_survives_mapping_byte_for_byte(self):
+        # The live T02 mission carries its "Done when:" clause on a second line.
+        # Founder Runtime owns mission intent; Workers transports it and must not
+        # reinterpret, join, or truncate it.
+        objective = (
+            "T02 close, supervised mission B: read-only property research dispatched "
+            "through the Workers seam under the scoped R1 ratification, to prove Founder "
+            "Runtime -> Governance -> QUEUED -> Workers exactly once -> ExecutionLedger -> "
+            "typed receipt -> receipt.sealed -> SWITCHAROO -> Sentinel -> Honey Pot -> "
+            "parent continuation.\n"
+            "Done when: One sealed nrh.receipt.fr-dispatch.v1, one court request, no "
+            "duplicate dispatch, receipt, court or custody."
+        )
+        ticket, candidate = map_founder_runtime_dispatch(
+            self.fr_envelope(objective=objective),
+            catalog=self.catalog,
+        )
+        self.assertIsInstance(ticket, DispatchTicket)
+        self.assertIsInstance(candidate, WorkCandidate)
+        self.assertIs(candidate.layer, IntelligenceLayer.L0)
+        # Byte-for-byte: not joined, not first-line-only, not stripped.
+        self.assertEqual(ticket.objective, objective)
+        self.assertIn("\n", ticket.objective)
+        self.assertEqual(ticket.objective.count("\n"), 1)
+        context = compile_context(ticket, candidate)
+        self.assertEqual(context["objective"], objective)
+        self.assertIn("\n", context["objective"])
+        # The transported objective is still the mission's, not an inferred one.
+        self.assertEqual(candidate.workflow_name, "property-research")
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
+    def test_identifier_fields_still_refuse_embedded_newlines(self):
+        # Widening `objective` must not widen identity. These stay single-line.
+        for update in (
+            {"mission_id": "msn-fr-boundary\ninjected"},
+            {"mission_id": "msn-fr-boundary\rinjected"},
+        ):
+            with self.subTest(update=update):
+                with self.assertRaises(ValueError):
+                    map_founder_runtime_dispatch(
+                        self.fr_envelope(**update),
+                        catalog=self.catalog,
+                    )
+        for approval_id in ("appr-fr-boundary\ninjected", "appr-fr-boundary\rinjected"):
+            with self.subTest(dispatch_approval_id=approval_id):
+                envelope = self.fr_envelope()
+                envelope["authority"] = dict(envelope["authority"])
+                envelope["authority"]["dispatch_approval_id"] = approval_id
+                with self.assertRaises(ValueError):
+                    map_founder_runtime_dispatch(envelope, catalog=self.catalog)
+        # An empty objective is still no objective at all -- and widening the
+        # newline rule must not let whitespace impersonate mission intent.
+        for empty in ("", " ", "\t", "\n", "\r\n", "\n\n\n"):
+            with self.subTest(objective=repr(empty)):
+                with self.assertRaises(ValueError):
+                    map_founder_runtime_dispatch(
+                        self.fr_envelope(objective=empty),
+                        catalog=self.catalog,
+                    )
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
     def test_pulled_fr_envelope_reaches_production_mapping_without_loss(self):
         envelope = self.fr_envelope()
 

@@ -105,11 +105,20 @@ class DispatchTicket:
     code_custody_required: bool = False
 
     def __post_init__(self) -> None:
-        if not self.mission_id or not self.objective:
+        # `.strip()` here tests emptiness only -- the stored objective is never
+        # rewritten. Widening the newline rule below must not make "\n" a
+        # substitute for the mission intent this field is supposed to carry.
+        if not self.mission_id or not self.objective.strip():
             raise ValueError("mission_id and objective are required")
         if type(self.mission_version) is not int or self.mission_version < 1:
             raise ValueError("mission_version must be a positive integer")
-        for name in ("mission_id", "objective", "dispatch_approval_id"):
+        # Identity stays single-line: these are keys, log fields and members of the
+        # dispatch authority identity tuple, where an embedded newline is an
+        # injection surface. `objective` is not identity -- it is Founder Runtime's
+        # authored mission intent, carried verbatim. Real missions state their
+        # "Done when:" clause on its own line, and Workers has no licence to join,
+        # truncate or otherwise reinterpret what the mission author wrote.
+        for name in ("mission_id", "dispatch_approval_id"):
             if "\r" in getattr(self, name) or "\n" in getattr(self, name):
                 raise ValueError(f"{name} must be a single-line value")
         if not self.dispatch_approval_id:
