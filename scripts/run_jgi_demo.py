@@ -30,14 +30,17 @@ def main() -> int:
     parser.add_argument("--mission-id", required=True)
     args = parser.parse_args()
 
+    # Authority first: a dispatch with no Founder Runtime authority assembles no
+    # runtime and touches no ledger.
+    token = os.environ.get("FR_API_OPERATOR_TOKEN")
+    if not token:
+        parser.error("FR_API_OPERATOR_TOKEN is required")
+
     ledger = ExecutionLedger(args.ledger)
     registry = build_registry()
     catalog = build_catalog()
     queue = JobQueue(ledger, registry)
     runner = WorkflowRunner(queue, registry, catalog)
-    token = os.environ.get("FR_API_OPERATOR_TOKEN")
-    if not token:
-        parser.error("FR_API_OPERATOR_TOKEN is required")
     pulled = pull_authoritative_mission(args.mission_id, token=token)
     if not pulled.get("ok"):
         print(json.dumps(pulled, indent=2, sort_keys=True), file=sys.stderr)
