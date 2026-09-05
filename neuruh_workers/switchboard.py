@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import fcntl
 import functools
+import hashlib
 import json
 import os
 import stat
@@ -1004,6 +1005,39 @@ class Switchboard:
             f"consumer {consumer.consumer_id} cannot route {event_type.value}",
             {"reason": DeadletterReason.UNROUTABLE_EVENT.value})
 
+    def _independent_court_evidence(self, receipt_ref: str) -> tuple[list[str], dict[str, str]]:
+        """The evidence this board can name for a court, and what it said then.
+
+        The adjudicator retrieves what it judges from evidence_refs, and it
+        refuses the sealed receipt as evidence of itself. Emitting a court
+        request without evidence therefore leaves a human to hand the organ its
+        evidence by hand, which is not an unattended seam.
+
+        These are the two immutable hash-chained ledgers this board already
+        owns and has already written: the causal event chain and the court job
+        chain. Nothing is constructed, summarised or discovered here -- the
+        paths are the board's own, and the digests pin what those files said at
+        the moment the court was requested.
+        """
+        sealed_receipt = os.path.realpath(receipt_ref)
+        refs: list[str] = []
+        for name in (EVENTS_NAME, JOBS_NAME):
+            path = os.path.join(self.root, name)
+            if not os.path.isfile(path):
+                continue
+            if os.path.realpath(path) == sealed_receipt:
+                continue
+            if path not in refs:
+                refs.append(path)
+        digests: dict[str, str] = {}
+        for path in refs:
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(65536), b""):
+                    digest.update(chunk)
+            digests[path] = digest.hexdigest()
+        return refs, digests
+
     def _on_receipt_sealed(self, envelope: dict) -> str:
         payload = envelope["payload_ref_or_payload"]
         if envelope.get("authority_ref") in {"", "unsigned", "none"}:
@@ -1035,6 +1069,8 @@ class Switchboard:
         if state.status != JobStatus.SUCCEEDED or len(succeeded) != 1:
             raise SwitchboardError(
                 "Sentinel court artifact job did not seal exactly one success")
+        evidence_refs, evidence_sha256 = self._independent_court_evidence(
+            params["receipt_ref"])
         court_payload = {
             "court_job_id": enqueued,
             "mission": params["mission"],
@@ -1045,6 +1081,8 @@ class Switchboard:
             "required_invariants": params["required_invariants"],
             "authority_ref": params["authority_ref"],
             "sentinel_model_execution": SENTINEL_MODEL_EXECUTION,
+            "evidence_refs": evidence_refs,
+            "evidence_sha256": evidence_sha256,
         }
         self._emit(
             EventType.COURT_REQUESTED,

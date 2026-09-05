@@ -219,6 +219,51 @@ class T07FirstSeamTests(unittest.TestCase):
         self.assertEqual(len(self.board.events(EventType.COURT_REQUESTED)), 1)
         self.assertEqual(len(self.board.jobs_for(SENTINEL_WORKFLOW)), 1)
 
+    def test_court_request_carries_resolvable_independent_evidence_refs(self):
+        """A court.requested that names no evidence cannot be adjudicated unattended.
+
+        The Sentinel organ retrieves what it judges from evidence_refs, and it
+        refuses the sealed receipt as its own evidence (PRIME_VERDICT /
+        SENTINEL_CLOSURE are receipt fields, not court evidence). Emitting a
+        court request with no evidence_refs therefore forces a human to hand
+        the adjudicator its evidence, which is the whole point of the seam.
+        """
+        self.board.tick()
+        court = self.board.events(EventType.COURT_REQUESTED)
+        self.assertEqual(len(court), 1)
+        payload = court[0]["payload_ref_or_payload"]
+
+        self.assertIn("evidence_refs", payload)
+        refs = payload["evidence_refs"]
+        self.assertIsInstance(refs, list)
+        self.assertTrue(refs, "court.requested must name its own evidence")
+
+        # Deterministic, absolute, existing, and never the receipt itself.
+        receipt_ref = os.path.realpath(payload["receipt_ref"])
+        for ref in refs:
+            self.assertIsInstance(ref, str)
+            self.assertTrue(os.path.isabs(ref), f"{ref!r} is not absolute")
+            self.assertTrue(os.path.isfile(ref), f"{ref!r} does not exist")
+            self.assertNotEqual(
+                os.path.realpath(ref), receipt_ref,
+                "the sealed receipt is not independent evidence of itself")
+        self.assertEqual(len(refs), len(set(refs)))
+
+        # The immutable hash-chained ledgers this board already owns.
+        self.assertIn(os.path.join(self.board.root, "events.jsonl"), refs)
+        self.assertIn(os.path.join(self.board.root, "jobs.jsonl"), refs)
+
+        # Hash-bound: the payload pins what the evidence said at request time.
+        digests = payload.get("evidence_sha256")
+        self.assertIsInstance(digests, dict)
+        self.assertEqual(sorted(digests), sorted(refs))
+        for ref, digest in digests.items():
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+        # Re-emitting the same request is deterministic, not a fresh guess.
+        self.board.tick()
+        self.assertEqual(len(self.board.events(EventType.COURT_REQUESTED)), 1)
+
     def test_independent_court_pass_materialises_exactly_one_honey_pot_no_git_push(self):
         """Second seam: court.passed from independent evidence, never from T07 reconstruction."""
         self.board.tick()
