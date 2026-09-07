@@ -28,7 +28,7 @@ def materialize_court_artifact(ctx: StepContext, params: Mapping[str, Any]) -> d
     if missing:
         raise ValueError(f"court artifact missing {missing}")
     court_job_id = params.get("court_job_id") or ctx.job_id
-    return {
+    artifact = {
         "artifact": "court.requested",
         "sentinel_model_execution": SENTINEL_MODEL_EXECUTION,
         "court_job_id": court_job_id,
@@ -41,6 +41,13 @@ def materialize_court_artifact(ctx: StepContext, params: Mapping[str, Any]) -> d
         "authority_ref": params["authority_ref"],
         "note": "job artifact only; no Sentinel model was invoked",
     }
+    # The evidence and identity bindings the court.requested event will carry
+    # (A04 §6), recorded on the job artifact verbatim so the durable job says
+    # exactly what the request said. Nothing is derived here.
+    bindings = params.get("bindings")
+    if isinstance(bindings, Mapping):
+        artifact["bindings"] = dict(bindings)
+    return artifact
 
 
 def materialize_candidate_push(ctx: StepContext, params: Mapping[str, Any]) -> dict:

@@ -21,6 +21,7 @@ from neuruh_workers.git_custodian import (
     RecordingSwitchboard,
     SWITCHAROO_INTEGRATED,
 )
+from tests.canonical_fixture import OfflineCanonical
 from tests.git_custodian_fixtures import (
     T07_AUTHORITY_REF,
     git,
@@ -86,11 +87,15 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
         state = os.path.join(self.tmpdir, "switchboard")
         receipts = os.path.join(self.tmpdir, "receipts")
         os.makedirs(receipts, exist_ok=True)
+        # The seeded pair's origin IS a bare repository on disk: the board reads
+        # main off it, and the fixture observer refuses any other worktree.
+        self.canonical = OfflineCanonical(self.pair["work"], self.pair["remote"])
         self.board = Switchboard(
             state,
             receipts_dir=receipts,
             known_missions=frozenset({MISSION}),
             git_custodian=self.worker,
+            canonical_observer=self.canonical.observe,
         )
 
     def test_switchboard_emits_envelope_git_custodian_consumes_and_pushes(self):
@@ -101,6 +106,14 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
 
         sealed = self.board.events(EventType.RECEIPT_SEALED)[-1]
         court = self.board.events(EventType.COURT_REQUESTED)[-1]
+        request = court["payload_ref_or_payload"]
+        # The board read main off the bare remote: the base is the seeded main,
+        # not the feature commit under judgement, and the record it accepts says
+        # so (candidate_descends_from_canonical_base, derived from this request).
+        self.assertEqual(request["canonical_sha"], self.pair["base_sha"])
+        self.assertNotEqual(request["canonical_sha"], self.pair["feature_sha"])
+        self.assertEqual(request["canonical_repo"], self.pair["remote"])
+        self.assertNotIn("canonical_base", request["binding_gaps"])
         self.board.record_court_outcome(
             passed=True,
             court_job_id=court["payload_ref_or_payload"]["court_job_id"],

@@ -2,7 +2,9 @@
 """Observe local PRIME receipts and tick the Switchboard first seam.
 
 Loopback/file observation only.  No public listener.  Does not execute a
-Sentinel model and does not git push.
+Sentinel model and does not git push.  The one remote read is the canonical
+base: a read-only ``git ls-remote`` against the executed worktree's own remote,
+so the court request names a base this board observed rather than a gap.
 """
 from __future__ import annotations
 
@@ -13,7 +15,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neuruh_workers.switchboard import Switchboard  # noqa: E402
+from neuruh_workers.switchboard import (  # noqa: E402
+    Switchboard, observe_canonical_base_via_git,
+)
 
 ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -22,7 +26,12 @@ RECEIPTS = os.path.join(ROOT, "receipts")
 
 
 def _board(args) -> Switchboard:
-    return Switchboard(args.root, receipts_dir=args.receipts)
+    # The production board observes the canonical base itself. Without an
+    # observer the request names the canonical_base gap and no PASS can ever be
+    # certified against it (switchboard._require_observed_relation).
+    return Switchboard(
+        args.root, receipts_dir=args.receipts,
+        canonical_observer=observe_canonical_base_via_git)
 
 
 def main() -> int:
