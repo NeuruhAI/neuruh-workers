@@ -501,6 +501,7 @@ class DispatchBridge:
         http_open: HttpOpen | None = None,
         fr_token: str | None = None,
         fr_timeout_s: float = 0.25,
+        canonical_observer: Callable[[str, str, str], tuple[str, str]] | None = None,
     ) -> None:
         self.queue = queue
         self.catalog = catalog
@@ -513,6 +514,10 @@ class DispatchBridge:
         self.http_open = http_open
         self.fr_token = fr_token
         self.fr_timeout_s = fr_timeout_s
+        # How the bridge's Switchboard reads the canonical base. None means the
+        # production observer (read-only git against the worktree's own remote);
+        # a court injects an offline one so no tick here reaches a network host.
+        self.canonical_observer = canonical_observer
         self.last_switchboard = None
 
     def dispatch(
@@ -838,6 +843,7 @@ class DispatchBridge:
                 receipts_dir=self.receipts_dir,
                 switchboard_root=self.switchboard_root,
                 code_custody_required=mission.code_custody_required,
+                canonical_observer=self.canonical_observer,
             )
             sealed = emission["sealed"]
             court = emission["court_request"]

@@ -29,11 +29,13 @@ from neuruh_workers.queue import JobQueue
 from neuruh_workers.switchboard import (
     INDEPENDENT_COURT_KIND, T07_AXON_BRANCH, T07_AXON_PR, T07_AXON_PR_URL,
     T07_HEAD, T07_MISSION, T07_STAGE, SwitchboardError, _CrashSimulated,
+    _UNOBSERVED_BASE,
 )
 from neuruh_workers.switchboard_jobs import (
     GIT_PUSH, HONEY_POT_WORKFLOW, REMEDIATION_WORKFLOW, SENTINEL_MODEL_EXECUTION,
     SENTINEL_WORKFLOW, materialize_candidate_push, materialize_court_artifact,
 )
+from tests.canonical_fixture import OfflineCanonical
 from tests.helpers import fixed_clock, make_stack
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,11 +45,37 @@ T07_COURT_FIXTURE = os.path.join(
 T07_WORKTREE = (
     "/Users/jeramiehicks/neuruh-worktrees/grok-sovereign-mcp-v4-20260827/neuruh-axon")
 SYNTHETIC_MISSION = "NEURUH_SWITCHAROO_SYNTHETIC_SEAM_V1"
+# A head no repository holds. Only forged shapes name it; a receipt the seam is
+# meant to carry names the offline canonical's own head (see _synthetic_body).
 SYNTHETIC_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+# The offline canonical every board in this module observes. Built once per
+# module run: a tick only ever READS it. A test that must move its main builds
+# its own (CanonicalObserverContractTests).
+_CANONICAL: OfflineCanonical | None = None
+_CANONICAL_TMP: str | None = None
+
+
+def setUpModule() -> None:
+    global _CANONICAL, _CANONICAL_TMP
+    _CANONICAL_TMP = tempfile.mkdtemp(prefix="neuruh-switchboard-canonical-")
+    _CANONICAL = OfflineCanonical.seed(_CANONICAL_TMP, branch="feature/synthetic-first-seam")
+
+
+def tearDownModule() -> None:
+    global _CANONICAL, _CANONICAL_TMP
+    if _CANONICAL_TMP:
+        shutil.rmtree(_CANONICAL_TMP, ignore_errors=True)
+    _CANONICAL, _CANONICAL_TMP = None, None
+
+
+def _canonical() -> OfflineCanonical:
+    assert _CANONICAL is not None, "setUpModule builds the offline canonical"
+    return _CANONICAL
 
 
 def _board(testcase, *, missions=None, crash_after_lease=False, fail_handler=None,
-           receipts=None):
+           receipts=None, observe=True):
     tmp = tempfile.mkdtemp(prefix="neuruh-switchboard-")
     testcase.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
     receipts_dir = receipts or os.path.join(tmp, "receipts")
@@ -59,6 +87,9 @@ def _board(testcase, *, missions=None, crash_after_lease=False, fail_handler=Non
         clock=fixed_clock(),
         crash_after_lease=crash_after_lease,
         fail_handler=fail_handler,
+        # The board reads the canonical base off the offline fixture; a board
+        # built with observe=False names the gap and can never certify a PASS.
+        canonical_observer=_canonical().observe if observe else None,
     )
 
 
@@ -76,9 +107,9 @@ def _synthetic_body(**overrides) -> str:
         "PLAN_ID": "SYNTHETIC_FIRST_SEAM",
         "TASK_ID": "synthetic-first-seam",
         "REPO": "NeuruhAI/neuruh-workers",
-        "WORKTREE": "/tmp/synthetic-worktree",
+        "WORKTREE": _canonical().worktree,
         "BRANCH": "feature/synthetic-first-seam",
-        "HEAD": SYNTHETIC_HEAD,
+        "HEAD": _canonical().head,
         "REMOTE": "origin",
         "SOURCE_ROLE": "PRIME",
         "SOURCE_COMPONENT": "prime-builder",
@@ -93,6 +124,29 @@ def _synthetic_body(**overrides) -> str:
     return "\n".join(f"{k}={v}" for k, v in fields.items()) + "\n"
 
 
+def _t07_body_rebound() -> str:
+    """The live T07 receipt with its source identity rebound to the offline
+    canonical. Mission, stage, authority and the PR it expects are the fixture's
+    own text; only WORKTREE/SOURCE_HEAD/REMOTE now name a base a test board can
+    observe. seal_receipt_text re-seals the PAYLOAD_HASH (via _write_receipt)."""
+    world = _canonical()
+    rebound = {
+        "WORKTREE": world.worktree,
+        "SOURCE_HEAD": world.head,
+        "REMOTE": "origin",
+        "REMOTE_HEAD_MAIN": world.base,
+        "REMOTE_HEAD_FEATURE": world.head,
+    }
+    lines = []
+    with open(T07_FIXTURE, encoding="utf-8") as fh:
+        for line in fh.read().splitlines():
+            key = line.split("=", 1)[0]
+            if key == "PAYLOAD_HASH":
+                continue
+            lines.append(f"{key}={rebound[key]}" if key in rebound else line)
+    return "\n".join(lines) + "\n"
+
+
 def _independent_evidence(
     board: Switchboard,
     sealed: dict,
@@ -104,6 +158,15 @@ def _independent_evidence(
         board.root,
         f"sentinel-{court['payload_ref_or_payload']['court_job_id']}.json",
     )
+    request = court["payload_ref_or_payload"] or {}
+    # The stub organ takes its base from the request it was handed, exactly as
+    # the canonical organ does: the base the BOARD read off the remote, or -- when
+    # the board read nothing -- the unobserved sentinel, stated as unobserved. It
+    # never invents an observation the request did not carry.
+    canonical = str(request.get("canonical_sha") or sealed["source_head"]).lower()
+    observed = request.get("canonical_base_observed") is True
+    relation = ("candidate_is_canonical_base" if canonical == sealed["source_head"]
+                else "candidate_descends_from_canonical_base")
     record = {
         "kind": INDEPENDENT_COURT_KIND,
         "source_role": "SENTINEL",
@@ -118,7 +181,8 @@ def _independent_evidence(
         "receipt_ref": sealed["payload_ref_or_payload"]["receipt_ref"],
         "receipt_sha": sealed["payload_ref_or_payload"]["receipt_sha"],
         "candidate_sha": sealed["source_head"],
-        "canonical_sha": sealed["source_head"],
+        "canonical_sha": canonical,
+        "canonical_base_sha": canonical,
         "plan_id": sealed["plan_id"],
         "task_id": sealed["task_id"],
         "correlation_id": sealed["correlation_id"],
@@ -130,7 +194,20 @@ def _independent_evidence(
         "observed_sha": hashlib.sha256(
             Path(sealed["payload_ref_or_payload"]["receipt_ref"]).read_bytes()
         ).hexdigest(),
-        "base_relation": "equal",
+        # The evidence it names is the receipt the request named, and the digest
+        # is the one the request carried. The base, and whether it was observed,
+        # are the request's too (above): equal shas alone are an assertion the
+        # verifier refuses, and so is a base the board never read.
+        "evidence_refs": [sealed["payload_ref_or_payload"]["receipt_ref"]],
+        "evidence_sha256": request.get("evidence_sha256", ""),
+        "base_relation": relation,
+        "base_binding": {
+            "relation": relation,
+            "independently_observed": observed,
+            "canonical_base_observed_on_remote": observed,
+            "observed_base_sha": canonical if observed else "",
+            "detail": "test fixture: base taken from the court request",
+        },
         "findings": [] if passed else [{"code": "TEST_FAIL"}],
         "exceptions": [],
         "required_repairs": [] if passed else ["repair test failure"],
@@ -155,7 +232,7 @@ def _independent_evidence(
     }
 
 
-def _ingest_pass(board: Switchboard, *, passed: bool, extra_payload=None):
+def _ingest_pass(board: Switchboard, *, passed: bool, extra_payload=None, evidence=None):
     sealed = board.events(EventType.RECEIPT_SEALED)[-1]
     court = board.events(EventType.COURT_REQUESTED)[-1]
     return board.record_court_outcome(
@@ -170,7 +247,7 @@ def _ingest_pass(board: Switchboard, *, passed: bool, extra_payload=None):
         authority_ref=sealed["authority_ref"],
         source_repo=sealed["source_repo"],
         receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
-        evidence=_independent_evidence(
+        evidence=evidence or _independent_evidence(
             board, sealed, court, passed=passed),
         verdict_note="independent Sentinel close; Switchboard did not PASS",
         extra_payload=extra_payload,
@@ -215,60 +292,85 @@ class T07FirstSeamTests(unittest.TestCase):
         self.assertEqual(payload["source_head"], T07_HEAD)
         self.assertEqual(payload["claimer"], "NEURUH_PRIME")
         self.assertEqual(payload["court_job_id"], jobs[0])
+        # The live receipt names a worktree on a GitHub remote. No tick here may
+        # read it, and the fixture observer refuses it: the request names the gap.
+        self.assertIn("canonical_base", payload["binding_gaps"])
+        self.assertEqual(payload["canonical_sha"], _UNOBSERVED_BASE)
+        self.assertFalse(payload["canonical_base_observed"])
         self.board.tick()
         self.assertEqual(len(self.board.events(EventType.COURT_REQUESTED)), 1)
         self.assertEqual(len(self.board.jobs_for(SENTINEL_WORKFLOW)), 1)
 
     def test_independent_court_pass_materialises_exactly_one_honey_pot_no_git_push(self):
-        """Second seam: court.passed from independent evidence, never from T07 reconstruction."""
+        """Second seam: court.passed from independent evidence, never from T07 reconstruction.
+
+        The sealed T07 fixture names a worktree on a GitHub remote, which no test
+        tick may read, so its board observed nothing and can only refuse a PASS.
+        The PASS half runs on the same T07 receipt REBOUND to the offline
+        canonical: mission, stage, authority and the PR it expects are the
+        fixture's own text; only the source identity points at a base this board
+        can observe."""
         self.board.tick()
         with self.assertRaises(SwitchboardError) as refused:
             self.board.ingest_court_fixture(T07_COURT_FIXTURE)
         self.assertIn("reconstruction", str(refused.exception).lower())
         self.assertEqual(len(self.board.events(EventType.COURT_PASSED)), 0)
-        _ingest_pass(self.board, passed=True, extra_payload={
+        with self.assertRaises(SwitchboardError) as unobserved:
+            _ingest_pass(self.board, passed=True)
+        self.assertIn("never observed", str(unobserved.exception))
+        self.assertEqual(len(self.board.events(EventType.COURT_PASSED)), 0)
+
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "T07_REBOUND.txt", _t07_body_rebound())
+        board.tick()
+        request = board.events(EventType.COURT_REQUESTED)[0]["payload_ref_or_payload"]
+        self.assertEqual(request["canonical_sha"], _canonical().base)
+        self.assertNotIn("canonical_base", request["binding_gaps"])
+        _ingest_pass(board, passed=True, extra_payload={
             "summary": {"pass_count": 1, "fail_count": 0},
         })
-        report = self.board.tick()
-        passed = self.board.events(EventType.COURT_PASSED)
+        report = board.tick()
+        passed = board.events(EventType.COURT_PASSED)
         self.assertEqual(len(passed), 1)
         evidence = passed[0]["payload_ref_or_payload"]["evidence"]
         self.assertEqual(evidence["kind"], INDEPENDENT_COURT_KIND)
         self.assertEqual(evidence["source_role"], "SENTINEL")
         self.assertTrue(evidence["independent"])
         self.assertEqual(passed[0]["source_role"], "SENTINEL")
-        pushes = self.board.events(EventType.CANDIDATE_PUSH_REQUESTED)
+        pushes = board.events(EventType.CANDIDATE_PUSH_REQUESTED)
         self.assertEqual(len(pushes), 1)
-        jobs = self.board.jobs_for(HONEY_POT_WORKFLOW)
+        jobs = board.jobs_for(HONEY_POT_WORKFLOW)
         self.assertEqual(len(jobs), 1)
         self.assertIn(jobs[0], report.jobs_created)
-        artifact = self.board.queue.load(jobs[0]).step_results["materialize"]
+        artifact = board.queue.load(jobs[0]).step_results["materialize"]
         self.assertEqual(artifact["git_push"], GIT_PUSH)
         self.assertEqual(artifact["expected_pr"], T07_AXON_PR)
         self.assertEqual(artifact["expected_pr_url"], T07_AXON_PR_URL)
         self.assertEqual(artifact["expected_pr_draft"], "YES")
-        self.assertEqual(artifact["head"], T07_HEAD)
+        self.assertEqual(artifact["head"], _canonical().head)
         self.assertEqual(artifact["repo"], "NeuruhAI/neuruh-axon")
         self.assertEqual(artifact["branch"], T07_AXON_BRANCH)
-        self.assertEqual(artifact["worktree"], T07_WORKTREE)
+        self.assertEqual(artifact["worktree"], _canonical().worktree)
         for key in ("mission_id", "task_id", "repo", "worktree", "branch", "head",
                     "remote", "court_receipt", "authority_ref", "idempotency_key"):
             self.assertIn(key, artifact)
         self.assertNotIn("git push", inspect.getsource(materialize_candidate_push))
         self.assertNotIn("git push", inspect.getsource(materialize_court_artifact))
-        self.assertEqual(len(self.board.jobs_for(REMEDIATION_WORKFLOW)), 0)
-        self.board.tick()
-        self.assertEqual(len(self.board.events(EventType.CANDIDATE_PUSH_REQUESTED)), 1)
+        self.assertEqual(len(board.jobs_for(REMEDIATION_WORKFLOW)), 0)
+        board.tick()
+        self.assertEqual(len(board.events(EventType.CANDIDATE_PUSH_REQUESTED)), 1)
 
     def test_chain_preserves_correlation_and_causation(self):
-        self.board.tick()
-        _ingest_pass(self.board, passed=True)
-        self.board.tick()
-        created = self.board.events(EventType.RECEIPT_CREATED)[0]
-        sealed = self.board.events(EventType.RECEIPT_SEALED)[0]
-        court = self.board.events(EventType.COURT_REQUESTED)[0]
-        passed = self.board.events(EventType.COURT_PASSED)[0]
-        push = self.board.events(EventType.CANDIDATE_PUSH_REQUESTED)[0]
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "T07_REBOUND.txt", _t07_body_rebound())
+        board.tick()
+        _ingest_pass(board, passed=True)
+        board.tick()
+        created = board.events(EventType.RECEIPT_CREATED)[0]
+        sealed = board.events(EventType.RECEIPT_SEALED)[0]
+        court = board.events(EventType.COURT_REQUESTED)[0]
+        passed = board.events(EventType.COURT_PASSED)[0]
+        push = board.events(EventType.CANDIDATE_PUSH_REQUESTED)[0]
         corr = created["correlation_id"]
         for event in (sealed, court, passed, push):
             self.assertEqual(event["correlation_id"], corr)
@@ -384,7 +486,7 @@ class SyntheticAndIdempotencyTests(unittest.TestCase):
         self.assertEqual(len(board.events(EventType.CANDIDATE_PUSH_REQUESTED)), 1)
         artifact = board.queue.load(board.jobs_for(HONEY_POT_WORKFLOW)[0]).step_results["materialize"]
         self.assertEqual(artifact["git_push"], GIT_PUSH)
-        self.assertEqual(artifact["head"], SYNTHETIC_HEAD)
+        self.assertEqual(artifact["head"], _canonical().head)
 
     def test_replay_of_same_events_produces_no_duplicate_jobs(self):
         board = _board(self)
@@ -962,7 +1064,16 @@ class RequiredProofTests(unittest.TestCase):
                 "observed_sha": hashlib.sha256(
                     Path(sealed["payload_ref_or_payload"]["receipt_ref"]).read_bytes()
                 ).hexdigest(),
-                "base_relation": "equal",
+                "base_relation": "candidate_is_canonical_base",
+                "base_binding": {
+                    "relation": "candidate_is_canonical_base",
+                    "independently_observed": True,
+                    "canonical_base_observed_on_remote": True,
+                    "observed_base_sha": sealed["source_head"],
+                    "detail": "test fixture: identity observed",
+                },
+                "evidence_refs": [sealed["payload_ref_or_payload"]["receipt_ref"]],
+                "evidence_sha256": (court["payload_ref_or_payload"] or {}).get("evidence_sha256", ""),
                 "findings": [],
                 "exceptions": [],
                 "required_repairs": [],
@@ -983,6 +1094,100 @@ class RequiredProofTests(unittest.TestCase):
             board.events(EventType.COURT_PASSED)[0]["payload_ref_or_payload"]
             ["evidence"]["kind"],
             INDEPENDENT_COURT_KIND)
+
+
+class CanonicalObserverContractTests(unittest.TestCase):
+    """The observer contract as this seam now exercises it: every board that
+    certifies a PASS here read the base off an offline canonical remote, and a
+    board that read nothing names the gap and can only refuse."""
+
+    def test_the_request_names_the_base_the_board_read_off_the_remote(self):
+        board = _board(self)
+        _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        board.tick()
+        payload = board.events(EventType.COURT_REQUESTED)[0]["payload_ref_or_payload"]
+        # A bound method is minted per access; equality (same self, same function)
+        # is the identity that matters.
+        self.assertEqual(board.canonical_observer, _canonical().observe)
+        self.assertEqual(payload["canonical_sha"], _canonical().base)
+        self.assertEqual(payload["canonical_repo"], _canonical().bare)
+        self.assertTrue(payload["canonical_base_observed"])
+        self.assertNotIn("canonical_base", payload["binding_gaps"])
+
+    def test_the_observer_reads_the_remote_rather_than_echoing_the_candidate(self):
+        """A fixture observer that answered with the worktree's own head would make
+        every identity PASS true by construction. Move the canonical's main past
+        the candidate: the request must follow the REMOTE, and a PASS that still
+        calls the candidate its own base must be refused."""
+        tmp = tempfile.mkdtemp(prefix="neuruh-switchboard-moved-")
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        world = OfflineCanonical.seed(tmp, branch="feature/synthetic-first-seam")
+        moved = world.advance_main()
+        self.assertNotEqual(moved, world.head)
+        receipts = os.path.join(tmp, "receipts")
+        os.makedirs(receipts)
+        board = Switchboard(
+            os.path.join(tmp, "state"), receipts_dir=receipts,
+            known_missions=frozenset({SYNTHETIC_MISSION}), clock=fixed_clock(),
+            canonical_observer=world.observe)
+        _write_receipt(receipts, "SYNTHETIC_RECEIPT.txt",
+                       _synthetic_body(WORKTREE=world.worktree, HEAD=world.head))
+        board.tick()
+        payload = board.events(EventType.COURT_REQUESTED)[0]["payload_ref_or_payload"]
+        self.assertEqual(payload["canonical_sha"], moved)
+        self.assertEqual(payload["canonical_sha"], world.base)
+        self.assertNotEqual(payload["canonical_sha"], payload["candidate_sha"])
+        sealed = board.events(EventType.RECEIPT_SEALED)[-1]
+        court = board.events(EventType.COURT_REQUESTED)[-1]
+        evidence = _independent_evidence(board, sealed, court, passed=True)
+        record = json.loads(Path(evidence["ref"]).read_text(encoding="utf-8"))
+        record["canonical_sha"] = record["canonical_base_sha"] = world.head
+        record["base_relation"] = record["base_binding"]["relation"] = "candidate_is_canonical_base"
+        record["base_binding"]["observed_base_sha"] = world.head
+        Path(evidence["ref"]).write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        with self.assertRaises(SwitchboardError) as caught:
+            _ingest_pass(board, passed=True, evidence=evidence)
+        self.assertIn("different canonical base", str(caught.exception))
+        self.assertEqual(board.events(EventType.COURT_PASSED), [])
+
+    def test_a_board_that_observed_nothing_names_the_gap_and_cannot_certify_a_pass(self):
+        board = _board(self, observe=False)
+        _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        board.tick()
+        payload = board.events(EventType.COURT_REQUESTED)[0]["payload_ref_or_payload"]
+        self.assertIn("canonical_base", payload["binding_gaps"])
+        self.assertEqual(payload["canonical_sha"], _UNOBSERVED_BASE)
+        with self.assertRaises(SwitchboardError) as caught:
+            _ingest_pass(board, passed=True)
+        self.assertIn("never observed", str(caught.exception))
+        board.tick()
+        self.assertEqual(board.events(EventType.COURT_PASSED), [])
+        self.assertEqual(board.events(EventType.CANDIDATE_PUSH_REQUESTED), [])
+        self.assertEqual(board.jobs_for(HONEY_POT_WORKFLOW), [])
+
+    def test_a_fail_is_still_recordable_on_a_base_the_board_did_not_observe(self):
+        """Failure semantics: the contract forecloses unearned PASSes, not the
+        honest FAIL. A verdict against an unobservable base is still recordable."""
+        board = _board(self, observe=False)
+        _write_receipt(board.receipts_dir, "SYNTHETIC_RECEIPT.txt", _synthetic_body())
+        board.tick()
+        _ingest_pass(board, passed=False)
+        board.tick()
+        self.assertEqual(len(board.events(EventType.COURT_FAILED)), 1)
+        self.assertEqual(len(board.jobs_for(REMEDIATION_WORKFLOW)), 1)
+        self.assertEqual(board.events(EventType.COURT_PASSED), [])
+
+    def test_the_fixture_observer_observes_only_its_own_worktree(self):
+        """The no-network guarantee, pinned: a receipt naming any other worktree --
+        the live T07 axon checkout on this host included -- gets a gap, never a
+        remote read; and a multi-token REMOTE cannot choose a host either."""
+        world = _canonical()
+        self.assertEqual(world.observe(world.worktree, "origin", "refs/heads/main"),
+                         (world.bare, world.base))
+        self.assertEqual(world.observe(T07_WORKTREE, "origin", "refs/heads/main"), ("", ""))
+        self.assertEqual(world.observe(world.worktree, f"origin {world.bare}", "refs/heads/main"),
+                         ("", ""))
+        self.assertEqual(world.observe(world.worktree, "upstream", "refs/heads/main"), ("", ""))
 
 
 if __name__ == "__main__":

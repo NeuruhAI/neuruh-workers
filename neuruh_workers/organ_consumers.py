@@ -83,6 +83,21 @@ def try_import(module_name: str) -> Any | None:
         return None
 
 
+def _canonical_observer_for(switchboard_module: Any, injected: Any) -> Any:
+    """The canonical observer the bridge's board carries.
+
+    An injected observer wins -- a court hands in one that reads an offline bare
+    repository, so no tick inside a test resolves a URL a receipt names. With
+    nothing injected this is a production composition root, and the board gets
+    the production observer: read-only git against the executed worktree's own
+    remote. A board with no observer names the canonical_base gap in its request
+    and can never certify a PASS against it.
+    """
+    if injected is not None:
+        return injected
+    return getattr(switchboard_module, "observe_canonical_base_via_git", None)
+
+
 def _looks_head(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -805,8 +820,14 @@ def emit_receipt_sealed_and_switcharoo(
     receipts_dir: str | None = None,
     switchboard_root: str | None = None,
     code_custody_required: bool = False,
+    canonical_observer: Callable[[str, str, str], tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Hand a receipted result to live SWITCHAROO. Do not clone nrh.event.v1."""
+    """Hand a receipted result to live SWITCHAROO. Do not clone nrh.event.v1.
+
+    ``canonical_observer`` is what the board reads the canonical base with; see
+    ``_canonical_observer_for`` for the production default and why a court must
+    inject its own.
+    """
     events = try_import(EVENTS_MODULE)
     switchboard = try_import(SWITCHBOARD_MODULE)
     honey = honey_pot_bind()
@@ -934,6 +955,7 @@ def emit_receipt_sealed_and_switcharoo(
             switchboard_root,
             receipts_dir=receipts_dir,
             known_missions=frozenset({mission_id}),
+            canonical_observer=_canonical_observer_for(switchboard, canonical_observer),
         )
         report = board.tick()
         sealed_events = [
