@@ -10,6 +10,7 @@ deterministic job IDs.  Persistence is JSONL (ledger) + a cursor file.
 Loopback/local file observation only; no public listener.
 """
 from __future__ import annotations
+import shutil
 
 import fcntl
 import functools
@@ -85,7 +86,7 @@ _UNOBSERVED_BASE = "0" * 40
 ADJUDICATE_CONSUMER_ID = "switchboard.adjudicate-on-court-requested.v1"
 COURTS_DIR = "courts"
 DEFAULT_CANONICAL_BASE_REF = "refs/heads/main"
-GIT = os.environ.get("NEURUH_GIT", "/opt/homebrew/bin/git")
+GIT = os.environ.get("NEURUH_GIT") or shutil.which("git") or "git"
 # Only these relations may stand under a PASS (mirrors the organ's VERIFIED_RELATIONS).
 _VERIFIED_RELATIONS = frozenset({
     "candidate_is_canonical_base",

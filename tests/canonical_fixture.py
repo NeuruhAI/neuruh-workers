@@ -12,13 +12,14 @@ and never reaches a network host. The live T07 axon checkout on the founder's
 machine, whose ``origin`` is GitHub, is the case this guards against.
 """
 from __future__ import annotations
+import shutil
 
 import os
 import subprocess
 
 from neuruh_workers.switchboard import observe_canonical_base_via_git
 
-GIT = os.environ.get("NEURUH_GIT", "/opt/homebrew/bin/git")
+GIT = os.environ.get("NEURUH_GIT") or shutil.which("git") or "git"
 # The host's own git identity, signing and hooks must not decide these courts.
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "Court",

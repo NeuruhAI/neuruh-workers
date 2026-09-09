@@ -41,7 +41,7 @@ from neuruh_workers.switchboard import (
 from neuruh_workers.switchboard_jobs import HONEY_POT_WORKFLOW, REMEDIATION_WORKFLOW
 from tests.helpers import fixed_clock
 
-GIT = os.environ.get("NEURUH_GIT", "/opt/homebrew/bin/git")
+GIT = os.environ.get("NEURUH_GIT") or shutil.which("git") or "git"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MISSION = "msn_0000000000000000000000000000c0e1"
 JOB_ID = "job-000000000000000000000c0e1"
