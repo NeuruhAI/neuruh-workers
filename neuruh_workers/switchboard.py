@@ -114,6 +114,22 @@ class SwitchboardError(DefinitionError):
     code = "SWITCHBOARD_REFUSED"
 
 
+class AdjudicatorUnavailable(SwitchboardError):
+    """The independent Sentinel could not be reached, so no court happened.
+
+    This is emphatically NOT a verdict. It is raised by an adjudicator adapter
+    (see neuruh_workers.adjudicator_http) when the organ is down, times out, or
+    answers with a non-2xx, and the board treats it as a VISIBLE blocked state:
+    the court stays open, the cause is named on the tick report and in the
+    consumer lease, and no retry budget is burned toward a MAX_RETRIES
+    deadletter. Burning that budget is precisely how the live T02 court
+    disappeared -- an unreachable organ became an anonymous deadletter that read
+    like a judged candidate. An absent court must look absent.
+    """
+
+    code = "SENTINEL_COURT_UNAVAILABLE"
+
+
 @dataclass
 class ConsumerSpec:
     consumer_id: str
@@ -131,6 +147,10 @@ class TickReport:
     acked: list[str] = field(default_factory=list)
     deadlettered: list[str] = field(default_factory=list)
     recovered: list[str] = field(default_factory=list)
+    #: Events whose consumer is blocked on an unreachable dependency. Open, not
+    #: judged, not deadlettered -- and named, so a stalled seam is legible from
+    #: `run_switchboard.py tick|status` instead of looking like quiet success.
+    blocked: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _atomic_write(path: str, text: str) -> None:
@@ -674,7 +694,17 @@ class Switchboard:
             if record.get(field) != value:
                 raise SwitchboardError(
                     f"Sentinel evidence {field} is not bound to the court request")
+        # The organ seals verdicts this board does not ingest directly
+        # (PASS_WITH_EXCEPTIONS). Where it projected one, the PROJECTION is what
+        # the outcome must agree with -- it is the organ's own answer to
+        # "PASS or FAIL", and re-deriving that answer here is exactly the
+        # divergence this seam removed. A record sealed without a projection --
+        # the offline record-court path, and every record already on a live
+        # ledger -- is still compared on its raw verdict, unchanged.
+        ingest = record.get("switchboard_ingest")
         verdict = str(record.get("verdict") or "")
+        if isinstance(ingest, Mapping) and ingest.get("ingest_verdict"):
+            verdict = str(ingest["ingest_verdict"])
         if verdict != ("PASS" if passed else "FAIL"):
             raise SwitchboardError("Sentinel evidence verdict differs from outcome")
         court_id = record.get("court_id")
@@ -1016,6 +1046,24 @@ class Switchboard:
             report.acked.append(envelope["event_id"])
         except _CrashSimulated:
             raise
+        except AdjudicatorUnavailable as exc:
+            # No court happened. Keep it open and make the block visible: do NOT
+            # advance attempt_count, because three quiet retries against a dead
+            # organ would terminate a court that was never heard, under
+            # MAX_RETRIES -- a reason that names the board's patience rather than
+            # the actual cause. The lease stays in RETRY, so the next tick after
+            # the organ returns picks the very same event back up.
+            lease["state"] = AckState.RETRY.value
+            lease["last_error"] = redact_secrets(str(exc))
+            state["lease"] = lease
+            report.blocked.append({
+                "event_id": envelope["event_id"],
+                "event_type": envelope["event_type"],
+                "consumer_id": consumer.consumer_id,
+                "reason": AdjudicatorUnavailable.code,
+                "detail": redact_secrets(str(exc)),
+                "attempt": attempt,
+            })
         except Exception as exc:  # noqa: BLE001 — receipted, never swallowed
             if attempt >= consumer.max_attempts:
                 self._deadletter_envelope(
@@ -1280,11 +1328,32 @@ class Switchboard:
         findings = [f for f in (record.get("findings") or []) if isinstance(f, Mapping)]
         blocking = {str(f.get("code")) for f in findings if f.get("severity", "blocking") == "blocking"}
         if verdict == "FAIL" and blocking and blocking <= _ENVIRONMENTAL_ONLY:
-            raise SwitchboardError(
+            # The organ was reached but its model was not. Same shape as an
+            # unreachable organ: a block, not a judgement. Raised as
+            # AdjudicatorUnavailable so the court genuinely stays open and says
+            # why -- the plain SwitchboardError this used to raise burned the
+            # retry budget and terminated under MAX_RETRIES, which is the
+            # opposite of the sentence above it.
+            raise AdjudicatorUnavailable(
                 "Sentinel could not reach its model; the court stays open rather than "
                 "recording a verdict the candidate did not earn")
-        exceptions = list(record.get("exceptions") or [])
-        passed = verdict == "PASS" or (verdict == "PASS_WITH_EXCEPTIONS" and not exceptions)
+        # PROJECTION OWNERSHIP (ruled 2026-09-09): the organ owns the PASS|FAIL
+        # projection (sentinel_court.project.project_for_switchboard_ingest) and
+        # ships it on the wire beside the record. The board reads that answer; it
+        # does not re-derive one. Two implementations of this mapping is exactly
+        # how a PASS carrying exceptions came to be scored one way inside the
+        # organ and another way here.
+        ingest = record.get("switchboard_ingest")
+        if not isinstance(ingest, Mapping):
+            raise SwitchboardError(
+                "adjudicator record carries no switchboard_ingest projection; the "
+                "PASS|FAIL projection is owned by the Sentinel organ and must arrive "
+                "with the record it projects")
+        passed = ingest.get("switchboard_passed")
+        if not isinstance(passed, bool):
+            raise SwitchboardError(
+                "switchboard_ingest.switchboard_passed is not a boolean; the board "
+                "does not infer a verdict the organ did not project")
 
         courts_dir = os.path.join(self.root, COURTS_DIR)
         os.makedirs(courts_dir, exist_ok=True)

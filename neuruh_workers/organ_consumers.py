@@ -57,6 +57,7 @@ RF_IMPORT_PATHS = (
     "revenue_factory",
 )
 SWITCHBOARD_MODULE = "neuruh_workers.switchboard"
+ADJUDICATOR_MODULE = "neuruh_workers.adjudicator_http"
 EVENTS_MODULE = "neuruh_workers.events"
 GIT_CUSTODIAN_MODULE = "neuruh_workers.git_custodian"
 
@@ -96,6 +97,24 @@ def _canonical_observer_for(switchboard_module: Any, injected: Any) -> Any:
     if injected is not None:
         return injected
     return getattr(switchboard_module, "observe_canonical_base_via_git", None)
+
+
+def _adjudicator_for(adjudicator_module: Any, injected: Any) -> Any:
+    """The independent Sentinel the bridge's board carries.
+
+    Same shape as ``_canonical_observer_for``, and the same reason: an injected
+    adjudicator wins, so a court can hand in a double that never opens a socket.
+    With nothing injected this is a production composition root and the board
+    gets the production adjudicator -- a loopback HTTP client to the organ,
+    which runs in its own process. Workers never imports the organ; the process
+    boundary is what makes "independent" true at runtime rather than asserted.
+
+    With no adjudicator at all, ``court.requested`` is unroutable and the board
+    deadletters its own court request. That was the T02 gap.
+    """
+    if injected is not None:
+        return injected
+    return getattr(adjudicator_module, "sentinel_court_adjudicator", lambda: None)()
 
 
 def _looks_head(value: Any) -> bool:
@@ -821,15 +840,21 @@ def emit_receipt_sealed_and_switcharoo(
     switchboard_root: str | None = None,
     code_custody_required: bool = False,
     canonical_observer: Callable[[str, str, str], tuple[str, str]] | None = None,
+    adjudicator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Hand a receipted result to live SWITCHAROO. Do not clone nrh.event.v1.
 
     ``canonical_observer`` is what the board reads the canonical base with; see
     ``_canonical_observer_for`` for the production default and why a court must
     inject its own.
+
+    ``adjudicator`` is the independent Sentinel the board carries its
+    ``court.requested`` to; see ``_adjudicator_for``. Without one the request is
+    unroutable and the board deadletters its own court.
     """
     events = try_import(EVENTS_MODULE)
     switchboard = try_import(SWITCHBOARD_MODULE)
+    adjudicator_module = try_import(ADJUDICATOR_MODULE)
     honey = honey_pot_bind()
     absent = {
         "bind_status": "SWITCHBOARD_ABSENT",
@@ -956,6 +981,7 @@ def emit_receipt_sealed_and_switcharoo(
             receipts_dir=receipts_dir,
             known_missions=frozenset({mission_id}),
             canonical_observer=_canonical_observer_for(switchboard, canonical_observer),
+            adjudicator=_adjudicator_for(adjudicator_module, adjudicator),
         )
         report = board.tick()
         sealed_events = [
