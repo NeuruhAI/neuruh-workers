@@ -98,6 +98,24 @@ class SentinelCourtHTTPAdjudicator:
         return self._request(_endpoint(self.base_url, HEALTH_PATH), body=None)
 
     def __call__(self, envelope: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Hand the envelope over and return what the organ sealed. Verbatim.
+
+        PERMANENTLY REJECTED, 2026-09-09 -- do not "fix" an ingest refusal here.
+        Workers' ingest gate requires the sealed record to echo the request
+        identity (switchboard._require_independent_court_evidence), and the organ
+        does not yet record all of it, so a real verdict currently refuses at
+        ingest with "Sentinel evidence <field> is not bound to the court request".
+
+        The one-line fix that suggests itself -- merge the request identity into
+        the record on the way back through this method -- is FORGERY. It would
+        have workers assert that the organ answered about this request when the
+        organ never said so, making the binding gate certify workers' own
+        bookkeeping against itself. The correct fix is in the organ, which
+        already receives every one of those fields
+        (see handoff/2026-09-09/11_sentinel_court_patch.md).
+
+        Nothing is added to the envelope going out or to the record coming back.
+        """
         body = json.dumps(envelope).encode("utf-8")
         if len(body) > _MAX_BODY_BYTES:
             # The organ refuses a body over 1 MiB outright; say so here rather
