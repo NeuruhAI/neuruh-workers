@@ -151,3 +151,35 @@ Allowed after structured independent court + founder-candidate authority:
 `FEATURE_BRANCH_PUSH`, `PR_CREATE` / `PR_UPDATE`, `CI_READ`.
 Structurally forbidden: direct main, force push, auto-merge, tags,
 production deploy, history rewrite.
+
+## Mission continuation (O4 — durable parent/child)
+
+`neuruh_workers.continuation.MissionContinuation` is the mission-control seam
+over the **same** ExecutionLedger: a parent job runs to its
+`continuation.await_child` step, dispatches one child job with a
+deterministic id (`deterministic_job_id(child workflow, version, params,
+sha(parent_job_id, child_role))`), receipts `child.dispatched` on the parent
+and pauses (`job.paused {paused_before_step: await_child}` = WAITING_ON_CHILD).
+When the child reaches `job.succeeded` — in the same tick, a later tick or
+another process — `child.result.ingested` binds the child's `job.succeeded`
+receipt sha to the parent, the parent is `job.resumed`, the await step serves
+the ingested result from the ledger and the parent finishes
+(`SUCCEEDED` = READY_FOR_REVIEW; nothing is published).
+
+Guarantees, all courted in `tests/test_mission_continuation.py`:
+mission identity is `requested_by = jgi:<mission_id>` and survives restart
+(re-open is a `job.enqueue_deduplicated` no-op); child identity is a pure
+function of parent job + role + child work; a duplicate dispatch is the
+queue's receipted no-op (`DUPLICATE_REFUSED`) and a terminal parent refuses
+dispatch outright; ingestion is idempotent (one `child.result.ingested`,
+replays append nothing); a sealed child receipt
+(`nrh.continuation.child_receipt.v1`, `export_child_receipt`) replays safely
+and a tampered/unbound one is refused; a FAILED child leaves the parent
+PAUSED, an approval-gated parent stays BLOCKED_ON_APPROVAL, and no founder
+receipt is needed for the un-gated path.  No daemon, no mission table.
+
+```bash
+python3 scripts/run_continuation.py open --mission M --params-file p.json
+python3 scripts/run_continuation.py tick --mission M        # repeat until settled
+python3 scripts/run_continuation.py status --mission M
+```

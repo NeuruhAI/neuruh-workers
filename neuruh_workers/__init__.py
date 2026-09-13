@@ -30,6 +30,7 @@ from .runner import WorkflowRunner
 from .seams import OrganRegistrationSeam, OrganSeamDeclaration
 from .switchboard import HUMAN_CLIPBOARD_REQUIRED, Switchboard
 from .git_custodian import GitCustodian, GitCustodianRefused, PromotionExecutor
+from .continuation import ContinuationRefused, MissionContinuation
 
 __version__ = "1.1.0"
 
@@ -42,4 +43,5 @@ __all__ = [
     "WorkerRegistry", "WorkflowCatalog", "WorkflowDefinition", "WorkflowError",
     "WorkflowRunner", "deterministic_job_id", "HUMAN_CLIPBOARD_REQUIRED",
     "GitCustodian", "GitCustodianRefused", "PromotionExecutor",
+    "ContinuationRefused", "MissionContinuation",
 ]
