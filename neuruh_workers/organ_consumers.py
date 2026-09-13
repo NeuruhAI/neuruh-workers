@@ -19,6 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from .contracts import JobStatus, ReceiptType, canonical_json
@@ -498,63 +499,205 @@ def pull_authoritative_mission(
     }
 
 
-def update_fr_evidence(
+# --------------------------------------------------------------------------- #
+# R02D: Workers -> Founder Runtime execution-outcome write-back.
+# FR owns mission state; the bridge reports sealed evidence and never raises on
+# a refused write (fail-closed = record the bind status, keep the dispatch).
+# Route + envelope: recipe-engine `POST /v1/missions/{id}/execution-outcomes`
+# (fr.execution_outcome.v1). Replay is safe by construction on the FR side.
+# --------------------------------------------------------------------------- #
+FR_EXECUTION_OUTCOME_SCHEMA = "fr.execution_outcome.v1"
+FR_OUTCOME_RECORDED = "FR_OUTCOME_RECORDED"
+FR_OUTCOME_ALREADY_KNOWN = "FR_OUTCOME_ALREADY_KNOWN"
+FR_OUTCOME_WRITEBACK_FAIL_CLOSED = "FR_OUTCOME_WRITEBACK_FAIL_CLOSED"
+FR_OUTCOME_WRITEBACK_NOT_CONFIGURED = "FR_OUTCOME_WRITEBACK_NOT_CONFIGURED"
+# FR 409 reason codes that mean "this evidence, or a later one, is already
+# known": nothing to retry, nothing lost.
+FR_OUTCOME_REPLAY_CODES = frozenset({
+    "OUTCOME_STALE", "IDEMPOTENCY_CONFLICT", "OUTCOME_OUT_OF_ORDER",
+})
+# The write path may wait on the FR service lock; never the 0.25 s probe budget.
+FR_OUTCOME_WRITE_TIMEOUT_S = 8.0
+
+
+def execution_outcome_idempotency_key(job_id: str, outcome: str,
+                                      evidence_sha: str | None = None) -> str:
+    return f"execution_outcome:{job_id}:{outcome}:{evidence_sha or '-'}"
+
+
+def build_execution_outcome_envelope(
+    *,
     mission_id: str,
-    evidence: Mapping[str, Any],
+    mission_version: int,
+    work_spec_sha256: str,
+    job_id: str,
+    outcome: str,
+    dispatch_approval_id: str,
+    source_head: str,
+    source_repo: str = "NeuruhAI/neuruh-workers",
+    observed_at: str | None = None,
+    receipt_ref: str | None = None,
+    failure: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one fr.execution_outcome.v1 envelope from bridge facts.
+
+    SUCCEEDED binds the sealed dispatch receipt on disk verbatim
+    (`receipt_sha` = its PAYLOAD_HASH = content sha of the fields minus
+    PAYLOAD_HASH); FR re-derives and refuses any mismatch.
+    """
+    envelope: dict[str, Any] = {
+        "schema": FR_EXECUTION_OUTCOME_SCHEMA,
+        "api_version": FR_API_VERSION,
+        "mission_id": mission_id,
+        "mission_version": int(mission_version),
+        "work_spec_sha256": work_spec_sha256,
+        "execution_id": job_id,
+        "outcome": outcome,
+        "authority_reference": (
+            f"{FR_API_VERSION}:approval:{dispatch_approval_id}"
+            f":work-spec:{work_spec_sha256}"
+        ),
+        "observed_at": observed_at or datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "source": {
+            "role": DISPATCH_SOURCE_ROLE,
+            "component": DISPATCH_SOURCE_COMPONENT,
+            "repo": source_repo,
+            "head": source_head,
+        },
+    }
+    if outcome == "SUCCEEDED":
+        if not receipt_ref:
+            raise ValueError("a SUCCEEDED outcome requires the sealed receipt path")
+        parsed = parse_prime_receipt(receipt_ref)
+        envelope["receipt"] = {
+            "schema": FR_DISPATCH_RECEIPT_SCHEMA,
+            "fields": dict(parsed.fields),
+            "receipt_sha": parsed.fields.get("PAYLOAD_HASH") or parsed.content_sha,
+            "receipt_ref": parsed.path,
+        }
+    elif outcome == "FAILED" and failure:
+        envelope["failure"] = {
+            "error_class": str(failure.get("error_class") or "")[:128],
+            "detail": str(failure.get("detail") or "")[:2000],
+        }
+    return envelope
+
+
+def _http_post_json_status(
+    url: str,
+    payload: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    opener: HttpOpen | None,
+    headers: Mapping[str, str],
+) -> dict[str, Any]:
+    """POST and keep the HTTP status/body of a refusal (4xx/5xx) instead of
+    collapsing it into an exception name — the FR reason code is the evidence."""
+    body = canonical_json(dict(payload)).encode("utf-8")
+    merged = {"Content-Type": "application/json", "Accept": "application/json"}
+    merged.update(dict(headers or {}))
+    request = urllib.request.Request(url, data=body, method="POST", headers=merged)
+    open_fn = opener or urllib.request.urlopen
+    try:
+        with open_fn(request, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+            status = int(getattr(resp, "status", 200))
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        try:
+            raw = exc.read().decode("utf-8")
+        except Exception:  # noqa: BLE001
+            raw = ""
+    except Exception as exc:  # noqa: BLE001 — fail closed from the attempt
+        return {"attempted": True, "url": url, "ok": False, "status": None,
+                "error": type(exc).__name__, "data": {}}
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return {"attempted": True, "url": url, "ok": 200 <= status < 300,
+            "status": status, "error": None, "data": data}
+
+
+def _fr_error_code(data: Mapping[str, Any]) -> str | None:
+    for key in ("code", "reason_code", "error_code"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    error = data.get("error")
+    if isinstance(error, Mapping):
+        for key in ("code", "reason_code"):
+            value = error.get(key)
+            if isinstance(value, str) and value:
+                return value
+    detail = data.get("detail")
+    if isinstance(detail, Mapping):
+        for key in ("code", "reason_code"):
+            value = detail.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def report_execution_outcome(
+    mission_id: str,
+    body: Mapping[str, Any],
     *,
     opener: HttpOpen | None = None,
     token: str | None = None,
-    timeout_s: float = 0.25,
+    timeout_s: float = FR_OUTCOME_WRITE_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Attempt FR state/evidence update. FR owns persistence; write fail-closed.
+    """Report one sealed execution outcome to the Founder Runtime.
 
-    fr-api-v1 exposes GET /v1/missions/{id}/receipts and has no workers evidence
-    write. This call attempts the update and records the organ's refusal.
+    Returns ``{attempted, ok, status, code, bind_status, outcome, execution_id,
+    idempotency_key, url, data}``. Never raises: a refused write is recorded as
+    FR_OUTCOME_WRITEBACK_FAIL_CLOSED and the caller keeps its dispatch.
     """
-    health = bind_founder_runtime(opener=opener, timeout_s=timeout_s)
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    outcome = str(body.get("outcome") or "")
+    job_id = str(body.get("execution_id") or "")
+    receipt = body.get("receipt") or {}
+    court = body.get("court") or {}
+    evidence_sha = (
+        (receipt.get("receipt_sha") if isinstance(receipt, Mapping) else None)
+        or (court.get("record_sha") if isinstance(court, Mapping) else None)
+    )
+    idem = execution_outcome_idempotency_key(job_id, outcome, evidence_sha)
     quoted = urllib.parse.quote(mission_id, safe="")
-    read = http_get_json(
-        f"{FR_MISSIONS_URL}/{quoted}",
-        timeout_s=timeout_s,
-        opener=opener,
-        headers=headers,
-    )
-    write = http_post_json(
-        f"{FR_MISSIONS_URL}/{quoted}/evidence",
-        {
-            "api_version": FR_API_VERSION,
-            "mission_id": mission_id,
-            "evidence": dict(evidence),
-            "note": "workers dispatch-bridge evidence; FR remains mission-state authority",
-        },
-        timeout_s=timeout_s,
-        opener=opener,
-        headers=headers,
-    )
-    return {
-        "attempted": True,
-        "mission_id": mission_id,
-        "fr_health": health,
-        "fr_read": {
-            "attempted": read["attempted"],
-            "ok": read["ok"],
-            "error": read.get("error"),
-        },
-        "fr_write": {
-            "attempted": write["attempted"],
-            "ok": write["ok"],
-            "error": write.get("error"),
-            "url": write["url"],
-        },
-        "persisted_locally": False,
-        "bind_status": (
-            "FR_EVIDENCE_UPDATED" if write.get("ok")
-            else "FR_EVIDENCE_UPDATE_FAIL_CLOSED"
-        ),
+    url = f"{FR_MISSIONS_URL}/{quoted}/execution-outcomes"
+    base = {
+        "attempted": False, "ok": False, "status": None, "code": None,
+        "outcome": outcome, "execution_id": job_id,
+        "idempotency_key": idem, "url": url, "data": {},
         "owner": "NeuruhAI/recipe-engine Founder Runtime",
+    }
+    if not token:
+        return {**base, "bind_status": FR_OUTCOME_WRITEBACK_NOT_CONFIGURED,
+                "error": "FR_API_OPERATOR_TOKEN_REQUIRED"}
+    write = _http_post_json_status(
+        url, body, timeout_s=timeout_s, opener=opener,
+        headers={"Authorization": f"Bearer {token}", "Idempotency-Key": idem},
+    )
+    data = write.get("data") or {}
+    code = _fr_error_code(data)
+    if write.get("ok"):
+        replay = data.get("idempotent_replay") is True or data.get("applied") is False
+        bind_status = FR_OUTCOME_ALREADY_KNOWN if replay else FR_OUTCOME_RECORDED
+    elif write.get("status") == 409 and code in FR_OUTCOME_REPLAY_CODES:
+        bind_status = FR_OUTCOME_ALREADY_KNOWN
+    else:
+        bind_status = FR_OUTCOME_WRITEBACK_FAIL_CLOSED
+    return {
+        **base,
+        "attempted": True,
+        "ok": bool(write.get("ok")),
+        "status": write.get("status"),
+        "code": code,
+        "error": write.get("error"),
+        "bind_status": bind_status,
+        "data": data,
     }
 
 

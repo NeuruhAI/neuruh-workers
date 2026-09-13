@@ -1377,21 +1377,41 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(result.parent_resume["status"], "PARENT_JOB_ABSENT_IN_LEDGER")
         self.assertEqual(result.parent_resume["parent_mission_id"], "JGI-PARENT-MISSING")
 
-    def test_fr_evidence_update_is_attempted_and_not_persisted_here(self):
+    def test_fr_execution_outcome_writeback_is_attempted_and_fails_closed_here(self):
+        # R02D: the bridge reports DISPATCHED then SUCCEEDED (from the sealed
+        # receipt, not gated on a Sentinel verdict). This court's opener refuses
+        # every POST, so both write-backs are attempted and recorded fail-closed;
+        # the dispatch itself is untouched. The legacy /evidence route is gone.
         result = self.runtime.dispatch(self.mission(), [self.property_candidate()])
         self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
         self.assertIsNone(result.fr_evidence_update)
+        writeback = result.fr_outcome_writeback
+        self.assertEqual(sorted(writeback), ["DISPATCHED", "SUCCEEDED"])
+        for outcome, report in writeback.items():
+            self.assertTrue(report["attempted"])
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["bind_status"], "FR_OUTCOME_WRITEBACK_FAIL_CLOSED")
+            self.assertEqual(report["outcome"], outcome)
+            self.assertEqual(report["execution_id"], result.job_id)
+            self.assertIn("/execution-outcomes", report["url"])
+            self.assertEqual(report["owner"], "NeuruhAI/recipe-engine Founder Runtime")
+        self.assertEqual(
+            writeback["DISPATCHED"]["idempotency_key"],
+            f"execution_outcome:{result.job_id}:DISPATCHED:-")
+        receipt_sha = result.sealed_receipt["payload_ref_or_payload"]["receipt_sha"]
+        self.assertEqual(
+            writeback["SUCCEEDED"]["idempotency_key"],
+            f"execution_outcome:{result.job_id}:SUCCEEDED:{receipt_sha}")
         self.record_outcome(result)
-        result = self.runtime.dispatch(self.mission(), [self.property_candidate()])
-        self.assertEqual(result.status, RuntimeStatus.ALREADY_SUCCEEDED)
-        update = result.fr_evidence_update
-        self.assertTrue(update["attempted"])
-        self.assertFalse(update["persisted_locally"])
-        self.assertEqual(update["bind_status"], "FR_EVIDENCE_UPDATE_FAIL_CLOSED")
-        self.assertTrue(update["fr_write"]["attempted"])
-        self.assertFalse(update["fr_write"]["ok"])
-        self.assertIn("/v1/missions/", update["fr_write"]["url"])
-        self.assertEqual(update["owner"], "NeuruhAI/recipe-engine Founder Runtime")
+        replay = self.runtime.dispatch(self.mission(), [self.property_candidate()])
+        self.assertEqual(replay.status, RuntimeStatus.ALREADY_SUCCEEDED)
+        self.assertIsNone(replay.fr_evidence_update)
+        # A replayed dispatch re-reports only the sealed SUCCEEDED evidence
+        # (same idempotency key => FR replay by construction); no second DISPATCHED.
+        self.assertEqual(sorted(replay.fr_outcome_writeback), ["SUCCEEDED"])
+        self.assertEqual(
+            replay.fr_outcome_writeback["SUCCEEDED"]["idempotency_key"],
+            writeback["SUCCEEDED"]["idempotency_key"])
 
     def test_fr_api_health_without_auth_configuration_fails_closed(self):
         class _Resp:

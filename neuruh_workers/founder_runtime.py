@@ -42,8 +42,9 @@ from .organ_consumers import (
     job_succeeded_sha,
     pull_authoritative_mission,
     resolve_dispatch_source_identity,
+    build_execution_outcome_envelope,
+    report_execution_outcome,
     resume_parent_from_receipts,
-    update_fr_evidence,
 )
 from .queue import JobQueue
 from .runner import WorkflowRunner
@@ -400,6 +401,9 @@ class RuntimeResult:
     honey_pot: Mapping[str, Any] | None = None
     fr_bind: Mapping[str, Any] | None = None
     fr_evidence_update: Mapping[str, Any] | None = None
+    # R02D: per-phase Founder Runtime write-back results (DISPATCHED / SUCCEEDED /
+    # FAILED). FR owns mission state; a refused write is recorded, never raised.
+    fr_outcome_writeback: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -800,10 +804,37 @@ class DispatchBridge:
             dedupe_key=dedupe_key,
         )
         state = self.queue.load(job_id)
+        writeback: dict[str, Any] = {}
+
+        def _report(outcome: str, **extra: Any) -> None:
+            # R02D write-back. Never raises; FR decides replay/refusal.
+            try:
+                envelope = build_execution_outcome_envelope(
+                    mission_id=mission.mission_id,
+                    mission_version=mission.mission_version,
+                    work_spec_sha256=mission.work_spec_sha256,
+                    job_id=job_id,
+                    outcome=outcome,
+                    dispatch_approval_id=mission.dispatch_approval_id,
+                    source_head=verified_source.head,
+                    **extra,
+                )
+            except Exception as exc:  # noqa: BLE001 — evidence unbuildable = fail closed
+                writeback[outcome] = {
+                    "attempted": False, "ok": False, "status": None, "code": None,
+                    "outcome": outcome, "execution_id": job_id,
+                    "bind_status": "FR_OUTCOME_WRITEBACK_FAIL_CLOSED",
+                    "error": f"{type(exc).__name__}: {exc}"[:300],
+                }
+                return
+            writeback[outcome] = report_execution_outcome(
+                mission.mission_id, envelope,
+                opener=self.http_open, token=self.fr_token)
 
         if state.status == JobStatus.SUCCEEDED:
             status = RuntimeStatus.ALREADY_SUCCEEDED
         elif auto_execute_read_only:
+            _report("DISPATCHED")
             state = self.runner.execute(job_id)
             if state.status == JobStatus.SUCCEEDED:
                 status = RuntimeStatus.SUCCEEDED
@@ -811,8 +842,14 @@ class DispatchBridge:
                 status = RuntimeStatus.APPROVAL_REQUIRED
             else:
                 status = RuntimeStatus.BLOCKED
+            if state.status == JobStatus.FAILED:
+                _report("FAILED", failure={
+                    "error_class": "WORKERS_JOB_FAILED",
+                    "detail": f"job {job_id} ended {state.status.value}",
+                })
         else:
             status = RuntimeStatus.QUEUED
+            _report("DISPATCHED")
 
         chain = self.queue.ledger.verify()
         sealed = None
@@ -859,6 +896,14 @@ class DispatchBridge:
                 and isinstance(switchboard_emit, Mapping)
                 and switchboard_emit.get("consumed") is True
             )
+            if emission_complete:
+                # SUCCEEDED is reported from the sealed receipt itself, NOT gated
+                # on a Sentinel verdict: the court's outcome is its own write-back
+                # (Switchboard consumers), and FR shows court PENDING until then.
+                receipt_payload = sealed.get("payload_ref_or_payload") or {}
+                _report("SUCCEEDED", receipt_ref=(
+                    receipt_payload.get("receipt_ref")
+                    or os.path.join(self.receipts_dir or "", f"{job_id}.txt")))
             if not emission_complete:
                 status = RuntimeStatus.BLOCKED
             elif sentinel and sentinel.get("verdict") == "FAIL":
@@ -872,19 +917,6 @@ class DispatchBridge:
                         child_job_id=job_id,
                     )
                     chain = self.queue.ledger.verify()
-                fr_update = update_fr_evidence(
-                    mission.mission_id,
-                    {
-                        "job_id": job_id,
-                        "ledger_tail_sha": chain["tail_sha"],
-                        "job_status": state.status.value,
-                        "parent_resume": parent_resume,
-                        "switchboard_bind": (switchboard_emit or {}).get("bind_status"),
-                        "sentinel_bind": (sentinel or {}).get("bind_status"),
-                    },
-                    opener=self.http_open,
-                    token=self.fr_token,
-                )
         elif mission.parent_mission_id:
             parent_resume = {
                 "parent_mission_id": mission.parent_mission_id,
@@ -916,6 +948,7 @@ class DispatchBridge:
             honey_pot=honey,
             fr_bind=fr_bind,
             fr_evidence_update=fr_update,
+            fr_outcome_writeback=writeback or None,
             note=(
                 "FR ticket dispatched, independently courted, and sealed"
                 if emission_complete and sentinel and sentinel.get("verdict") == "PASS"
