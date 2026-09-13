@@ -43,6 +43,9 @@ class JobState:
     pause_requested: bool = False
     replay_notices: list[str] = field(default_factory=list)
     failure_reason: str = ""
+    # Mission continuation: child_role -> dispatch record / ingested result.
+    children: dict[str, dict[str, Any]] = field(default_factory=dict)
+    child_results: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def terminal(self) -> bool:
@@ -120,6 +123,10 @@ def replay_job(receipts) -> JobState:
                     ReceiptType.CI_FAILED,
                     ReceiptType.PROMOTION_READY):
             pass
+        elif rt == ReceiptType.CHILD_DISPATCHED:
+            state.children[p["child_role"]] = dict(p)
+        elif rt == ReceiptType.CHILD_RESULT_INGESTED:
+            state.child_results[p["child_role"]] = dict(p)
         elif rt == ReceiptType.JOB_SUCCEEDED:
             state.status = JobStatus.SUCCEEDED
         elif rt == ReceiptType.JOB_FAILED:
