@@ -506,6 +506,7 @@ class DispatchBridge:
         fr_token: str | None = None,
         fr_timeout_s: float = 0.25,
         canonical_observer: Callable[[str, str, str], tuple[str, str]] | None = None,
+        adjudicator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> None:
         self.queue = queue
         self.catalog = catalog
@@ -522,6 +523,14 @@ class DispatchBridge:
         # production observer (read-only git against the worktree's own remote);
         # a court injects an offline one so no tick here reaches a network host.
         self.canonical_observer = canonical_observer
+        # The independent Sentinel the bridge's Switchboard carries court.requested
+        # to. None means the production adjudicator (organ_consumers._adjudicator_for:
+        # the loopback HTTP client to the organ at NEURUH_SENTINEL_COURT_URL /
+        # 127.0.0.1:18731). A court injects its own so no unit tick here reaches a
+        # LIVE organ -- observed 2026-09-14: with the organ up and routed, the
+        # idempotency court's second dispatch came back BLOCKED
+        # (SENTINEL_ALREADY_COURTED_FAIL) on a verdict the live organ sealed.
+        self.adjudicator = adjudicator
         self.last_switchboard = None
 
     def dispatch(
@@ -881,6 +890,7 @@ class DispatchBridge:
                 switchboard_root=self.switchboard_root,
                 code_custody_required=mission.code_custody_required,
                 canonical_observer=self.canonical_observer,
+                adjudicator=self.adjudicator,
             )
             sealed = emission["sealed"]
             court = emission["court_request"]
