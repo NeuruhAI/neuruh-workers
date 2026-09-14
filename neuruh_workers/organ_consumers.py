@@ -538,6 +538,8 @@ FR_OUTCOME_REPLAY_CODES = frozenset({
 })
 # The write path may wait on the FR service lock; never the 0.25 s probe budget.
 FR_OUTCOME_WRITE_TIMEOUT_S = 8.0
+#: fr.execution_outcome.v1 court outcomes (recipe_engine execution_outcome.COURT_OUTCOMES).
+FR_COURT_OUTCOMES = frozenset({"COURT_PASSED", "COURT_FAILED"})
 
 
 def execution_outcome_idempotency_key(job_id: str, outcome: str,
@@ -558,12 +560,19 @@ def build_execution_outcome_envelope(
     observed_at: str | None = None,
     receipt_ref: str | None = None,
     failure: Mapping[str, Any] | None = None,
+    court: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one fr.execution_outcome.v1 envelope from bridge facts.
 
     SUCCEEDED binds the sealed dispatch receipt on disk verbatim
     (`receipt_sha` = its PAYLOAD_HASH = content sha of the fields minus
     PAYLOAD_HASH); FR re-derives and refuses any mismatch.
+
+    COURT_PASSED / COURT_FAILED bind the independent Sentinel verdict the board
+    ingested (court.passed|court.failed): ``court`` names the organ's court_id,
+    the verdict, the receipt it judged (receipt_sha) and the sealed record's
+    content sha (record_sha) -- the fields fr.execution_outcome.v1 requires
+    (recipe_engine execution_outcome._COURT_REQUIRED). Nothing is judged here.
     """
     envelope: dict[str, Any] = {
         "schema": FR_EXECUTION_OUTCOME_SCHEMA,
@@ -601,6 +610,34 @@ def build_execution_outcome_envelope(
             "error_class": str(failure.get("error_class") or "")[:128],
             "detail": str(failure.get("detail") or "")[:2000],
         }
+    elif outcome in FR_COURT_OUTCOMES:
+        if not isinstance(court, Mapping):
+            raise ValueError(f"a {outcome} outcome requires the ingested court verdict")
+        verdict = str(court.get("verdict") or "")
+        expected = "PASS" if outcome == "COURT_PASSED" else "FAIL"
+        if verdict != expected:
+            raise ValueError(f"{outcome} requires verdict {expected}, got {verdict!r}")
+        court_id = str(court.get("court_id") or "")
+        receipt_sha = str(court.get("receipt_sha") or "").lower()
+        record_sha = str(court.get("record_sha") or "").lower()
+        if not (court_id.startswith("court-") and len(court_id) == 30):
+            raise ValueError("court outcome requires the organ's court_id")
+        if not (_looks_hex64(receipt_sha) and _looks_hex64(record_sha)):
+            raise ValueError("court outcome requires 64-hex receipt_sha and record_sha")
+        if court.get("independent") is not True or str(court.get("source_role") or "").upper() != "SENTINEL":
+            raise ValueError("court outcome requires an independent SENTINEL record")
+        bound: dict[str, Any] = {
+            "court_id": court_id, "verdict": verdict, "receipt_sha": receipt_sha,
+            "record_sha": record_sha, "independent": True, "source_role": "SENTINEL",
+        }
+        head = str(court.get("source_head") or "").lower()
+        if _looks_head(head):
+            bound["source_head"] = head
+        if isinstance(court.get("findings"), list):
+            bound["findings"] = [str(f)[:500] for f in court["findings"][:64]]
+        if court.get("court_ref"):
+            bound["court_ref"] = str(court["court_ref"])[:1024]
+        envelope["court"] = bound
     return envelope
 
 

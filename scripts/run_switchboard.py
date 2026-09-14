@@ -42,6 +42,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neuruh_workers.switchboard import (  # noqa: E402
+    missions_on_ledger,
     AdjudicatorUnavailable, Switchboard, observe_canonical_base_via_git,
 )
 from neuruh_workers.adjudicator_http import (  # noqa: E402
@@ -216,8 +217,13 @@ def _board(args) -> Switchboard:
     # its first-seam shape and candidate.push.requested / promotion.requested
     # stay unroutable -- the board never pushes or merges anything itself.
     organs = composition(args.root)
+    # Scoped to the missions this root's own ledger already carries: the bridge
+    # seals receipts and asks for courts here for whatever the Founder Runtime
+    # dispatched. Left at DEFAULT_MISSIONS, this board deadlettered every such
+    # court as "event mission outside consumer scope" (2026-09-04, 2026-09-14).
     return Switchboard(
         args.root, receipts_dir=args.receipts,
+        known_missions=missions_on_ledger(args.root),
         canonical_observer=observe_canonical_base_via_git,
         adjudicator=sentinel_court_adjudicator(),
         git_custodian=organs["git_custodian"],
