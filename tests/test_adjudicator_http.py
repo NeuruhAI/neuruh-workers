@@ -25,6 +25,8 @@ from typing import Any
 from neuruh_workers.adjudicator_http import (
     ADJUDICATE_PATH,
     COURT_TIMEOUT_ENV,
+    DEFAULT_TIMEOUT_SECONDS,
+    ORGAN_ROUND_TRIP_CEILING_SECONDS,
     COURT_URL_ENV,
     DEFAULT_COURT_URL,
     SentinelCourtHTTPAdjudicator,
@@ -214,3 +216,31 @@ class IndependenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DefaultTimeoutOutlastsTheOrgan(unittest.TestCase):
+    """A bound shorter than the organ's own IAR round trip can never carry a PASS:
+    the client gives up, the court stays open, the replay re-requests it forever.
+    Observed 2026-09-14 at the old 30s bound against a live organ that sealed a
+    genuine PASS at 58s (court-e309e9b41486414c5d42d166)."""
+
+    def test_default_bound_covers_the_organ_round_trip(self):
+        saved = os.environ.pop(COURT_TIMEOUT_ENV, None)
+        try:
+            self.assertEqual(court_timeout(), DEFAULT_TIMEOUT_SECONDS)
+            self.assertGreaterEqual(DEFAULT_TIMEOUT_SECONDS, ORGAN_ROUND_TRIP_CEILING_SECONDS)
+            self.assertGreaterEqual(DEFAULT_TIMEOUT_SECONDS, 58.0 * 2)
+        finally:
+            if saved is not None:
+                os.environ[COURT_TIMEOUT_ENV] = saved
+
+    def test_environment_still_overrides_the_default(self):
+        saved = os.environ.get(COURT_TIMEOUT_ENV)
+        os.environ[COURT_TIMEOUT_ENV] = "5"
+        try:
+            self.assertEqual(court_timeout(), 5.0)
+        finally:
+            if saved is None:
+                os.environ.pop(COURT_TIMEOUT_ENV, None)
+            else:
+                os.environ[COURT_TIMEOUT_ENV] = saved
