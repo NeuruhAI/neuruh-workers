@@ -33,7 +33,20 @@ COURT_URL_ENV = "NEURUH_SENTINEL_COURT_URL"
 COURT_TIMEOUT_ENV = "NEURUH_SENTINEL_COURT_TIMEOUT"
 #: One attempt, bounded. The board owns retry policy; a client that retried on
 #: its own would hide the blocked state the board has to be able to see.
-DEFAULT_TIMEOUT_SECONDS = 30.0
+#:
+#: The bound must outlast the organ's own round trip, or no PASS can ever land:
+#: before a PASS the organ consults IAR (sentinel_court/iar_client.py:
+#: DEFAULT_HEALTH_TIMEOUT_S 45s for /health and /provenance, then /route with
+#: DEFAULT_REASON_TIMEOUT_S 120s; IAR's local backend floors its own timeout at
+#: 60s and runs on CPU). Observed 2026-09-14: with complete evidence the live
+#: organ sealed a genuine zero-exception PASS 58s after the request
+#: (court-e309e9b41486414c5d42d166); at the previous 30s bound the client had
+#: already given up, the court stayed open, and the replay re-requested it
+#: forever. 240s covers the organ's worst case (45 + 45 + 120) with headroom;
+#: NEURUH_SENTINEL_COURT_TIMEOUT still overrides it for a court that must not wait.
+DEFAULT_TIMEOUT_SECONDS = 240.0
+#: The organ's worst-case round trip before a PASS, from its own constants.
+ORGAN_ROUND_TRIP_CEILING_SECONDS = 45.0 + 45.0 + 120.0
 #: Mirrors the organ's own refusal (sentinel_court/service.py assert_loopback_bind)
 #: and the board's bind_host contract. A court reached over a public network is
 #: not the court this seam was authorised to consult.
