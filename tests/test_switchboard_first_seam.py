@@ -600,6 +600,27 @@ class FailClosedTests(unittest.TestCase):
         self.assertTrue(board.deadletters())
         self.assertEqual(board.events(EventType.COURT_REQUESTED), [])
 
+    def test_court_request_names_the_repository_the_receipt_names(self):
+        """court.requested carries the candidate's repository, not this board's.
+
+        The outcome verifier binds the verdict's source_repo to the SEALED
+        receipt, and the adjudicator consumer carries the REQUEST's source_repo
+        into that verifier. So the request must name what the receipt names;
+        a request stamped with this board's own slug can never be ingested for
+        a candidate in any other repository (and the organ refuses it first as
+        SOURCE_REPO_MISMATCH)."""
+        board = _board(self)
+        _write_receipt(
+            board.receipts_dir, "other-repo.txt",
+            _synthetic_body(REPO="NeuruhAI/neuruh-sentinel-court"))
+        board.tick()
+        sealed = board.events(EventType.RECEIPT_SEALED)
+        requested = board.events(EventType.COURT_REQUESTED)
+        self.assertEqual(len(sealed), 1)
+        self.assertEqual(len(requested), 1)
+        self.assertEqual(sealed[0]["source_repo"], "NeuruhAI/neuruh-sentinel-court")
+        self.assertEqual(requested[0]["source_repo"], sealed[0]["source_repo"])
+
     def test_failed_sentinel_artifact_job_does_not_emit_court_request(self):
         board = _board(self)
         _write_receipt(

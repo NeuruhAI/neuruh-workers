@@ -1172,7 +1172,15 @@ class Switchboard:
             causation_id=envelope["event_id"],
             source_role=SOURCE_ROLE,
             source_component=SOURCE_COMPONENT,
-            source_repo=SOURCE_REPO,
+            # The repository the CANDIDATE lives in, as the sealed receipt names
+            # it -- the same fact source_head already comes from. This board's own
+            # slug here made the request disagree with its receipt whenever the
+            # receipt named another repository: the organ then fails the court
+            # SOURCE_REPO_MISMATCH, and the outcome verifier below refuses the
+            # verdict ("source_repo differs from its sealed receipt") because the
+            # consumer carries the request's source_repo. Observed 2026-09-14 by
+            # the organ's own consumer harness (sentinel_court/e2e.py).
+            source_repo=envelope["source_repo"],
             source_head=envelope["source_head"],
             authority_ref=envelope["authority_ref"],
             payload=court_payload,
