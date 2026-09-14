@@ -52,6 +52,7 @@ from neuruh_workers.prime_receipts import parse_prime_receipt
 from neuruh_workers.queue import JobQueue
 from neuruh_workers.runner import WorkflowRunner
 from neuruh_workers.switchboard import (
+    AdjudicatorUnavailable,
     INDEPENDENT_COURT_KIND, SwitchboardError, observe_canonical_base_via_git,
 )
 from neuruh_workers.switchboard_jobs import (
@@ -220,7 +221,20 @@ class FounderRuntimeCourt(unittest.TestCase):
             http_open=self.health_opener,
             fr_token="court-token",
             canonical_observer=self.canonical.observe,
+            # No organ is consulted in this court. Without an injected adjudicator
+            # the bridge's Switchboard gets the production one -- a loopback HTTP
+            # client to whatever organ is LIVE on this host -- and this suite's
+            # verdicts then depend on that process (2026-09-14: a live organ at
+            # 127.0.0.1:18731 sealed a real FAIL for the fixture and the
+            # idempotency court returned BLOCKED). The court stays open, named,
+            # exactly as with an unreachable organ; nothing is scored.
+            adjudicator=self.no_organ,
         )
+
+    @staticmethod
+    def no_organ(envelope):
+        raise AdjudicatorUnavailable(
+            "no independent Sentinel organ is consulted in the founder-runtime court")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -688,6 +702,7 @@ class FounderRuntimeCourt(unittest.TestCase):
             http_open=self.health_opener,
             fr_token="court-token",
             canonical_observer=self.canonical.observe,
+            adjudicator=self.no_organ,
         )
         third = reopened_runtime.dispatch(
             self.mission(), [self.property_candidate()])
@@ -800,6 +815,7 @@ class FounderRuntimeCourt(unittest.TestCase):
                 OSError("Founder Runtime unavailable")),
             fr_token="court-token",
             canonical_observer=self.canonical.observe,
+            adjudicator=self.no_organ,
         )
         result = runtime.dispatch(self.mission(), [self.property_candidate()])
         self.assertEqual(result.status, RuntimeStatus.BLOCKED)
@@ -1039,6 +1055,7 @@ class FounderRuntimeCourt(unittest.TestCase):
             http_open=self.health_opener,
             fr_token="court-token",
             canonical_observer=self.canonical.observe,
+            adjudicator=self.no_organ,
         )
         ticket, candidate = self.authorized_pair(
             "JGI-L3-IAR-UP",
@@ -1149,6 +1166,8 @@ class FounderRuntimeCourt(unittest.TestCase):
                          self.canonical.observe)
         self.assertIsNone(_canonical_observer_for(None, None))
         self.assertIsNone(DispatchBridge(self.queue, self.catalog, self.runner).canonical_observer)
+        # Same contract for the Sentinel: None means the production HTTP adjudicator.
+        self.assertIsNone(DispatchBridge(self.queue, self.catalog, self.runner).adjudicator)
         self.assertEqual(self.runtime.canonical_observer, self.canonical.observe)
 
     def test_a_bridge_board_that_observed_nothing_cannot_certify_a_pass(self):
@@ -1558,6 +1577,7 @@ class FounderRuntimeCourt(unittest.TestCase):
             http_open=opener,
             fr_token="court-token",
             canonical_observer=self.canonical.observe,
+            adjudicator=self.no_organ,
         )
         ticket, candidate = self.authorized_pair(
             "JGI-CONSEQUENTIAL-CALLS",

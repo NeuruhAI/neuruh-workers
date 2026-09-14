@@ -102,17 +102,22 @@ class SentinelCourtHTTPAdjudicator:
 
         PERMANENTLY REJECTED, 2026-09-09 -- do not "fix" an ingest refusal here.
         Workers' ingest gate requires the sealed record to echo the request
-        identity (switchboard._require_independent_court_evidence), and the organ
-        does not yet record all of it, so a real verdict currently refuses at
-        ingest with "Sentinel evidence <field> is not bound to the court request".
+        identity (switchboard._require_independent_court_evidence). Until
+        2026-09-14 the organ recorded 8 of those 16 fields, so every real verdict
+        refused at ingest with "Sentinel evidence <field> is not bound to the
+        court request". The producer-side repair is neuruh-sentinel-court PR #5
+        (fix/court-record-echoes-request-identity-20260913): the organ's
+        CourtRecord echoes receipt_sha, plan_id, task_id, correlation_id,
+        causation_id, source_head, source_repo and authority_ref from the
+        envelope it was handed, and tests/test_sentinel_live_seam.py proves the
+        round trip here against a real organ process.
 
         The one-line fix that suggests itself -- merge the request identity into
         the record on the way back through this method -- is FORGERY. It would
         have workers assert that the organ answered about this request when the
         organ never said so, making the binding gate certify workers' own
-        bookkeeping against itself. The correct fix is in the organ, which
-        already receives every one of those fields
-        (see handoff/2026-09-09/11_sentinel_court_patch.md).
+        bookkeeping against itself. The fix lives in the organ, which already
+        receives every one of those fields.
 
         Nothing is added to the envelope going out or to the record coming back.
         """
