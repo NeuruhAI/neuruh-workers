@@ -297,3 +297,47 @@ class PromotionRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServiceBoardIsScopedToItsOwnLedger(unittest.TestCase):
+    """The production service board must carry the courts the bridge asked for
+    in the same root. Scoped to DEFAULT_MISSIONS alone it deadlettered them as
+    "event mission outside consumer scope" (2026-09-04 msn_4ab91616…,
+    2026-09-14 msn_2d6e71c5…: the live mission's court was never carried)."""
+
+    def setUp(self):
+        from tests.test_switchboard_court_request_contract import _Court
+        self.court = _Court("setUp")
+        self.court.setUp()
+        self.addCleanup(lambda: shutil.rmtree(self.court.tmp, ignore_errors=True))
+
+    def _sealed_root(self):
+        from tests.test_switchboard_court_request_contract import MISSION, StubAdjudicator
+        world = self.court.world()
+        bridge_board = self.court.board(world, adjudicator=StubAdjudicator())
+        bridge_board.tick()
+        self.assertEqual(len(bridge_board.events(EventType.COURT_REQUESTED)), 1)
+        return world, bridge_board, MISSION
+
+    def test_missions_on_ledger_names_the_missions_the_board_carries(self):
+        from neuruh_workers.switchboard import DEFAULT_MISSIONS, missions_on_ledger
+        empty = os.path.join(self.court.tmp, "empty-root")
+        self.assertEqual(missions_on_ledger(empty), DEFAULT_MISSIONS)
+        _world, bridge_board, mission = self._sealed_root()
+        scoped = missions_on_ledger(bridge_board.root)
+        self.assertIn(mission, scoped)
+        self.assertTrue(DEFAULT_MISSIONS <= scoped)
+
+    def test_service_board_carries_the_bridge_court_instead_of_deadlettering_it(self):
+        from tests.test_switchboard_court_request_contract import StubAdjudicator
+        _world, bridge_board, mission = self._sealed_root()
+        stub = StubAdjudicator(verdict="PASS")
+        args = Namespace(root=bridge_board.root, receipts=bridge_board.receipts_dir)
+        with mock.patch.object(rs, "sentinel_court_adjudicator", lambda: stub):
+            service_board = rs._board(args)
+        self.assertIn(mission, service_board.known_missions)
+        report = service_board.tick()
+        self.assertEqual(report.deadlettered, [], report)
+        self.assertEqual(len(stub.packets), 1)
+        self.assertEqual(len(service_board.events(EventType.COURT_PASSED)), 1)
+        self.assertEqual(service_board.deadletters(), [])

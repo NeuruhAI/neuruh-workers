@@ -71,6 +71,40 @@ T07_AXON_PR_URL = "https://github.com/NeuruhAI/neuruh-axon/pull/4"
 T07_AXON_BRANCH = "feat/grok-sovereign-mcp-v4-20260827"
 
 DEFAULT_MISSIONS = frozenset({T07_MISSION})
+#: Event types whose mission_id names a mission this board is already carrying.
+#: A receipt the bridge sealed here, and the court it asked for, name the mission
+#: the board's consumers must be in scope for.
+_MISSION_BEARING_EVENTS = frozenset({
+    "receipt.sealed", "court.requested", "court.passed", "court.failed",
+})
+
+
+def missions_on_ledger(root: str) -> frozenset[str]:
+    """The missions this board's own events ledger already carries.
+
+    The consumer scope of a production board is not a constant: the dispatch
+    bridge seals receipts for whatever missions the Founder Runtime dispatched,
+    into THIS root, and asks for their courts here. A service board scoped to
+    DEFAULT_MISSIONS alone deadlettered every one of them as "event mission
+    outside consumer scope" (observed 2026-09-04 msn_4ab91616… and 2026-09-14
+    msn_2d6e71c5…: the court the bridge asked for was never carried). Nothing is
+    invented: only missions already named by a hash-chained event on this ledger.
+    """
+    found: set[str] = set(DEFAULT_MISSIONS)
+    path = os.path.join(os.path.abspath(root), EVENTS_NAME)
+    if not os.path.isfile(path):
+        return frozenset(found)
+    try:
+        receipts = ExecutionLedger(path).receipts(EVENT_JOB)
+    except Exception:  # noqa: BLE001 -- an unreadable ledger widens nothing
+        return frozenset(found)
+    for receipt in receipts:
+        envelope = receipt.payload if isinstance(receipt.payload, Mapping) else {}
+        if envelope.get("event_type") in _MISSION_BEARING_EVENTS:
+            mission = envelope.get("mission_id")
+            if isinstance(mission, str) and mission:
+                found.add(mission)
+    return frozenset(found)
 
 # First seam closes the clipboard.  Court PASS is never derived here.
 HUMAN_CLIPBOARD_REQUIRED = "NO"

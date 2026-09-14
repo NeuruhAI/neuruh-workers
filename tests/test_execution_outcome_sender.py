@@ -312,3 +312,60 @@ class BridgeWritebackCourt(_fr_court.FounderRuntimeCourt):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CourtOutcomeEnvelopeCourt(unittest.TestCase):
+    """COURT_PASSED / COURT_FAILED carry the ingested independent verdict in the
+    shape fr.execution_outcome.v1 requires; before 2026-09-14 the builder had no
+    court form at all, so no Founder Runtime ever learned a verdict."""
+
+    def _court(self, **over):
+        court = {"court_id": "court-" + "a" * 24, "verdict": "PASS", "receipt_sha": "b" * 64,
+                 "record_sha": "c" * 64, "independent": True, "source_role": "SENTINEL",
+                 "source_head": HEAD, "findings": [], "court_ref": "/x/courts/court-a.json"}
+        court.update(over)
+        return court
+
+    def test_court_passed_envelope_binds_the_ingested_verdict(self):
+        env = build_execution_outcome_envelope(
+            mission_id="msn_test", mission_version=22, work_spec_sha256=WORK_SPEC,
+            job_id="job-abc", outcome="COURT_PASSED", dispatch_approval_id="appr_1",
+            source_head=HEAD, court=self._court())
+        self.assertEqual(env["outcome"], "COURT_PASSED")
+        self.assertEqual(env["court"], {
+            "court_id": "court-" + "a" * 24, "verdict": "PASS", "receipt_sha": "b" * 64,
+            "record_sha": "c" * 64, "independent": True, "source_role": "SENTINEL",
+            "source_head": HEAD, "findings": [], "court_ref": "/x/courts/court-a.json"})
+        self.assertNotIn("receipt", env)
+
+    def test_court_failed_requires_a_fail_verdict_and_vice_versa(self):
+        with self.assertRaises(ValueError):
+            build_execution_outcome_envelope(
+                mission_id="m", mission_version=1, work_spec_sha256=WORK_SPEC, job_id="j",
+                outcome="COURT_FAILED", dispatch_approval_id="a", source_head=HEAD,
+                court=self._court(verdict="PASS"))
+        env = build_execution_outcome_envelope(
+            mission_id="m", mission_version=1, work_spec_sha256=WORK_SPEC, job_id="j",
+            outcome="COURT_FAILED", dispatch_approval_id="a", source_head=HEAD,
+            court=self._court(verdict="FAIL"))
+        self.assertEqual(env["court"]["verdict"], "FAIL")
+
+    def test_court_outcome_without_a_complete_independent_record_is_refused(self):
+        for bad in ({}, {"court_id": "nope"}, {"record_sha": "zz"}, {"independent": False},
+                    {"source_role": "SWITCHBOARD"}, {"receipt_sha": "short"}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    build_execution_outcome_envelope(
+                        mission_id="m", mission_version=1, work_spec_sha256=WORK_SPEC, job_id="j",
+                        outcome="COURT_PASSED", dispatch_approval_id="a", source_head=HEAD,
+                        court=self._court(**bad) if bad else None)
+
+    def test_court_outcome_idempotency_key_carries_the_record_sha(self):
+        env = build_execution_outcome_envelope(
+            mission_id="m", mission_version=1, work_spec_sha256=WORK_SPEC, job_id="job-abc",
+            outcome="COURT_PASSED", dispatch_approval_id="a", source_head=HEAD, court=self._court())
+        opener, seen = _capture([_Resp(200, {"bind_status": "FR_OUTCOME_RECORDED"})])
+        report = report_execution_outcome("m", env, opener=opener, token="t")
+        self.assertEqual(report["idempotency_key"],
+                         execution_outcome_idempotency_key("job-abc", "COURT_PASSED", "c" * 64))
+        self.assertEqual(seen[0]["body"]["court"]["record_sha"], "c" * 64)
