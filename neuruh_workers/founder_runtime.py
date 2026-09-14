@@ -34,11 +34,14 @@ from .definitions import WorkflowCatalog
 from .organ_consumers import (
     FR_API_VERSION,
     FR_DISPATCHABLE_STATES,
+    GOVERNANCE_AUTHORIZE_RECEIPTS_LOG_ENV,
     HttpOpen,
     bind_founder_runtime,
     bind_iar_rf,
     call_gsa,
     emit_receipt_sealed_and_switcharoo,
+    execution_ledger_resolver_for,
+    governance_authority_resolver_for,
     job_succeeded_sha,
     pull_authoritative_mission,
     resolve_dispatch_source_identity,
@@ -507,6 +510,9 @@ class DispatchBridge:
         fr_timeout_s: float = 0.25,
         canonical_observer: Callable[[str, str, str], tuple[str, str]] | None = None,
         adjudicator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        authority_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        execution_ledger_resolver: Callable[[str], str | None] | None = None,
+        governance_authorize_ledger: str | None = None,
     ) -> None:
         self.queue = queue
         self.catalog = catalog
@@ -531,6 +537,31 @@ class DispatchBridge:
         # idempotency court's second dispatch came back BLOCKED
         # (SENTINEL_ALREADY_COURTED_FAIL) on a verdict the live organ sealed.
         self.adjudicator = adjudicator
+        # The two facts the bridge's Switchboard cannot know on its own, and the
+        # independent court will not PASS without (FR_REQUIRED_FACTS: execution_job,
+        # job_succeeded_sha, authority_record). The execution ledger IS this bridge's
+        # own queue ledger -- the rows it enqueued, ran and sealed the job in -- so
+        # the production default names exactly that file. The Governance record
+        # lives in the governance organ's append-only authorize-receipts log; its
+        # path is named by the composition root (``governance_authorize_ledger``)
+        # or by the organism-wide GOVERNANCE_AUTHORIZE_RECEIPTS_LOG variable, and
+        # with neither the request names the gap and the court fails closed --
+        # observed 2026-09-14: the live organ sealed FAIL INSUFFICIENT_EVIDENCE
+        # "missing authority_record, execution_job, job_succeeded_sha" on a
+        # request that carried only the receipt and the Switchboard chain.
+        self.execution_ledger_resolver = (
+            execution_ledger_resolver
+            if execution_ledger_resolver is not None
+            else execution_ledger_resolver_for(queue)
+        )
+        self.authority_resolver = (
+            authority_resolver
+            if authority_resolver is not None
+            else governance_authority_resolver_for(
+                governance_authorize_ledger
+                or os.environ.get(GOVERNANCE_AUTHORIZE_RECEIPTS_LOG_ENV)
+                or None)
+        )
         self.last_switchboard = None
 
     def dispatch(
@@ -891,6 +922,8 @@ class DispatchBridge:
                 code_custody_required=mission.code_custody_required,
                 canonical_observer=self.canonical_observer,
                 adjudicator=self.adjudicator,
+                authority_resolver=self.authority_resolver,
+                execution_ledger_resolver=self.execution_ledger_resolver,
             )
             sealed = emission["sealed"]
             court = emission["court_request"]
