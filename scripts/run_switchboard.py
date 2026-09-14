@@ -16,7 +16,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neuruh_workers.switchboard import (  # noqa: E402
-    Switchboard, observe_canonical_base_via_git,
+    AdjudicatorUnavailable, Switchboard, observe_canonical_base_via_git,
+)
+from neuruh_workers.adjudicator_http import (  # noqa: E402
+    court_url, sentinel_court_adjudicator,
 )
 
 ROOT = os.path.join(
@@ -29,9 +32,34 @@ def _board(args) -> Switchboard:
     # The production board observes the canonical base itself. Without an
     # observer the request names the canonical_base gap and no PASS can ever be
     # certified against it (switchboard._require_observed_relation).
+    #
+    # It also carries an adjudicator: a loopback HTTP client to the independent
+    # Sentinel court organ, running in its own process. Without one
+    # court.requested is unroutable and the board deadletters the very court it
+    # asked for -- the T02 seam. Workers never imports the organ; the process
+    # boundary is what keeps "independent" true at runtime.
     return Switchboard(
         args.root, receipts_dir=args.receipts,
-        canonical_observer=observe_canonical_base_via_git)
+        canonical_observer=observe_canonical_base_via_git,
+        adjudicator=sentinel_court_adjudicator())
+
+
+def _court_health(board: Switchboard) -> dict:
+    """Is the organ this board depends on actually reachable right now?
+
+    An operational dependency that can only be discovered by watching courts
+    stall is not an operational dependency anyone can run. `status` answers it
+    directly, and answers UNREACHABLE loudly rather than raising.
+    """
+    adjudicator = getattr(board, "adjudicator", None)
+    probe = getattr(adjudicator, "health", None)
+    if probe is None:
+        return {"status": "NO_ADJUDICATOR",
+                "detail": "court.requested is unroutable; the board will deadletter its own court"}
+    try:
+        return {"status": "UP", "organ": probe()}
+    except AdjudicatorUnavailable as exc:
+        return {"status": "UNREACHABLE", "detail": str(exc)}
 
 
 def main() -> int:
@@ -74,6 +102,8 @@ def main() -> int:
             "acked": report.acked,
             "deadlettered": report.deadlettered,
             "recovered": report.recovered,
+            # An unreachable Sentinel is a blocked court, not a quiet tick.
+            "blocked": report.blocked,
         }, indent=2))
     elif args.command == "status":
         print(json.dumps({
@@ -85,6 +115,8 @@ def main() -> int:
             "bind_host": board.bind_host,
             "sentinel_model_execution": "BLOCKED",
             "git_push": "BLOCKED",
+            "sentinel_court_url": court_url(),
+            "sentinel_court": _court_health(board),
         }, indent=2))
     elif args.command == "events":
         print(json.dumps(board.events(), indent=2))

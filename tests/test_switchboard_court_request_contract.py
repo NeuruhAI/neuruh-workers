@@ -29,14 +29,20 @@ import subprocess
 import tempfile
 import unittest
 
+import sys
+from urllib.parse import urlparse
+
 from neuruh_workers import Switchboard
+from neuruh_workers.adjudicator_http import (
+    DEFAULT_COURT_URL, SentinelCourtHTTPAdjudicator,
+)
 from neuruh_workers.contracts import content_sha
 from neuruh_workers.events import AckState, DeadletterReason, EventType
 from neuruh_workers.ledger import ExecutionLedger
 from neuruh_workers.organ_consumers import _fr_dispatch_receipt_text
 from neuruh_workers.switchboard import (
-    INDEPENDENT_COURT_KIND, SwitchboardError, observe_canonical_base_via_git,
-    _UNOBSERVED_BASE,
+    AdjudicatorUnavailable, INDEPENDENT_COURT_KIND, SwitchboardError,
+    observe_canonical_base_via_git, _UNOBSERVED_BASE,
 )
 from neuruh_workers.switchboard_jobs import HONEY_POT_WORKFLOW, REMEDIATION_WORKFLOW
 from tests.helpers import fixed_clock
@@ -158,7 +164,9 @@ class StubAdjudicator:
     def __init__(self, *, verdict: str = "PASS", findings=None, exceptions=None,
                  relation: str = "candidate_is_canonical_base", observed_remote: bool = True,
                  canonical_sha: str | None = None, evidence_sha256: str | None = None,
-                 evidence_refs=None, observed_sha: str | None = None) -> None:
+                 evidence_refs=None, observed_sha: str | None = None,
+                 switchboard_passed: bool | None = None,
+                 omit_projection: bool = False) -> None:
         self.verdict = verdict
         self.findings = list(findings or [])
         self.exceptions = list(exceptions or [])
@@ -168,6 +176,14 @@ class StubAdjudicator:
         self.evidence_sha256 = evidence_sha256
         self.evidence_refs = evidence_refs
         self.observed_sha = observed_sha
+        # The organ owns the PASS|FAIL projection and ships it beside the record
+        # (sentinel_court.project.project_for_switchboard_ingest). This double does
+        # NOT reimplement that mapping -- it carries whatever the scenario states,
+        # defaulting to the same single pass/fail flag the stub already uses for
+        # required_repairs and iar_provenance. A scenario that needs the organ and
+        # the old inline formula to disagree says so explicitly.
+        self.switchboard_passed = switchboard_passed
+        self.omit_projection = omit_projection
         self.packets: list[dict] = []
 
     def __call__(self, packet: dict) -> dict:
@@ -183,8 +199,9 @@ class StubAdjudicator:
         court_id = "court-" + hashlib.sha256(
             f"{packet['mission_id']}|{inner.get('court_job_id')}|{evidence_sha256}|{observed}".encode()
         ).hexdigest()[:24]
-        passed = self.verdict == "PASS"
-        return {
+        passed = (self.verdict == "PASS" if self.switchboard_passed is None
+                  else self.switchboard_passed)
+        record = {
             "kind": INDEPENDENT_COURT_KIND, "source_role": "SENTINEL", "independent": True,
             "court_id": court_id, "verdict": self.verdict,
             "receipt_ref": inner.get("receipt_ref"), "receipt_sha": inner.get("receipt_sha"),
@@ -211,6 +228,16 @@ class StubAdjudicator:
                             "ledger_sha256_prefix": "beef"},
             } if passed else {"authorized": False, "authorization_ref": ""},
         }
+        if not self.omit_projection:
+            projected = passed
+            record["switchboard_ingest"] = {
+                "ingest_verdict": "PASS" if projected else "FAIL",
+                "switchboard_passed": projected,
+                "organ_verdict": self.verdict,
+                "reason": "projection supplied by the organ",
+                "exceptions_empty": not self.exceptions,
+            }
+        return record
 
 
 class _Court(unittest.TestCase):
@@ -365,6 +392,95 @@ class CourtRequestConsumerTests(_Court):
         self.assertEqual(board.events(EventType.COURT_PASSED), [])
         self.assertEqual(board.events(EventType.COURT_FAILED), [])
 
+    def test_with_adjudicator_court_requested_is_consumed(self):
+        """The positive twin of the test above it, and the whole point of T02.
+
+        Same board, same event, one difference: an adjudicator is present. The
+        consumer is registered, court.requested is ACKED rather than left
+        unroutable, and a verdict comes back. Its negative twin stays exactly as
+        it was -- fail-closed with no adjudicator is still correct behaviour, it
+        was just never supposed to be the production configuration."""
+        world = self.world()
+        stub = StubAdjudicator()
+        board = self.board(world, adjudicator=stub)
+        board.tick()
+        court = self.court(board)
+        self.assertIn(CONSUMER_ID, [c.consumer_id for c in board.consumers])
+
+        report = board.tick()
+        self.assertIn(court["event_id"], report.acked)
+        self.assertEqual(report.blocked, [])
+        self.assertEqual(len(stub.packets), 1)
+        # Not unroutable, not deadlettered: consumed, with a verdict on the ledger.
+        self.assertEqual(board.deadletters(), [])
+        self.assertEqual(len(board.events(EventType.COURT_PASSED)), 1)
+
+    def test_unreachable_adjudicator_blocks_visibly_and_never_deadletters(self):
+        """An organ that is DOWN must not look like a candidate that FAILED.
+
+        Nothing here is mocked: the client is pointed at a real closed port on
+        loopback and a real connection is refused. The court must stay open, the
+        block must be named on the tick report, and no verdict may be invented in
+        either direction -- however many ticks run."""
+        import socket as _socket
+        with _socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed_port = probe.getsockname()[1]
+        # The socket is closed on exit, so this address now refuses connections.
+        client = SentinelCourtHTTPAdjudicator(f"http://127.0.0.1:{closed_port}", timeout=2.0)
+        world = self.world()
+        board = self.board(world, adjudicator=client)
+        board.tick()
+        court = self.court(board)
+
+        for _ in range(6):
+            report = board.tick()
+
+        self.assertEqual([b["reason"] for b in report.blocked],
+                         [AdjudicatorUnavailable.code])
+        self.assertEqual(report.blocked[0]["event_id"], court["event_id"])
+        self.assertIn("unreachable", report.blocked[0]["detail"])
+        # The three things that must NOT happen.
+        self.assertEqual(board.deadletters(), [], "a court that never happened was buried")
+        self.assertEqual(board.events(EventType.COURT_PASSED), [])
+        self.assertEqual(board.events(EventType.COURT_FAILED), [])
+        # And it is still open, so it resumes the moment the organ returns.
+        self.assertEqual(
+            board._consumer_state(CONSUMER_ID)["lease"]["state"], AckState.RETRY.value)
+
+    def test_pass_with_exceptions_arrives_projected_and_is_accepted(self):
+        """PASS_WITH_EXCEPTIONS is not a verdict this board knows how to score.
+
+        The organ projects it (empty exceptions -> PASS) and sends the answer.
+        The board reads the answer. It does not re-derive one, which is why the
+        inline formula is gone."""
+        world = self.world()
+        stub = StubAdjudicator(verdict="PASS_WITH_EXCEPTIONS", switchboard_passed=True)
+        board = self.board(world, adjudicator=stub)
+        board.tick()
+        board.tick()
+
+        passed = board.events(EventType.COURT_PASSED)
+        self.assertEqual(len(passed), 1, board.deadletters())
+        with open(passed[0]["payload_ref_or_payload"]["evidence"]["ref"], encoding="utf-8") as fh:
+            sealed = json.load(fh)
+        self.assertEqual(sealed["verdict"], "PASS_WITH_EXCEPTIONS")
+        self.assertIs(sealed["switchboard_ingest"]["switchboard_passed"], True)
+
+    def test_a_record_without_the_organs_projection_is_refused(self):
+        """One projection, one owner. A record that did not bring the organ's
+        answer is not scored by guessing -- it fails closed and says why."""
+        world = self.world()
+        stub = StubAdjudicator(omit_projection=True)
+        board = self.board(world, adjudicator=stub)
+        board.tick()
+        board.tick()
+
+        self.assertEqual(board.events(EventType.COURT_PASSED), [])
+        self.assertEqual(board.events(EventType.COURT_FAILED), [])
+        lease = board._consumer_state(CONSUMER_ID)["lease"]
+        self.assertIn("switchboard_ingest", lease["last_error"])
+
     def test_consumer_hands_the_event_itself_to_the_adjudicator_and_ingests_pass(self):
         world = self.world()
         stub = StubAdjudicator()
@@ -422,13 +538,20 @@ class CourtRequestConsumerTests(_Court):
         lease = board._consumer_state(CONSUMER_ID)["lease"]
         self.assertIsNotNone(lease)
         self.assertEqual(lease["state"], AckState.RETRY.value)
+        # The court STAYS open -- and stays visible. It used to burn three quiet
+        # retries and die under MAX_RETRIES, a reason that named the board's
+        # patience instead of the actual cause, which is how an unreached court
+        # came to look like a judged candidate.
         for _ in range(5):
-            board.tick()
+            report = board.tick()
         self.assertEqual(board.events(EventType.COURT_FAILED), [])
-        dead = [d for d in board.deadletters()
-                if d["payload_ref_or_payload"]["reason"] == DeadletterReason.MAX_RETRIES.value]
-        self.assertEqual(len(dead), 1)
-        self.assertTrue(dead[0]["payload_ref_or_payload"]["original_retained"])
+        self.assertEqual(board.events(EventType.COURT_PASSED), [])
+        self.assertEqual([b["reason"] for b in report.blocked],
+                         [AdjudicatorUnavailable.code])
+        self.assertIn("could not reach its model", report.blocked[0]["detail"])
+        self.assertEqual(board.deadletters(), [])
+        self.assertEqual(
+            board._consumer_state(CONSUMER_ID)["lease"]["state"], AckState.RETRY.value)
 
     def test_replay_and_restart_ingest_exactly_one_verdict(self):
         world = self.world()
@@ -860,7 +983,13 @@ class ProductionWiringTests(_Court):
         board = module._board(args)
         self.assertIs(board.canonical_observer, observe_canonical_base_via_git)
         self.assertEqual(board.bind_host, "127.0.0.1")
-        self.assertIsNone(board.adjudicator)
+        # The seam this file is named for: the production root must carry an
+        # adjudicator, or it emits a court.requested nothing reads. It is the
+        # loopback HTTP client -- the organ itself is never imported here.
+        self.assertIsInstance(board.adjudicator, SentinelCourtHTTPAdjudicator)
+        self.assertEqual(urlparse(board.adjudicator.base_url).hostname, "127.0.0.1")
+        self.assertIn(CONSUMER_ID, [c.consumer_id for c in board.consumers])
+        self.assertNotIn("sentinel_court", sys.modules)
 
 
 if __name__ == "__main__":
