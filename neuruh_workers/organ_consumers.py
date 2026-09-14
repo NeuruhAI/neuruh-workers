@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from .contracts import JobStatus, ReceiptType, canonical_json
+from .ledger import split_lines_exact
 from .prime_receipts import (
     FR_DISPATCH_RECEIPT_SCHEMA,
     parse_prime_receipt,
@@ -984,8 +985,18 @@ def emit_receipt_sealed_and_switcharoo(
     code_custody_required: bool = False,
     canonical_observer: Callable[[str, str, str], tuple[str, str]] | None = None,
     adjudicator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    authority_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+    execution_ledger_resolver: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     """Hand a receipted result to live SWITCHAROO. Do not clone nrh.event.v1.
+
+    ``authority_resolver`` and ``execution_ledger_resolver`` are the two facts the
+    board cannot know on its own and the independent court will not PASS without
+    (sentinel_court.verify FR_REQUIRED_FACTS: authority_record, execution_job,
+    job_succeeded_sha): the Governance record that allowed this mission and the
+    dispatch bridge's execution ledger that ran this job. See
+    ``execution_ledger_resolver_for`` / ``governance_authority_resolver_for``.
+    Absent means absent: the request names the gap and the organ fails closed.
 
     ``canonical_observer`` is what the board reads the canonical base with; see
     ``_canonical_observer_for`` for the production default and why a court must
@@ -1125,6 +1136,8 @@ def emit_receipt_sealed_and_switcharoo(
             known_missions=frozenset({mission_id}),
             canonical_observer=_canonical_observer_for(switchboard, canonical_observer),
             adjudicator=_adjudicator_for(adjudicator_module, adjudicator),
+            authority_resolver=authority_resolver,
+            execution_ledger_resolver=execution_ledger_resolver,
         )
         report = board.tick()
         sealed_events = [
@@ -1257,6 +1270,91 @@ def emit_receipt_sealed_and_switcharoo(
 
 # Back-compat name used by older call sites on this same PR.
 emit_receipt_sealed_and_court_request = emit_receipt_sealed_and_switcharoo
+
+
+#: Where Governance writes its hash-chained authorization records. The same
+#: name the governance organ itself is configured with (~/.neuruh/env/governance.env),
+#: so one path is named once for the whole organism.
+GOVERNANCE_AUTHORIZE_RECEIPTS_LOG_ENV = "GOVERNANCE_AUTHORIZE_RECEIPTS_LOG"
+
+
+def execution_ledger_resolver_for(queue: JobQueue) -> Callable[[str], str | None]:
+    """The dispatch bridge's own execution ledger, for a job it actually holds.
+
+    This is the ledger the bridge enqueued, ran and sealed the job in -- the
+    ``job.enqueued`` .. ``job.succeeded`` rows the court binds ``execution_job``
+    and ``job_succeeded_sha`` to. A job the ledger does not know resolves to None
+    and the board names the gap; nothing is looked up anywhere else.
+    """
+    def resolve(job_id: str) -> str | None:
+        if not job_id:
+            return None
+        try:
+            if not queue.ledger.receipts(job_id):
+                return None
+        except Exception:  # noqa: BLE001 -- an unreadable ledger is a gap, not a binding
+            return None
+        return os.path.abspath(queue.ledger.path)
+    return resolve
+
+
+def governance_authority_resolver_for(
+    ledger_path: str | None,
+) -> Callable[[str], Mapping[str, Any] | None] | None:
+    """The Governance authorization record a mission's dispatch rests on.
+
+    Reads the organ's own append-only ``authorize-receipts.jsonl`` (never
+    written here) and names the LAST ``allow`` authorization whose target is
+    this mission, by ``authorization_id:entry_hash`` and by the line range from
+    line 1 through that record, so the independent court verifies the hash chain
+    from its start and the digest still reproduces after Governance appends. No
+    record means no binding: the board names the gap and the court fails closed.
+    None when no ledger path is configured -- an unwired composition root stays
+    an unwired composition root, visibly.
+    """
+    if not ledger_path:
+        return None
+    ledger_ref = os.path.abspath(os.path.expanduser(str(ledger_path)))
+
+    def resolve(mission_id: str) -> Mapping[str, Any] | None:
+        if not mission_id or not os.path.isfile(ledger_ref):
+            return None
+        try:
+            with open(ledger_ref, "rb") as handle:
+                lines = split_lines_exact(handle.read())
+        except OSError:
+            return None
+        found: Mapping[str, Any] | None = None
+        for lineno, raw in enumerate(lines, start=1):
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(row, Mapping):
+                continue
+            target = row.get("target") if isinstance(row.get("target"), Mapping) else {}
+            if (
+                row.get("kind") == "governance_authorization"
+                and str(row.get("decision") or "") == "allow"
+                and target.get("type") == "mission"
+                and target.get("id") == mission_id
+                and _looks_hex64(row.get("entry_hash"))
+                and row.get("authorization_id")
+            ):
+                found = {
+                    "authorization_id": str(row["authorization_id"]),
+                    "entry_hash": str(row["entry_hash"]).lower(),
+                    "ledger_ref": ledger_ref,
+                    "line_start": 1,
+                    "line_end": lineno,
+                }
+        return found
+    return resolve
+
+
+def _looks_hex64(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        c in "0123456789abcdef" for c in value.lower())
 
 
 def job_succeeded_sha(queue: JobQueue, job_id: str) -> str | None:

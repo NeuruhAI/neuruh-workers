@@ -29,6 +29,21 @@ def utc_clock() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def split_lines_exact(body: bytes) -> list[bytes]:
+    """Lines as the producers wrote them: split on b"\\n" ONLY, terminators kept.
+
+    Byte-for-byte what the independent court hashes when it retrieves a line
+    range of a ledger (sentinel_court.retrieve.split_lines_exact). bytes.splitlines
+    also splits on U+2028/U+2029 and \\x1c-\\x1e, which a Governance line may carry
+    raw; the two sides would then hash different bytes for the same range.
+    """
+    parts = body.split(b"\n")
+    lines = [part + b"\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
 class ExecutionLedger:
     """One JSONL file, append-only, verified on every open and every append."""
 
@@ -43,6 +58,11 @@ class ExecutionLedger:
         # Verify the existing chain immediately: a corrupt ledger must never
         # accept new receipts.
         self._tail_seq, self._tail_sha = self._verify_all()
+
+    @property
+    def path(self) -> str:
+        """The JSONL file this ledger is: what a court is told to retrieve."""
+        return self._path
 
     # -- reading ----------------------------------------------------------- #
 

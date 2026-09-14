@@ -33,7 +33,7 @@ from .events import (
     build_envelope,
     validate_envelope,
 )
-from .ledger import Clock, ExecutionLedger, utc_clock
+from .ledger import Clock, ExecutionLedger, split_lines_exact, utc_clock
 from .prime_receipts import (
     FR_DISPATCH_RECEIPT_SCHEMA,
     contains_secret_shape,
@@ -1228,8 +1228,17 @@ class Switchboard:
                 ledger_path = self.execution_ledger_resolver(task_id)
             except Exception:  # noqa: BLE001 -- a resolver fault is a gap, not a binding
                 ledger_path = None
+        # Named only up to and including the job.succeeded row: final at emission,
+        # so the digest still reproduces after the bridge appends to the same
+        # ledger (a replay writes job.enqueue_deduplicated before the court runs),
+        # and anchored at line 1, which is the only range the organ verifies
+        # (sentinel_court.verify: RANGE_NOT_ANCHORED otherwise).
+        succeeded_line = 0
         if ledger_path and os.path.isfile(str(ledger_path)):
-            refs.append(self._typed_ref(_KIND_EXECUTION_LEDGER, str(ledger_path)))
+            succeeded_line = self._job_succeeded_line(str(ledger_path), task_id)
+        if succeeded_line:
+            refs.append(self._typed_ref(
+                _KIND_EXECUTION_LEDGER, str(ledger_path), line_start=1, line_end=succeeded_line))
         else:
             gaps.append("execution_ledger")
 
@@ -1294,12 +1303,39 @@ class Switchboard:
         return out
 
     @staticmethod
+    def _job_succeeded_line(path: str, task_id: str) -> int:
+        """1-based line of the job.succeeded row for ``task_id`` in a Workers ledger,
+        0 when there is none. The ledger is one JSON receipt per line; lines are
+        counted exactly as the organ counts them when it retrieves a range."""
+        if not task_id:
+            return 0
+        try:
+            with open(path, "rb") as handle:
+                lines = split_lines_exact(handle.read())
+        except OSError:
+            return 0
+        found = 0
+        for lineno, raw in enumerate(lines, start=1):
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if (isinstance(row, Mapping) and row.get("job_id") == task_id
+                    and row.get("receipt_type") == ReceiptType.JOB_SUCCEEDED.value):
+                found = lineno
+        return found
+
+    @staticmethod
     def _typed_ref(kind: str, path: str, *, line_start: int = 0, line_end: int = 0) -> dict[str, Any]:
         with open(path, "rb") as handle:
             body = handle.read()
         entry: dict[str, Any] = {"kind": kind, "ref": os.path.abspath(path)}
         if line_start or line_end:
-            lines = body.splitlines(keepends=True)
+            # Split on b"\n" ONLY, as the organ does when it re-hashes the range
+            # (sentinel_court.retrieve.split_lines_exact); bytes.splitlines also
+            # splits on U+2028/U+2029 and \x1c-\x1e, which a Governance line can
+            # carry raw, and the two sides would then hash different bytes.
+            lines = split_lines_exact(body)
             if line_start < 1 or line_end < line_start or line_end > len(lines):
                 raise SwitchboardError(
                     f"evidence line range {line_start}..{line_end} is outside {path}")
