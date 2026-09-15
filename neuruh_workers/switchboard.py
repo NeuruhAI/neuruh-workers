@@ -1593,6 +1593,20 @@ class Switchboard:
         court = envelope["payload_ref_or_payload"]
         if src.get("code_custody_required") is not True:
             return None
+        candidate = src.get("candidate") if isinstance(src.get("candidate"), Mapping) else None
+        evidence = court.get("evidence") if isinstance(court.get("evidence"), Mapping) else {}
+        if (
+            candidate is not None
+            and evidence.get("kind") == INDEPENDENT_COURT_KIND
+            and isinstance(evidence.get("ref"), str) and evidence["ref"]
+            and isinstance(evidence.get("record_sha"), str) and len(evidence["record_sha"]) == 64
+        ):
+            # The producer named its candidate before any court existed, so it
+            # cannot name the court. The board ingested the sealed Sentinel
+            # record that judged it; custody is bound to exactly that record.
+            candidate = {**candidate,
+                         "court_receipt_ref": evidence["ref"],
+                         "court_receipt_hash": evidence["record_sha"]}
         params = {
             "mission_id": envelope["mission_id"],
             "task_id": envelope["task_id"],
@@ -1601,15 +1615,16 @@ class Switchboard:
             "branch": src.get("branch", ""),
             "head": src.get("head", envelope["source_head"]),
             "remote": src.get("remote", "origin"),
-            "court_receipt": court.get("court_job_id", envelope["causation_id"]),
+            "court_receipt": (candidate or {}).get("court_receipt_ref")
+            or court.get("court_job_id", envelope["causation_id"]),
             "authority_ref": envelope["authority_ref"],
             "idempotency_key": f"candidate.push.requested|{src.get('receipt_sha')}",
             "expected_pr": src.get("expected_pr") or None,
             "expected_pr_url": src.get("expected_pr_url") or None,
             "expected_pr_draft": src.get("expected_pr_draft") or None,
         }
-        if src.get("candidate") is not None:
-            params["candidate"] = src["candidate"]
+        if candidate is not None:
+            params["candidate"] = dict(candidate)
         if params["expected_pr"] == "":
             params["expected_pr"] = None
         wf = self.catalog.get(HONEY_POT_WORKFLOW)

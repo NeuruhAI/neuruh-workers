@@ -62,6 +62,16 @@ def _receipt_body(
     ]) + "\n"
 
 
+class _SealedRecordStore:
+    """The production FileRecordStore contract: an absolute ref is a local JSON file."""
+
+    def get(self, ref):
+        if not isinstance(ref, str) or not os.path.isabs(ref) or not os.path.isfile(ref):
+            return None
+        with open(ref, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+
 class SwitchboardGitCustodianBindTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="neuruh-bind-")
@@ -77,8 +87,9 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
             git=RealGitBackend(),
             pr=self.pr,
             ci=MockCIAdapter(),
-            court_store=MemoryCourtStore(
-                {"court://local/bare-remote": self.court}),
+            # Production binds FileRecordStore over the board's record dirs: the
+            # sealed Sentinel record the board ingested is the court custody binds.
+            court_store=_SealedRecordStore(),
             authority_store=MemoryAuthorityStore(
                 {T07_AUTHORITY_REF: FOUNDER_CANDIDATE_V1}),
             switchboard=self.switchboard_log,
@@ -137,6 +148,16 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
         self.assertEqual(envelope["event_type"],
                          EventType.CANDIDATE_PUSH_REQUESTED.value)
         self.assertIn("candidate", envelope["payload_ref_or_payload"])
+        # The producer named its candidate before any court existed; the board
+        # bound it to the sealed Sentinel record that actually judged it.
+        bound = envelope["payload_ref_or_payload"]["candidate"]
+        passed = self.board.events(EventType.COURT_PASSED)[-1]["payload_ref_or_payload"]["evidence"]
+        self.assertEqual(bound["court_receipt_ref"], passed["ref"])
+        self.assertEqual(bound["court_receipt_hash"], passed["record_sha"])
+        with open(passed["ref"], "r", encoding="utf-8") as fh:
+            sealed_record = json.load(fh)
+        self.assertEqual(sealed_record["kind"], "independent_sentinel_court")
+        self.assertEqual(content_sha(sealed_record), bound["court_receipt_hash"])
 
         self.board.tick()  # git-custodian consumer
         remote_sha = sha(self.pair["remote"],
@@ -187,8 +208,11 @@ class SwitchboardGitCustodianBindTests(unittest.TestCase):
         self.assertNotEqual(ls.returncode, 0)
 
     def test_bare_pass_string_still_refused_on_bound_path(self):
-        self.worker.court_store = MemoryCourtStore(
-            {"court://local/bare-remote": "PASS"})
+        # A bare PASS string where the sealed record should be is still refused.
+        class _BarePass:
+            def get(self, ref):
+                return "PASS"
+        self.worker.court_store = _BarePass()
         _write_receipt(self.board.receipts_dir, "BIND_RECEIPT.txt",
                        _receipt_body(self.pair, self.candidate))
         self.board.tick()
