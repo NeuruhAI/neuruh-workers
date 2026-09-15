@@ -23,6 +23,69 @@ class MemoryCourtStore:
         self._records[ref] = value
 
 
+#: What the live independent Sentinel organ actually seals (sentinel_court.seal).
+#: Git Custodian V1 was written against nrh.court.receipt.v1, a shape no live
+#: court produces, so every real PASS it was handed was refused as COURT_INVALID.
+SENTINEL_COURT_KIND = "independent_sentinel_court"
+_VERIFIED_RELATIONS = frozenset({
+    "candidate_is_canonical_base", "candidate_descends_from_canonical_base",
+})
+
+
+def verify_sentinel_court(record: Mapping[str, Any], candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind a sealed independent Sentinel record to THIS candidate.
+
+    Same obligations as the legacy court receipt -- independent PASS, mission,
+    stage, source head, candidate repo/head, digest -- read from the fields the
+    organ seals. Branch is not a court fact (the organ judges a commit); the
+    candidate's branch is proven by the push itself (remote head == expected).
+    """
+    if record.get("independent") is not True or record.get("source_role") != "SENTINEL":
+        raise GitCustodianRefused(
+            "court record is not an independent Sentinel court", reason="COURT_INVALID")
+    if record.get("verdict") != "PASS":
+        raise GitCustodianRefused(
+            "independent court is not PASS", {"verdict": record.get("verdict")},
+            reason="COURT_FAILED")
+    for key in ("findings", "exceptions", "required_repairs"):
+        if not isinstance(record.get(key), list) or record[key]:
+            raise GitCustodianRefused(
+                "a PASS with findings, exceptions or repairs is not a clean court",
+                {"field": key}, reason="COURT_FAILED")
+    if record.get("base_relation") not in _VERIFIED_RELATIONS:
+        raise GitCustodianRefused(
+            "court PASS rests on an unverified base relation",
+            {"relation": record.get("base_relation")}, reason="COURT_INVALID")
+    checks = (
+        ("mission_id", candidate["mission_id"]),
+        ("task_id", candidate["task_id"]),
+        ("source_head", candidate["expected_local_head"]),
+        ("candidate_sha", candidate["expected_local_head"]),
+        ("source_repo", candidate["repo"]),
+    )
+    for key, expected in checks:
+        if record.get(key) != expected:
+            raise GitCustodianRefused(
+                f"court {key} does not match the candidate", {"field": key},
+                reason="COURT_MISMATCH")
+    if content_sha(dict(record)) != candidate["court_receipt_hash"]:
+        raise GitCustodianRefused(
+            "court_receipt_hash does not match the evidence object",
+            reason="COURT_HASH_MISMATCH")
+    # The shape the rest of Git Custodian (PR body, receipts) reads.
+    return {
+        "schema_version": record.get("kind"),
+        "independent_court": "PASS",
+        "mission_id": record["mission_id"],
+        "stage": record["task_id"],
+        "source_head": record["source_head"],
+        "candidate": {"repo": record["source_repo"], "branch": candidate["branch"],
+                      "head": record["candidate_sha"]},
+        "court_id": record.get("court_id"),
+        "sealed_at": record.get("sealed_at"),
+    }
+
+
 def verify_court(evidence: Any, candidate: Mapping[str, Any]) -> dict[str, Any]:
     if evidence is None:
         raise GitCustodianRefused(
@@ -34,6 +97,8 @@ def verify_court(evidence: Any, candidate: Mapping[str, Any]) -> dict[str, Any]:
             "court evidence must be a structured object; a bare string is not a court",
             {"type": type(evidence).__name__},
             reason="COURT_INVALID")
+    if evidence.get("kind") == SENTINEL_COURT_KIND:
+        return verify_sentinel_court(evidence, candidate)
     required = ("independent_court", "mission_id", "stage", "source_head",
                 "candidate")
     missing = [k for k in required if k not in evidence]
