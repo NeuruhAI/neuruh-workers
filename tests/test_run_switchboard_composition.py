@@ -341,3 +341,51 @@ class ServiceBoardIsScopedToItsOwnLedger(unittest.TestCase):
         self.assertEqual(len(stub.packets), 1)
         self.assertEqual(len(service_board.events(EventType.COURT_PASSED)), 1)
         self.assertEqual(service_board.deadletters(), [])
+
+
+class ANarrowBoardLeavesCarriedMissionsAlone(unittest.TestCase):
+    """The dispatch bridge seals each mission through a board scoped to that ONE
+    mission (organ_consumers: known_missions={mission_id}), on the shared root
+    whose consumer cursors every board reads and advances. Live 2026-09-16
+    12:12:02Z: a continuation child's bridge board met its parent's still-pending
+    court.passed, deadlettered it UNKNOWN_MISSION and acked past it, so the
+    service board could never carry it, and the child's own dispatch refused as
+    DISPATCH_NOT_DURABLY_SEALED. Had the parent carried code custody, its Honey
+    Pot request would have been lost. An event for a mission this ledger already
+    carries belongs to the board that carries it: a narrower board neither
+    deadletters nor acks it."""
+
+    def setUp(self):
+        from tests.test_switchboard_court_request_contract import _Court
+        self.court = _Court("setUp")
+        self.court.setUp()
+        self.addCleanup(lambda: shutil.rmtree(self.court.tmp, ignore_errors=True))
+
+    def _pending_court_root(self):
+        from tests.test_switchboard_court_request_contract import MISSION, StubAdjudicator
+        world = self.court.world()
+        bridge_board = self.court.board(world, adjudicator=StubAdjudicator())
+        bridge_board.tick()
+        self.assertEqual(len(bridge_board.events(EventType.COURT_REQUESTED)), 1)
+        return bridge_board, MISSION
+
+    def test_a_board_scoped_to_another_mission_does_not_deadletter_a_carried_court(self):
+        from tests.test_switchboard_court_request_contract import StubAdjudicator
+        bridge_board, mission = self._pending_court_root()
+        narrow = Switchboard(bridge_board.root, receipts_dir=bridge_board.receipts_dir,
+                             known_missions=frozenset({"msn_0000000000000000000000000000c1d2"}),
+                             clock=fixed_clock(), adjudicator=StubAdjudicator())
+        report = narrow.tick()
+        self.assertEqual(report.deadlettered, [], report)
+        self.assertEqual(narrow.deadletters(), [])
+        # ...and the board that carries the mission still carries its court.
+        stub = StubAdjudicator(verdict="PASS")
+        args = Namespace(root=bridge_board.root, receipts=bridge_board.receipts_dir)
+        with mock.patch.object(rs, "sentinel_court_adjudicator", lambda: stub):
+            service_board = rs._board(args)
+        self.assertIn(mission, service_board.known_missions)
+        service_report = service_board.tick()
+        self.assertEqual(service_report.deadlettered, [], service_report)
+        self.assertEqual(len(stub.packets), 1)
+        self.assertEqual(len(service_board.events(EventType.COURT_PASSED)), 1)
+        self.assertEqual(service_board.deadletters(), [])
