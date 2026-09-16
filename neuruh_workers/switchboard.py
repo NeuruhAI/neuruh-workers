@@ -130,6 +130,27 @@ class AdjudicatorUnavailable(SwitchboardError):
     code = "SENTINEL_COURT_UNAVAILABLE"
 
 
+class CourtRecordUnbound(SwitchboardError):
+    """The organ answered, but the record it sealed does not answer THIS request.
+
+    Raised by the outcome verifier when a sealed record fails a check that is a
+    pure function of the record's own bytes and the request on the ledger: an
+    identity field that is not echoed, a verdict that differs from the projected
+    outcome, a canonical base or evidence digest other than the one requested, a
+    PASS with findings or without authority. Re-adjudicating cannot change any
+    of these -- the organ holds a ledger and replays the very same seal -- so
+    the board deadletters it ONCE, under CONTRADICTION, naming this code, the
+    field and the record on disk. The alternative, observed live on 2026-09-11
+    (T9 NB1), was three quiet re-adjudications and an anonymous MAX_RETRIES
+    deadletter that read like the board's patience rather than the cause.
+
+    A transient fault while ingesting (an unreadable file, a lock) is still a
+    plain SwitchboardError and still retries.
+    """
+
+    code = "SENTINEL_RECORD_UNBOUND"
+
+
 @dataclass
 class ConsumerSpec:
     consumer_id: str
@@ -692,7 +713,7 @@ class Switchboard:
         }
         for field, value in record_expected.items():
             if record.get(field) != value:
-                raise SwitchboardError(
+                raise CourtRecordUnbound(
                     f"Sentinel evidence {field} is not bound to the court request")
         # The organ seals verdicts this board does not ingest directly
         # (PASS_WITH_EXCEPTIONS). Where it projected one, the PROJECTION is what
@@ -706,7 +727,7 @@ class Switchboard:
         if isinstance(ingest, Mapping) and ingest.get("ingest_verdict"):
             verdict = str(ingest["ingest_verdict"])
         if verdict != ("PASS" if passed else "FAIL"):
-            raise SwitchboardError("Sentinel evidence verdict differs from outcome")
+            raise CourtRecordUnbound("Sentinel evidence verdict differs from outcome")
         court_id = record.get("court_id")
         if (
             not isinstance(court_id, str)
@@ -714,9 +735,9 @@ class Switchboard:
             or not court_id.startswith("court-")
             or any(char not in "0123456789abcdef" for char in court_id[6:])
         ):
-            raise SwitchboardError("Sentinel evidence court_id is missing")
+            raise CourtRecordUnbound("Sentinel evidence court_id is missing")
         if os.path.realpath(str(record.get("ref") or "")) != os.path.realpath(ref):
-            raise SwitchboardError("Sentinel evidence ref is not self-bound")
+            raise CourtRecordUnbound("Sentinel evidence ref is not self-bound")
         if (
             type(record.get("findings")) is not list
             or type(record.get("exceptions")) is not list
@@ -725,7 +746,7 @@ class Switchboard:
             or len(record["observed_sha"]) != 64
             or any(char not in "0123456789abcdef" for char in record["observed_sha"])
         ):
-            raise SwitchboardError(
+            raise CourtRecordUnbound(
                 "Sentinel evidence findings and observed digest are malformed")
         # Binding runs for EVERY verdict; only the relation and authority are
         # PASS-only. An unbound terminal FAIL forecloses the correct verdict just
@@ -738,7 +759,7 @@ class Switchboard:
                 or record["required_repairs"]
                 or record.get("base_relation") == "unverified"
             ):
-                raise SwitchboardError("Sentinel PASS carries findings or exceptions")
+                raise CourtRecordUnbound("Sentinel PASS carries findings or exceptions")
             self._require_observed_relation(record, court=court, source_head=source_head)
             iar = record.get("iar_provenance")
             binding = iar.get("binding") if isinstance(iar, Mapping) else None
@@ -755,7 +776,7 @@ class Switchboard:
                 or not isinstance(binding.get("ledger_sha256_prefix"), str)
                 or len(binding["ledger_sha256_prefix"]) < 4
             ):
-                raise SwitchboardError(
+                raise CourtRecordUnbound(
                     "Sentinel PASS lacks IAR authorization provenance")
         return {
             "kind": kind,
@@ -1064,6 +1085,19 @@ class Switchboard:
                 "detail": redact_secrets(str(exc)),
                 "attempt": attempt,
             })
+        except CourtRecordUnbound as exc:
+            # The organ was heard and its seal is on disk, but the seal does not
+            # answer this request. Nothing a retry can change: deadletter ONCE,
+            # under the cause and naming the record, and ack the event so the
+            # organ is not asked the same question two more times for the same
+            # answer (T9 NB1: three re-adjudications, then MAX_RETRIES).
+            self._deadletter_envelope(
+                envelope, DeadletterReason.CONTRADICTION,
+                f"{CourtRecordUnbound.code}: {exc}")
+            report.deadlettered.append(envelope["event_id"])
+            state["last_ack"] = seq
+            state["lease"] = None
+            state["attempt_count"] = 0
         except Exception as exc:  # noqa: BLE001 — receipted, never swallowed
             if attempt >= consumer.max_attempts:
                 self._deadletter_envelope(
@@ -1115,7 +1149,7 @@ class Switchboard:
         return None
 
     def _unroutable(self, consumer: ConsumerSpec, event_type: EventType) -> None:
-        raise SwitchboardError(
+        raise CourtRecordUnbound(
             f"consumer {consumer.consumer_id} cannot route {event_type.value}",
             {"reason": DeadletterReason.UNROUTABLE_EVENT.value})
 
@@ -1125,7 +1159,7 @@ class Switchboard:
             self._deadletter_envelope(
                 envelope, DeadletterReason.AUTHORITY_INVALID,
                 "consequential court dispatch requires authority")
-            raise SwitchboardError("authority invalid")
+            raise CourtRecordUnbound("authority invalid")
         params = {
             "mission": payload["mission"],
             "stage": payload["stage"],
@@ -1149,7 +1183,7 @@ class Switchboard:
             if receipt.receipt_type == ReceiptType.JOB_SUCCEEDED
         ]
         if state.status != JobStatus.SUCCEEDED or len(succeeded) != 1:
-            raise SwitchboardError(
+            raise CourtRecordUnbound(
                 "Sentinel court artifact job did not seal exactly one success")
         court_payload = {
             "court_job_id": enqueued,
@@ -1293,7 +1327,7 @@ class Switchboard:
         if line_start or line_end:
             lines = body.splitlines(keepends=True)
             if line_start < 1 or line_end < line_start or line_end > len(lines):
-                raise SwitchboardError(
+                raise CourtRecordUnbound(
                     f"evidence line range {line_start}..{line_end} is outside {path}")
             body = b"".join(lines[line_start - 1:line_end])
             entry["line_start"], entry["line_end"] = line_start, line_end
@@ -1314,17 +1348,17 @@ class Switchboard:
         court = envelope.get("payload_ref_or_payload") or {}
         record = self.adjudicator(json.loads(json.dumps(envelope)))
         if not isinstance(record, Mapping):
-            raise SwitchboardError("adjudicator returned no sealed record")
+            raise CourtRecordUnbound("adjudicator returned no sealed record")
         if (record.get("kind") != INDEPENDENT_COURT_KIND
                 or str(record.get("source_role") or "").upper() != "SENTINEL"
                 or record.get("independent") is not True):
-            raise SwitchboardError("adjudicator record is not an independent Sentinel court")
+            raise CourtRecordUnbound("adjudicator record is not an independent Sentinel court")
         court_id = str(record.get("court_id") or "")
         if not court_id.startswith("court-") or len(court_id) != 30:
-            raise SwitchboardError("adjudicator record has no court_id")
+            raise CourtRecordUnbound("adjudicator record has no court_id")
         verdict = str(record.get("verdict") or "")
         if verdict not in {"PASS", "PASS_WITH_EXCEPTIONS", "FAIL"}:
-            raise SwitchboardError("adjudicator record verdict is not PASS|PASS_WITH_EXCEPTIONS|FAIL")
+            raise CourtRecordUnbound("adjudicator record verdict is not PASS|PASS_WITH_EXCEPTIONS|FAIL")
         findings = [f for f in (record.get("findings") or []) if isinstance(f, Mapping)]
         blocking = {str(f.get("code")) for f in findings if f.get("severity", "blocking") == "blocking"}
         if verdict == "FAIL" and blocking and blocking <= _ENVIRONMENTAL_ONLY:
@@ -1345,13 +1379,13 @@ class Switchboard:
         # organ and another way here.
         ingest = record.get("switchboard_ingest")
         if not isinstance(ingest, Mapping):
-            raise SwitchboardError(
+            raise CourtRecordUnbound(
                 "adjudicator record carries no switchboard_ingest projection; the "
                 "PASS|FAIL projection is owned by the Sentinel organ and must arrive "
                 "with the record it projects")
         passed = ingest.get("switchboard_passed")
         if not isinstance(passed, bool):
-            raise SwitchboardError(
+            raise CourtRecordUnbound(
                 "switchboard_ingest.switchboard_passed is not a boolean; the board "
                 "does not infer a verdict the organ did not project")
 
@@ -1377,26 +1411,33 @@ class Switchboard:
                 prior = {}
             identity = ("verdict", "evidence_sha256", "observed_sha", "canonical_sha", "base_relation")
             if any(prior.get(key) != sealed.get(key) for key in identity):
-                raise SwitchboardError(f"court {court_id} was already sealed with a different verdict")
+                raise CourtRecordUnbound(f"court {court_id} was already sealed with a different verdict")
         _atomic_write(ref, text)
 
-        self._record_court_outcome_locked(
-            passed=passed,
-            court_job_id=str(court.get("court_job_id") or ""),
-            mission_id=envelope["mission_id"],
-            plan_id=envelope["plan_id"],
-            task_id=envelope["task_id"],
-            correlation_id=envelope["correlation_id"],
-            causation_id=envelope["event_id"],
-            source_head=envelope["source_head"],
-            authority_ref=envelope["authority_ref"],
-            source_repo=envelope["source_repo"],
-            receipt_ref=str(court.get("receipt_ref") or ""),
-            evidence={"kind": INDEPENDENT_COURT_KIND, "source_role": "SENTINEL",
-                      "independent": True, "ref": ref},
-            verdict_note=("independent Sentinel verdict carried by the court.requested "
-                          "consumer; Switchboard did not judge"),
-        )
+        try:
+            self._record_court_outcome_locked(
+                passed=passed,
+                court_job_id=str(court.get("court_job_id") or ""),
+                mission_id=envelope["mission_id"],
+                plan_id=envelope["plan_id"],
+                task_id=envelope["task_id"],
+                correlation_id=envelope["correlation_id"],
+                causation_id=envelope["event_id"],
+                source_head=envelope["source_head"],
+                authority_ref=envelope["authority_ref"],
+                source_repo=envelope["source_repo"],
+                receipt_ref=str(court.get("receipt_ref") or ""),
+                evidence={"kind": INDEPENDENT_COURT_KIND, "source_role": "SENTINEL",
+                          "independent": True, "ref": ref},
+                verdict_note=("independent Sentinel verdict carried by the court.requested "
+                              "consumer; Switchboard did not judge"),
+            )
+        except CourtRecordUnbound as exc:
+            # The seal is on disk and stays there; the deadletter names it so the
+            # refused verdict can be read, and the organ-side defect repaired,
+            # without re-running a court that would only replay the same seal.
+            raise CourtRecordUnbound(
+                f"{exc} [court_id={court_id} verdict={verdict} record={ref}]") from exc
 
         return None
 
@@ -1414,7 +1455,7 @@ class Switchboard:
         payload = court.get("payload_ref_or_payload") or {}
         requested = str(payload.get("evidence_sha256") or "")
         if requested and str(record.get("evidence_sha256") or "") != requested:
-            raise SwitchboardError(
+            raise CourtRecordUnbound(
                 "Sentinel verdict evidence_sha256 differs from the evidence the court requested")
         declared = str(payload.get("canonical_sha") or "").lower()
         canonical = str(record.get("canonical_sha") or "").lower()
@@ -1422,17 +1463,17 @@ class Switchboard:
         # so it cannot contradict the record. A PASS against it is refused outright
         # in _require_observed_relation, which is where that belongs.
         if declared and declared != _UNOBSERVED_BASE and canonical and canonical != declared:
-            raise SwitchboardError("Sentinel verdict judged a different canonical base than was requested")
+            raise CourtRecordUnbound("Sentinel verdict judged a different canonical base than was requested")
         if passed:
             # Only a PASS must be positively bound: the organ's honest NO_EVIDENCE
             # FAIL legitimately binds nothing and carries no observed digest.
             # observed_sha is already required to be 64-hex on EVERY record by
             # _require_independent_court_evidence; only boundness is PASS-specific.
             if not record.get("evidence_refs"):
-                raise SwitchboardError("Sentinel PASS names no bound evidence")
+                raise CourtRecordUnbound("Sentinel PASS names no bound evidence")
         elif not (record.get("findings") or record.get("exceptions")
                   or record.get("required_repairs")):
-            raise SwitchboardError("Sentinel FAIL names no finding, exception or repair")
+            raise CourtRecordUnbound("Sentinel FAIL names no finding, exception or repair")
 
     def _require_observed_relation(self, record: Mapping[str, Any], *, court: Mapping[str, Any],
                                    source_head: str) -> None:
@@ -1457,7 +1498,7 @@ class Switchboard:
         gaps = [str(gap) for gap in (payload.get("binding_gaps") or [])]
         remote_observed = binding.get("canonical_base_observed_on_remote") is True
         if relation not in _VERIFIED_RELATIONS:
-            raise SwitchboardError(f"Sentinel PASS relation {relation!r} is not a verified relation")
+            raise CourtRecordUnbound(f"Sentinel PASS relation {relation!r} is not a verified relation")
         # The board's own observation is the only ground a PASS may stand on. A
         # request that named the canonical_base gap, or declared the unobserved
         # sentinel, or carries no 40-hex base at all, read nothing off the remote
@@ -1465,7 +1506,7 @@ class Switchboard:
         # coherent it is. Each clause stands alone: a gap named beside a base is a
         # contradiction, and the sentinel without a gap is still no observation.
         if "canonical_base" in gaps or declared == _UNOBSERVED_BASE or not _looks_head(declared):
-            raise SwitchboardError(
+            raise CourtRecordUnbound(
                 "Sentinel PASS rests on a canonical base this board never observed")
         # A record that CLAIMS observation must show it. Without this, the whole
         # proof of an observed base was one boolean the judged party set itself:
@@ -1473,18 +1514,18 @@ class Switchboard:
         # enough to carry a PASS whose canonical_sha equalled the candidate -- the
         # 2026-09-04 shape exactly.
         if remote_observed and not _looks_head(observed_base):
-            raise SwitchboardError(
+            raise CourtRecordUnbound(
                 "Sentinel PASS claims an observed canonical base but names no observed sha")
         if canonical == source_head and not remote_observed:
-            raise SwitchboardError(
+            raise CourtRecordUnbound(
                 "Sentinel PASS asserts the candidate is its own canonical base without "
                 "an observed remote ref; equality by construction is not a relation")
         if remote_observed and observed_base and canonical != observed_base:
-            raise SwitchboardError("Sentinel PASS canonical_sha is not the base it observed")
+            raise CourtRecordUnbound("Sentinel PASS canonical_sha is not the base it observed")
         # `declared` is now known to be a base this board read; the record must
         # have judged exactly that one.
         if canonical != declared:
-            raise SwitchboardError("Sentinel PASS judged a different canonical base than was requested")
+            raise CourtRecordUnbound("Sentinel PASS judged a different canonical base than was requested")
 
     def _on_court_passed(self, envelope: dict) -> str | None:
         if envelope.get("authority_ref") in {"", "unsigned", "none"}:
@@ -1695,6 +1736,33 @@ def _aggregate_evidence_sha256(item_shas) -> str:
     """One digest over the set of per-item digests; order-independent (matches the organ)."""
     return hashlib.sha256(
         json.dumps(sorted(str(s) for s in item_shas), separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def missions_sealed_on_ledger(root: str) -> frozenset[str]:
+    """Missions whose receipts a board on this root already admitted and sealed.
+
+    The mission gate is applied once, at admission (validate_receipt against
+    known_missions). Every later event for that mission -- court.requested,
+    court.passed, court.failed -- was emitted by the board itself, after that
+    gate. A composition root that opens the same ledger with a narrower static
+    scope (scripts/run_switchboard.py, whose default is DEFAULT_MISSIONS) used
+    to deadletter those events UNKNOWN_MISSION on its first tick, before the
+    organ was ever called (T9 NB2, 2026-09-11: the dispatch bridge seals under
+    known_missions={mission_id} and ticks once; the launchd tick root then
+    destroyed every FR mission's court.requested). Nothing here is invented:
+    the set is read off the ledger the root is about to consume.
+    """
+    path = os.path.join(root, EVENTS_NAME)
+    if not os.path.isfile(path):
+        return frozenset()
+    sealed: set[str] = set()
+    for receipt in ExecutionLedger(path).receipts(EVENT_JOB):
+        payload = receipt.payload or {}
+        if payload.get("event_type") == EventType.RECEIPT_SEALED.value:
+            mission = str(payload.get("mission_id") or "")
+            if mission and mission != "UNKNOWN":
+                sealed.add(mission)
+    return frozenset(sealed)
 
 
 def observe_canonical_base_via_git(worktree: str, remote: str, base_ref: str) -> tuple[str, str]:
