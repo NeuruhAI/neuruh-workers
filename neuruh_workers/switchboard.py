@@ -1015,6 +1015,16 @@ class Switchboard:
             (r.seq, dict(r.payload))
             for r in self.event_ledger.receipts(EVENT_JOB)
         ]
+        # Missions this ledger already carries. Consumer cursors live in the shared
+        # root, so a board scoped narrower than the ledger (the dispatch bridge seals
+        # through a board scoped to ONE mission) must not deadletter or ack past an
+        # event that belongs to a mission the ledger carries: the board that carries
+        # it has to be able to deliver it.
+        carried = frozenset(
+            envelope.get("mission_id") for _seq, envelope in all_events
+            if envelope.get("event_type") in _MISSION_BEARING_EVENTS
+            and isinstance(envelope.get("mission_id"), str) and envelope.get("mission_id")
+        )
         for consumer in self.consumers:
             state = self._consumer_state(consumer.consumer_id)
             lease = state.get("lease")
@@ -1033,6 +1043,15 @@ class Switchboard:
                 if envelope.get("event_type") != consumer.event_type.value:
                     continue
                 mission = envelope.get("mission_id")
+                if (
+                    consumer.mission_scope is not None
+                    and mission not in consumer.mission_scope
+                    and mission in carried
+                ):
+                    # Not this board's mission, but this ledger's: leave it (and
+                    # everything after it for this consumer) to the board that
+                    # carries it. Never deadletter it, never advance the cursor.
+                    break
                 if consumer.mission_scope is not None and mission not in consumer.mission_scope:
                     self._deadletter_envelope(
                         envelope, DeadletterReason.UNKNOWN_MISSION,
