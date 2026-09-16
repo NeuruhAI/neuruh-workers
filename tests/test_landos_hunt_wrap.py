@@ -15,7 +15,6 @@ from neuruh_workers.landos_hunt import (
     landos_hunt_job_id_from_step_results,
     post_hunt,
 )
-from neuruh_workers.organ_consumers import _fr_dispatch_receipt_text
 from neuruh_workers.registry import StepContext
 from tests.helpers import make_stack
 
@@ -72,7 +71,8 @@ class LandosHuntWrapTests(unittest.TestCase):
         self.assertEqual(spec["steps"][0]["capability"], CAPABILITY_ID)
 
     @mock.patch.dict(os.environ, {"NVE_LAND_TOKEN": "test-token"}, clear=False)
-    def test_execute_persists_landos_job_id_in_step_result(self):
+    def test_execute_persists_landos_job_id_in_fr_jobqueue_outcome_shape(self):
+        """LandOS job_id lands in JobQueue STEP_SUCCEEDED result (FR outcome vocabulary)."""
         landos_jid = "a91adc8d-a541-48dc-b48e-681c237a5cf9"
 
         def fake_open(request, timeout=None):
@@ -107,32 +107,13 @@ class LandosHuntWrapTests(unittest.TestCase):
             r for r in stack.ledger.receipts(job_id)
             if r.receipt_type == ReceiptType.STEP_SUCCEEDED
         ]
+        # Existing FR/JobQueue outcome shape: job_id in STEP_SUCCEEDED result.
         self.assertEqual(succeeded[-1].payload["result"]["job_id"], landos_jid)
-
-    def test_fr_dispatch_receipt_carries_landos_job_id_field(self):
-        landos_jid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-        text = _fr_dispatch_receipt_text(
-            mission_id="msn_test",
-            mission_version=1,
-            work_spec_sha256="a" * 64,
-            idempotency_key="idem",
-            dispatch_result="SUCCEEDED",
-            job_id="workers-job-1",
-            ledger_tail_sha="b" * 64,
-            context_digest="c" * 64,
-            evidence_refs=("ref-1",),
-            job_succeeded_sha="d" * 64,
-            source_head="e" * 40,
-            source_branch="main",
-            source_worktree="/tmp/wt",
-            authority_ref="fr-api-v1:approval:x:work-spec:" + ("a" * 64),
-            code_custody_required=False,
-            extra_fields={LANDOS_HUNT_JOB_ID_FIELD: landos_jid},
+        self.assertEqual(
+            succeeded[-1].payload["result"][LANDOS_HUNT_JOB_ID_FIELD], landos_jid
         )
-        self.assertIn(f"{LANDOS_HUNT_JOB_ID_FIELD}={landos_jid}", text)
-        # Existing FR outcome shape still present (workers job id).
-        self.assertIn("JOB_ID=workers-job-1", text)
-        self.assertIn("TASK_ID=workers-job-1", text)
+        # Workers execution_id remains the JobQueue job id (distinct from LandOS job_id).
+        self.assertNotEqual(job_id, landos_jid)
 
     def test_create_hunt_fail_closed_without_token(self):
         ctx = StepContext(
