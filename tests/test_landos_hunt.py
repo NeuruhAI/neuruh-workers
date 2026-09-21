@@ -33,11 +33,12 @@ class LandosHuntRegistrationTests(unittest.TestCase):
         bind_landos_hunt_workers(registry, catalog)
         cap = registry.resolve(CAPABILITY_ID)
         self.assertEqual(cap.name, "landos.hunt.create")
-        self.assertTrue(cap.read_only)
+        # POST /hunt creates a hunt job: mutating, never auto-executed.
+        self.assertFalse(cap.read_only)
         self.assertFalse(cap.external)
         wf = catalog.get(WORKFLOW_NAME)
         self.assertEqual(wf.name, "landos-hunt")
-        self.assertTrue(wf.read_only)
+        self.assertFalse(wf.read_only)
         self.assertEqual(wf.steps[0].capability, CAPABILITY_ID)
 
     def test_default_stack_resolves_capability(self):
