@@ -4,11 +4,12 @@ CAPABILITY_ID = landos.hunt.create
 WORKFLOW_NAME = landos-hunt
 
 This is a WRAP of the existing LandOS loopback organ (POST /hunt), not a new
-scheduler. FR DispatchBridge auto-executes only read_only workflows;
-external=True capabilities cannot register without EXTERNAL_AUTHORIZATION_SENTINEL.
-Local organ consume is therefore declared read_only=True, external=False — same
-rationale as the dead Cloud Agent bc-686fb375 notes and the switchboard artifact
-workers (loopback/organ, not an open external mutation lane).
+scheduler. POST /hunt creates a hunt job in LandOS: it mutates organ state, so
+the capability and the workflow are declared read_only=False. FR DispatchBridge
+auto-executes only read_only workflows; this one stops at
+GOVERNANCE_SENTINEL_AXON_REQUIRED (NON_READ_ONLY_WORKFLOW), so every hunt needs
+founder approval, and a continuation child can never bind it. external=False
+stays true: the organ is loopback, not an external lane.
 
 ECONOMIC_LINK: organism-driven national Hunt
 efxow_APPLY=NO; mint stays human GO; organism proof stops at hunt_job_id.
@@ -144,13 +145,13 @@ def bind_landos_hunt_workers(
     registry.register_worker(WorkerDeclaration(
         worker_id=WORKER_ID,
         description="WRAP LandOS POST /hunt (local organ). Returns hunt_job_id "
-                    "into FR execution-outcome. read_only/external flags follow "
-                    "DispatchBridge auto-exec + EXTERNAL_AUTHORIZATION_SENTINEL rules.",
+                    "into FR execution-outcome. Mutating, so read_only=False: "
+                    "DispatchBridge never auto-executes it.",
         capabilities=(
             Capability(
                 name=CAPABILITY_ID,
                 description="Create a LandOS Hunt job via POST /hunt (auth_hunt)",
-                read_only=True,
+                read_only=False,
                 external=False,
                 execute=create_hunt,
             ),
@@ -160,7 +161,7 @@ def bind_landos_hunt_workers(
         name=WORKFLOW_NAME,
         version=WORKFLOW_VERSION,
         description="FR→JobQueue WRAP that POSTs LandOS /hunt and yields hunt_job_id.",
-        read_only=True,
+        read_only=False,
         steps=(
             StepDefinition(
                 step_id="create_hunt",

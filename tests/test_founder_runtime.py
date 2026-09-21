@@ -1002,6 +1002,28 @@ class FounderRuntimeCourt(unittest.TestCase):
                 self.assertTrue(result.broker_bind["attempted"])
                 self.assertEqual(result.broker_bind["calls"][0]["url"], GOVERNANCE_EVALUATE_URL)
 
+    def test_landos_hunt_is_never_auto_executed(self):
+        # POST /hunt mutates LandOS. An APPROVED + execution_authorized ticket
+        # with every consequential flag false must still stop at GSA: the
+        # workflow's own read_only=False is the gate, not the caller's flags.
+        candidate = self.property_candidate(
+            candidate_id="landos-hunt-court-v1",
+            workflow_name="landos-hunt",
+            params={"territory": [{"fips": "26021"}]},
+            evidence_refs=("workflow:landos-hunt@1.0.0",),
+        )
+        ticket, candidate = self.authorized_pair("JGI-LANDOS-HUNT", candidate)
+        with patch(
+            "neuruh_workers.landos_hunt.http_post_json",
+            side_effect=AssertionError("POST /hunt must not run without approval"),
+        ):
+            result = self.runtime.dispatch(ticket, [candidate])
+        self.assertEqual(result.status, RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED)
+        self.assertEqual(result.founder_gate_reasons, ("NON_READ_ONLY_WORKFLOW",))
+        self.assertIsNone(result.job_id)
+        self.assertFalse(result.broker_bind["caller_approved"])
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
     def test_model_layer_routes_to_broker_instead_of_self_authorizing(self):
         candidate = self.property_candidate(
             layer=IntelligenceLayer.L4,
