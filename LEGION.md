@@ -49,7 +49,7 @@ staged units (content-addressed, sha sealed in the job)
 
 - `scale-probe@1.0.0` — synthetic work with injectable faults (`raise_once`,
   `raise_always`, `hang_once`). Used by the scale court.
-- `opportunity-analyst@1.0.0` — one agent per Lead Recipe OS opportunity. It
+- `opportunity-analyst@1.1.0` — one agent per Lead Recipe OS opportunity. It
   scores distress stacking from the record's own signals, excludes government
   owners, keeps equity `UNKNOWN`, names the evidence gap that blocks each recipe,
   and marks every row `contact: NOT_AUTHORIZED`. The final output is an

@@ -98,7 +98,8 @@ def cmd_launch(a) -> int:
     count_path = os.path.join(a.root, "units", f"{a.units}.jsonl")
     with open(count_path, encoding="utf-8") as fh:
         count = sum(1 for line in fh if line.strip())
-    params = {"mission": a.mission, "profile": a.profile, "unit_manifest_sha": a.units,
+    params = {"mission": a.mission, "profile": a.profile,
+              "profile_version": PROFILES[a.profile].version, "unit_manifest_sha": a.units,
               "unit_count": count, "max_agents": a.max_agents, "max_parallel": a.max_parallel,
               "squad_size": a.squad_size, "cohort_size": a.cohort_size,
               "agent_timeout_s": a.agent_timeout_s, "max_attempts": a.max_attempts,

@@ -182,8 +182,15 @@ def _analyst_run(ctx: AgentContext, unit: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+TIER_ORDER = {"A": 0, "B": 1, "C": 2, "D": 3, "EXCLUDED_GOVERNMENT": 4}
+# Sources that cost money per call: shown in the unlock map, never called here.
+PAID_SOURCES = {"batchdata", "regrid", "reportall", "tracerfy", "attom", "propstream"}
+
+
 def _rank_key(r: Mapping[str, Any]):
-    return (-r["legion_priority"], r["opportunity_id"])
+    # Tier first: a $1,650 scrap lot with many flags must not outrank a
+    # corroborated, valued tier-A property.
+    return (TIER_ORDER.get(r["tier"], 9), -r["legion_priority"], r["opportunity_id"])
 
 
 def _slim(r: Mapping[str, Any]) -> dict[str, Any]:
@@ -224,7 +231,9 @@ def _merge(summaries: list[Mapping[str, Any]]) -> dict[str, Any]:
 def _analyst_reduce_squad(results: list[Mapping[str, Any]]) -> dict[str, Any]:
     leaf = []
     for r in results:
-        opportunity_gaps_by_source = Counter({g["source_id"] for g in r["evidence_gaps"]})
+        opportunity_gaps_by_source = Counter({
+            g["source_id"] if g["source_id"] != "UNSOURCED"
+            else f"UNSOURCED:{g['signal_id']}" for g in r["evidence_gaps"]})
         leaf.append({
             "n": 1, "tiers": {r["tier"]: 1}, "counties": {r["county"]: 1},
             "distress_groups": dict(Counter(r["distress_groups"])),
@@ -253,7 +262,11 @@ def _analyst_finalize(summaries, meta) -> dict[str, Any]:
         "top_opportunities": total["top"],
         "top_by_county": total["by_county"],
         "evidence_unlock_map": [
-            {"source_id": s, "opportunities_blocked": c} for s, c in unlock[:15]],
+            {"source_id": s, "opportunities_blocked": c,
+             "access": ("NO_SOURCE_REGISTERED" if s.startswith("UNSOURCED:")
+                        else "PAID_FOUNDER_GATE" if s.split(".")[0] in PAID_SOURCES
+                        else "FREE_OR_PUBLIC")}
+            for s, c in unlock[:20]],
         "evidence_signals_most_missing": sorted(
             total["evidence_signals"].items(), key=lambda kv: (-kv[1], kv[0]))[:15],
         "laws": [
@@ -267,7 +280,7 @@ def _analyst_finalize(summaries, meta) -> dict[str, Any]:
 
 
 OPPORTUNITY_ANALYST = AgentProfile(
-    name="opportunity-analyst", version="1.0.0",
+    name="opportunity-analyst", version="1.1.0",
     description="One read-only analyst agent per Lead Recipe OS opportunity.",
     run=_analyst_run, reduce_squad=_analyst_reduce_squad,
     reduce_cohort=_merge, finalize=_analyst_finalize)

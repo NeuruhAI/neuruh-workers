@@ -270,7 +270,25 @@ class OpportunityAnalyst(LegionCase):
             self.assertEqual(row["contact"], "NOT_AUTHORIZED")
             self.assertTrue(row["equity"].startswith("UNKNOWN"))
         self.assertEqual(out["evidence_unlock_map"][0],
-                         {"source_id": "court.nc.ecourts_portal", "opportunities_blocked": 1})
+                         {"source_id": "court.nc.ecourts_portal", "opportunities_blocked": 1,
+                          "access": "FREE_OR_PUBLIC"})
+
+    def test_tier_outranks_raw_priority_and_gaps_are_labelled(self):
+        units = self.units() + [
+            lro_opportunity("opp_scrap", "37183", {
+                "tax.delinquent": sig(), "heirship.unresolved": sig(),
+                "absentee.out_of_state": sig(), "ownership.trust_or_estate": sig(),
+                "transfer.tenure_years": sig(40.0), "valuation.assessed_value": sig(1650.0)},
+                [{"recipe_id": "r1", "decision": "UNKNOWN", "qualification": "NEEDS_EVIDENCE",
+                  "nbe_top": {"signal_id": "obituary.match", "source_id": None}},
+                 {"recipe_id": "r2", "decision": "UNKNOWN", "qualification": "NEEDS_EVIDENCE",
+                  "nbe_top": {"signal_id": "equity.estimated_pct", "source_id": "batchdata"}}])]
+        out = self.run_legion(units, OPPORTUNITY_ANALYST).final_output["output"]
+        ranked = [r["opportunity_id"] for r in out["top_opportunities"]]
+        self.assertLess(ranked.index("opp_a"), ranked.index("opp_scrap"))
+        access = {e["source_id"]: e["access"] for e in out["evidence_unlock_map"]}
+        self.assertEqual(access["UNSOURCED:obituary.match"], "NO_SOURCE_REGISTERED")
+        self.assertEqual(access["batchdata"], "PAID_FOUNDER_GATE")
         self.assertEqual(sorted(out["top_by_county"]), ["Durham", "Union", "Wake"])
 
 
@@ -306,6 +324,7 @@ class WorkersIntegration(LegionCase):
 
     def params(self, staged, profile="scale-probe", **extra):
         return {"mission": "court", "profile": profile,
+                "profile_version": PROFILES[profile].version,
                 "unit_manifest_sha": staged["unit_manifest_sha"],
                 "unit_count": staged["unit_count"], "legion_root": self.root, **extra}
 
@@ -325,6 +344,15 @@ class WorkersIntegration(LegionCase):
         self.assertLess(ledger.verify()["receipts"], 20)
         self.assertEqual(queue.enqueue(catalog.get("legion-mission"), self.params(staged),
                                        requested_by="founder"), job)
+
+    def test_stale_profile_version_is_refused(self):
+        staged = stage_units(synthetic(10), self.root)
+        ledger, catalog, queue, runner = self.stack()
+        job = queue.enqueue(catalog.get("legion-mission"),
+                            {**self.params(staged), "profile_version": "0.9.0"},
+                            requested_by="founder")
+        self.assertEqual(runner.execute(job).status, JobStatus.FAILED)
+        self.assertEqual(self.step_errors(ledger, job)[-1]["error_code"], "LEGION_SPEC_DRIFT")
 
     def test_all_legion_capabilities_are_read_only_and_internal(self):
         registry, catalog = WorkerRegistry(), WorkflowCatalog()

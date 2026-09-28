@@ -82,6 +82,12 @@ def _spec_from_params(params: Mapping[str, Any]) -> LegionSpec:
     profile = PROFILES.get(params.get("profile", ""))
     if profile is None:
         raise LegionRefused("unknown legion profile", {"profile": params.get("profile")})
+    # The version is part of job identity: without it a changed profile would
+    # dedupe onto (and silently serve) the old profile's sealed job.
+    if params.get("profile_version") != profile.version:
+        raise LegionSpecDrift("job profile_version does not match the installed profile",
+                              {"job": params.get("profile_version"),
+                               "installed": profile.version})
     return LegionSpec(
         mission=params["mission"], profile=profile.name,
         profile_version=profile.version,
@@ -204,15 +210,21 @@ def _render_md(final: Mapping[str, Any], cognition: Mapping[str, Any], mission_j
             av = f"${r['assessed_value']:,.0f}" if isinstance(r.get("assessed_value"), (int, float)) else "?"
             ow = f"${r['tax_owed']:,.2f}" if isinstance(r.get("tax_owed"), (int, float)) else "?"
             lines.append(f"| {i} | {r['tier']} | {r['legion_priority']} | {r['county']} | "
-                         f"{r.get('address') or '?'} | {av} | {ow} | {', '.join(r['distress_groups'])} |")
+                         f"{r.get('address') or r.get('subject') or '?'} | {av} | {ow} | {', '.join(r['distress_groups'])} |")
         if notes:
             lines += ["", "## Advisory notes (local model, validated)", ""]
             for r in out["top_opportunities"]:
                 n = notes.get(r["opportunity_id"])
                 if n:
                     lines.append(f"- **{r.get('address')}** - {n['narrative']}")
-        lines += ["", "## Evidence unlock map (one source -> opportunities it would move)", ""]
-        lines += [f"- `{e['source_id']}` - {e['opportunities_blocked']:,}"
+        lines += ["", "## Top by county", ""]
+        for county, rows in out["top_by_county"].items():
+            lines.append(f"**{county}**")
+            lines += [f"- {r['tier']} {r['legion_priority']} - {r.get('address') or r.get('subject') or '?'} "
+                      f"({', '.join(r['distress_groups'])})" for r in rows]
+            lines.append("")
+        lines += ["## Evidence unlock map (one source -> opportunities it would move)", ""]
+        lines += [f"- `{e['source_id']}` - {e['opportunities_blocked']:,} [{e['access']}]"
                   for e in out["evidence_unlock_map"]]
         lines += ["", "## Laws", ""] + [f"- {law}" for law in out["laws"]]
     else:
