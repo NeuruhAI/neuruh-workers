@@ -1,6 +1,6 @@
 """Legion: governed mass fan-out of read-only agents to ONE sealed output.
 
-See LEGION.md.  Entry points: ``Legion`` (runtime), ``PROFILES`` (what an
+See docs/legion/LEGION.md.  Entry points: ``Legion`` (runtime), ``PROFILES`` (what an
 agent does), ``register_legion`` (the ``legion-mission@1.0.0`` Workers job).
 """
 from .journal import LegionJournal, verify_journal
