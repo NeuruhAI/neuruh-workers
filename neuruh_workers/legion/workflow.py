@@ -216,7 +216,7 @@ def _render_md(final: Mapping[str, Any], cognition: Mapping[str, Any], mission_j
             for r in out["top_opportunities"]:
                 n = notes.get(r["opportunity_id"])
                 if n:
-                    lines.append(f"- **{r.get('address')}** - {n['narrative']}")
+                    lines.append(f"- **{r.get('address') or r.get('subject') or '?'}** - {n['narrative']}")
         lines += ["", "## Top by county", ""]
         for county, rows in out["top_by_county"].items():
             lines.append(f"**{county}**")
