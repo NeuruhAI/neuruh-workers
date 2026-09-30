@@ -20,6 +20,7 @@ from neuruh_workers.legion import (
 )
 from neuruh_workers.legion.profiles import OPPORTUNITY_ANALYST, SCALE_PROBE
 from neuruh_workers.legion.runtime import AgentProfile, LegionCrashInjected
+from neuruh_workers.legion.workflow import _render_md
 from neuruh_workers.registry import WorkerRegistry
 
 
@@ -290,6 +291,32 @@ class OpportunityAnalyst(LegionCase):
         self.assertEqual(access["UNSOURCED:obituary.match"], "NO_SOURCE_REGISTERED")
         self.assertEqual(access["batchdata"], "PAID_FOUNDER_GATE")
         self.assertEqual(sorted(out["top_by_county"]), ["Durham", "Union", "Wake"])
+
+    def no_address_final(self):
+        # opp_a (tier A, Wake) has no address, like the Cabarrus/Durham/Johnston/Union rows
+        # in the 2026-09-28 live brief that rendered as "?"
+        units = self.units()
+        units[0] = {**units[0], "identity": {"address": None, "owner_pattern": "PERSON"}}
+        return self.run_legion(units, OPPORTUNITY_ANALYST).final_output
+
+    def test_missing_address_falls_back_to_parcel_subject(self):
+        final = self.no_address_final()
+        row = next(r for r in final["output"]["top_opportunities"]
+                   if r["opportunity_id"] == "opp_a")
+        self.assertIsNone(row["address"])
+        self.assertEqual(row["subject"], "parcel:37183:opp_a")
+        md = _render_md(final, {}, "job-court")
+        self.assertRegex(md, r"\n\| 1 \| A \| [0-9.]+ \| Wake \| parcel:37183:opp_a \| ")
+        self.assertRegex(md, r"\n- A [0-9.]+ - parcel:37183:opp_a \(")
+        self.assertIn("| opp_b MAIN ST |", md)
+        self.assertNotIn("None", md.split("## Evidence unlock map")[0])
+
+    def test_advisory_note_without_address_names_the_parcel(self):
+        final = self.no_address_final()
+        note = {"opportunity_id": "opp_a", "status": "ADVISORY", "narrative": "Verify probate."}
+        md = _render_md(final, {"notes": [note]}, "job-court")
+        self.assertIn("- **parcel:37183:opp_a** - Verify probate.", md)
+        self.assertNotIn("**None**", md)
 
 
 class FakeIAR(http.server.BaseHTTPRequestHandler):
