@@ -45,12 +45,16 @@ from neuruh_workers.organ_consumers import (
     honey_pot_bind,
     pull_dispatchable_tickets,
     switchboard_present,
+    _canonical_observer_for,
     _write_immutable,
 )
 from neuruh_workers.prime_receipts import parse_prime_receipt
 from neuruh_workers.queue import JobQueue
 from neuruh_workers.runner import WorkflowRunner
-from neuruh_workers.switchboard import INDEPENDENT_COURT_KIND, SwitchboardError
+from neuruh_workers.switchboard import (
+    AdjudicatorUnavailable,
+    INDEPENDENT_COURT_KIND, SwitchboardError, observe_canonical_base_via_git,
+)
 from neuruh_workers.switchboard_jobs import (
     GIT_PUSH,
     HONEY_POT_WORKFLOW,
@@ -58,6 +62,7 @@ from neuruh_workers.switchboard_jobs import (
     SENTINEL_WORKFLOW,
 )
 from neuruh_workers.workflows import build_catalog, build_registry
+from tests.canonical_fixture import OfflineCanonical
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -106,6 +111,10 @@ class FounderRuntimeCourt(unittest.TestCase):
             "-C", self.source_root, "remote", "add", "origin",
             "https://github.com/NeuruhAI/neuruh-workers.git",
         )
+        # The identity check pins origin to GitHub, which no court tick may read.
+        # The canonical base is observed on an offline mirror of that origin.
+        self.canonical = OfflineCanonical.mirror(
+            self.tmp.name, self.source_root, remote_name="canonical-fixture")
         self.default_work_spec = {
             "schema": "fr.work_spec.v1",
             "candidate_id": "property-research-existing-v1",
@@ -211,7 +220,21 @@ class FounderRuntimeCourt(unittest.TestCase):
             source_root=self.source_root,
             http_open=self.health_opener,
             fr_token="court-token",
+            canonical_observer=self.canonical.observe,
+            # No organ is consulted in this court. Without an injected adjudicator
+            # the bridge's Switchboard gets the production one -- a loopback HTTP
+            # client to whatever organ is LIVE on this host -- and this suite's
+            # verdicts then depend on that process (2026-09-14: a live organ at
+            # 127.0.0.1:18731 sealed a real FAIL for the fixture and the
+            # idempotency court returned BLOCKED). The court stays open, named,
+            # exactly as with an unreachable organ; nothing is scored.
+            adjudicator=self.no_organ,
         )
+
+    @staticmethod
+    def no_organ(envelope):
+        raise AdjudicatorUnavailable(
+            "no independent Sentinel organ is consulted in the founder-runtime court")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -255,6 +278,13 @@ class FounderRuntimeCourt(unittest.TestCase):
 
     def sentinel_evidence(self, sealed, court, *, passed=True):
         path = os.path.join(self.tmp.name, "independent-sentinel.json")
+        request = court["payload_ref_or_payload"] or {}
+        # The base is the one the BOARD read (or the unobserved sentinel, stated
+        # as unobserved); the stub never invents an observation.
+        canonical = str(request.get("canonical_sha") or sealed["source_head"]).lower()
+        observed = request.get("canonical_base_observed") is True
+        relation = ("candidate_is_canonical_base" if canonical == sealed["source_head"]
+                    else "candidate_descends_from_canonical_base")
         record = {
             "kind": INDEPENDENT_COURT_KIND,
             "source_role": "SENTINEL",
@@ -269,7 +299,7 @@ class FounderRuntimeCourt(unittest.TestCase):
             "receipt_ref": sealed["payload_ref_or_payload"]["receipt_ref"],
             "receipt_sha": sealed["payload_ref_or_payload"]["receipt_sha"],
             "candidate_sha": sealed["source_head"],
-            "canonical_sha": sealed["source_head"],
+            "canonical_sha": canonical,
             "plan_id": sealed["plan_id"],
             "task_id": sealed["task_id"],
             "correlation_id": sealed["correlation_id"],
@@ -281,7 +311,16 @@ class FounderRuntimeCourt(unittest.TestCase):
             "observed_sha": hashlib.sha256(
                 Path(sealed["payload_ref_or_payload"]["receipt_ref"]).read_bytes()
             ).hexdigest(),
-            "base_relation": "equal",
+            "base_relation": relation,
+            "base_binding": {
+                "relation": relation,
+                "independently_observed": observed,
+                "canonical_base_observed_on_remote": observed,
+                "observed_base_sha": canonical if observed else "",
+                "detail": "test fixture: base taken from the court request",
+            },
+            "evidence_refs": [sealed["payload_ref_or_payload"]["receipt_ref"]],
+            "evidence_sha256": (court["payload_ref_or_payload"] or {}).get("evidence_sha256", ""),
             "findings": [] if passed else [{"code": "TEST_FAIL"}],
             "exceptions": [],
             "required_repairs": [] if passed else ["repair test failure"],
@@ -662,6 +701,8 @@ class FounderRuntimeCourt(unittest.TestCase):
             source_root=self.source_root,
             http_open=self.health_opener,
             fr_token="court-token",
+            canonical_observer=self.canonical.observe,
+            adjudicator=self.no_organ,
         )
         third = reopened_runtime.dispatch(
             self.mission(), [self.property_candidate()])
@@ -773,6 +814,8 @@ class FounderRuntimeCourt(unittest.TestCase):
             http_open=lambda _request, timeout=None: (_ for _ in ()).throw(
                 OSError("Founder Runtime unavailable")),
             fr_token="court-token",
+            canonical_observer=self.canonical.observe,
+            adjudicator=self.no_organ,
         )
         result = runtime.dispatch(self.mission(), [self.property_candidate()])
         self.assertEqual(result.status, RuntimeStatus.BLOCKED)
@@ -959,6 +1002,28 @@ class FounderRuntimeCourt(unittest.TestCase):
                 self.assertTrue(result.broker_bind["attempted"])
                 self.assertEqual(result.broker_bind["calls"][0]["url"], GOVERNANCE_EVALUATE_URL)
 
+    def test_landos_hunt_is_never_auto_executed(self):
+        # POST /hunt mutates LandOS. An APPROVED + execution_authorized ticket
+        # with every consequential flag false must still stop at GSA: the
+        # workflow's own read_only=False is the gate, not the caller's flags.
+        candidate = self.property_candidate(
+            candidate_id="landos-hunt-court-v1",
+            workflow_name="landos-hunt",
+            params={"territory": [{"fips": "26021"}]},
+            evidence_refs=("workflow:landos-hunt@1.0.0",),
+        )
+        ticket, candidate = self.authorized_pair("JGI-LANDOS-HUNT", candidate)
+        with patch(
+            "neuruh_workers.landos_hunt.http_post_json",
+            side_effect=AssertionError("POST /hunt must not run without approval"),
+        ):
+            result = self.runtime.dispatch(ticket, [candidate])
+        self.assertEqual(result.status, RuntimeStatus.GOVERNANCE_SENTINEL_AXON_REQUIRED)
+        self.assertEqual(result.founder_gate_reasons, ("NON_READ_ONLY_WORKFLOW",))
+        self.assertIsNone(result.job_id)
+        self.assertFalse(result.broker_bind["caller_approved"])
+        self.assertEqual(self.ledger.verify()["receipts"], 0)
+
     def test_model_layer_routes_to_broker_instead_of_self_authorizing(self):
         candidate = self.property_candidate(
             layer=IntelligenceLayer.L4,
@@ -1011,6 +1076,8 @@ class FounderRuntimeCourt(unittest.TestCase):
             source_root=self.source_root,
             http_open=self.health_opener,
             fr_token="court-token",
+            canonical_observer=self.canonical.observe,
+            adjudicator=self.no_organ,
         )
         ticket, candidate = self.authorized_pair(
             "JGI-L3-IAR-UP",
@@ -1075,6 +1142,15 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertNotEqual(result.sealed_receipt.get("source_role"), "PRIME")
         self.assertIsNotNone(result.court_request)
         self.assertEqual(result.court_request["event_type"], EventType.COURT_REQUESTED.value)
+        request = result.court_request["payload_ref_or_payload"]
+        # The bridge's board carried the injected offline observer and read the
+        # canonical base off it: no gap, and the base is the mirror's main.
+        self.assertEqual(self.runtime.last_switchboard.canonical_observer, self.canonical.observe)
+        self.assertEqual(request["canonical_sha"], self.canonical.base)
+        self.assertEqual(request["canonical_sha"], self.source_sha)
+        self.assertEqual(request["canonical_repo"], self.canonical.bare)
+        self.assertTrue(request["canonical_base_observed"])
+        self.assertNotIn("canonical_base", request["binding_gaps"])
         self.assertEqual(result.court_request["source_role"], "SWITCHAROO")
         self.assertEqual(result.sentinel["model_execution"], SENTINEL_MODEL_EXECUTION)
         self.assertEqual(result.sentinel["bind_status"], "SENTINEL_COURT_JOBBED_INDEPENDENT")
@@ -1098,6 +1174,64 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         artifact = board.queue.load(jobs[0]).step_results["materialize"]
         self.assertEqual(artifact["sentinel_model_execution"], "BLOCKED")
+
+    def test_bridge_board_carries_the_production_observer_unless_a_court_injects_one(self):
+        """The dispatch bridge is a production composition root. With nothing
+        injected its board observes the canonical base through read-only git
+        against the worktree's own remote; a court injects an offline observer so
+        no tick here reaches GitHub. Pinned at the resolver -- never by ticking a
+        board that carries the production observer from inside a test."""
+        import neuruh_workers.switchboard as switchboard_mod
+        self.assertIs(_canonical_observer_for(switchboard_mod, None),
+                      observe_canonical_base_via_git)
+        self.assertEqual(_canonical_observer_for(switchboard_mod, self.canonical.observe),
+                         self.canonical.observe)
+        self.assertIsNone(_canonical_observer_for(None, None))
+        self.assertIsNone(DispatchBridge(self.queue, self.catalog, self.runner).canonical_observer)
+        # Same contract for the Sentinel: None means the production HTTP adjudicator.
+        self.assertIsNone(DispatchBridge(self.queue, self.catalog, self.runner).adjudicator)
+        self.assertEqual(self.runtime.canonical_observer, self.canonical.observe)
+
+    def test_a_bridge_board_that_observed_nothing_cannot_certify_a_pass(self):
+        """An observer that reads nothing leaves the request naming the gap, and a
+        coherent PASS against it is refused at ingest -- the H01 defect, closed
+        on the bridge path as well as on scripts/run_switchboard.py."""
+        runtime = DispatchBridge(
+            self.queue,
+            self.catalog,
+            self.runner,
+            receipts_dir=self.receipts_dir,
+            switchboard_root=self.switchboard_root,
+            source_head=self.source_sha,
+            source_root=self.source_root,
+            http_open=self.health_opener,
+            fr_token="court-token",
+            canonical_observer=lambda worktree, remote, base_ref: ("", ""),
+        )
+        result = runtime.dispatch(self.mission(), [self.property_candidate()])
+        self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
+        request = result.court_request["payload_ref_or_payload"]
+        self.assertIn("canonical_base", request["binding_gaps"])
+        self.assertFalse(request["canonical_base_observed"])
+        board = runtime.last_switchboard
+        sealed, court = result.sealed_receipt, result.court_request
+        with self.assertRaises(SwitchboardError) as caught:
+            board.record_court_outcome(
+                passed=True,
+                court_job_id=court["payload_ref_or_payload"]["court_job_id"],
+                mission_id=sealed["mission_id"],
+                plan_id=sealed["plan_id"],
+                task_id=sealed["task_id"],
+                correlation_id=sealed["correlation_id"],
+                causation_id=court["event_id"],
+                source_head=sealed["source_head"],
+                authority_ref=sealed["authority_ref"],
+                source_repo=sealed["source_repo"],
+                receipt_ref=sealed["payload_ref_or_payload"]["receipt_ref"],
+                evidence=self.sentinel_evidence(sealed, court),
+            )
+        self.assertIn("never observed", str(caught.exception))
+        self.assertEqual(board.events(EventType.COURT_PASSED), [])
 
     def test_fake_sentinel_pass_from_receipt_or_reconstruction_is_refused(self):
         result = self.runtime.dispatch(self.mission(), [self.property_candidate()])
@@ -1284,21 +1418,41 @@ class FounderRuntimeCourt(unittest.TestCase):
         self.assertEqual(result.parent_resume["status"], "PARENT_JOB_ABSENT_IN_LEDGER")
         self.assertEqual(result.parent_resume["parent_mission_id"], "JGI-PARENT-MISSING")
 
-    def test_fr_evidence_update_is_attempted_and_not_persisted_here(self):
+    def test_fr_execution_outcome_writeback_is_attempted_and_fails_closed_here(self):
+        # R02D: the bridge reports DISPATCHED then SUCCEEDED (from the sealed
+        # receipt, not gated on a Sentinel verdict). This court's opener refuses
+        # every POST, so both write-backs are attempted and recorded fail-closed;
+        # the dispatch itself is untouched. The legacy /evidence route is gone.
         result = self.runtime.dispatch(self.mission(), [self.property_candidate()])
         self.assertEqual(result.status, RuntimeStatus.SUCCEEDED)
         self.assertIsNone(result.fr_evidence_update)
+        writeback = result.fr_outcome_writeback
+        self.assertEqual(sorted(writeback), ["DISPATCHED", "SUCCEEDED"])
+        for outcome, report in writeback.items():
+            self.assertTrue(report["attempted"])
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["bind_status"], "FR_OUTCOME_WRITEBACK_FAIL_CLOSED")
+            self.assertEqual(report["outcome"], outcome)
+            self.assertEqual(report["execution_id"], result.job_id)
+            self.assertIn("/execution-outcomes", report["url"])
+            self.assertEqual(report["owner"], "NeuruhAI/recipe-engine Founder Runtime")
+        self.assertEqual(
+            writeback["DISPATCHED"]["idempotency_key"],
+            f"execution_outcome:{result.job_id}:DISPATCHED:-")
+        receipt_sha = result.sealed_receipt["payload_ref_or_payload"]["receipt_sha"]
+        self.assertEqual(
+            writeback["SUCCEEDED"]["idempotency_key"],
+            f"execution_outcome:{result.job_id}:SUCCEEDED:{receipt_sha}")
         self.record_outcome(result)
-        result = self.runtime.dispatch(self.mission(), [self.property_candidate()])
-        self.assertEqual(result.status, RuntimeStatus.ALREADY_SUCCEEDED)
-        update = result.fr_evidence_update
-        self.assertTrue(update["attempted"])
-        self.assertFalse(update["persisted_locally"])
-        self.assertEqual(update["bind_status"], "FR_EVIDENCE_UPDATE_FAIL_CLOSED")
-        self.assertTrue(update["fr_write"]["attempted"])
-        self.assertFalse(update["fr_write"]["ok"])
-        self.assertIn("/v1/missions/", update["fr_write"]["url"])
-        self.assertEqual(update["owner"], "NeuruhAI/recipe-engine Founder Runtime")
+        replay = self.runtime.dispatch(self.mission(), [self.property_candidate()])
+        self.assertEqual(replay.status, RuntimeStatus.ALREADY_SUCCEEDED)
+        self.assertIsNone(replay.fr_evidence_update)
+        # A replayed dispatch re-reports only the sealed SUCCEEDED evidence
+        # (same idempotency key => FR replay by construction); no second DISPATCHED.
+        self.assertEqual(sorted(replay.fr_outcome_writeback), ["SUCCEEDED"])
+        self.assertEqual(
+            replay.fr_outcome_writeback["SUCCEEDED"]["idempotency_key"],
+            writeback["SUCCEEDED"]["idempotency_key"])
 
     def test_fr_api_health_without_auth_configuration_fails_closed(self):
         class _Resp:
@@ -1444,6 +1598,8 @@ class FounderRuntimeCourt(unittest.TestCase):
             source_root=self.source_root,
             http_open=opener,
             fr_token="court-token",
+            canonical_observer=self.canonical.observe,
+            adjudicator=self.no_organ,
         )
         ticket, candidate = self.authorized_pair(
             "JGI-CONSEQUENTIAL-CALLS",

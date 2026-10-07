@@ -19,9 +19,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from .contracts import JobStatus, ReceiptType, canonical_json
+from .ledger import split_lines_exact
 from .prime_receipts import (
     FR_DISPATCH_RECEIPT_SCHEMA,
     parse_prime_receipt,
@@ -57,6 +59,7 @@ RF_IMPORT_PATHS = (
     "revenue_factory",
 )
 SWITCHBOARD_MODULE = "neuruh_workers.switchboard"
+ADJUDICATOR_MODULE = "neuruh_workers.adjudicator_http"
 EVENTS_MODULE = "neuruh_workers.events"
 GIT_CUSTODIAN_MODULE = "neuruh_workers.git_custodian"
 
@@ -81,6 +84,39 @@ def try_import(module_name: str) -> Any | None:
         return importlib.import_module(module_name)
     except ImportError:
         return None
+
+
+def _canonical_observer_for(switchboard_module: Any, injected: Any) -> Any:
+    """The canonical observer the bridge's board carries.
+
+    An injected observer wins -- a court hands in one that reads an offline bare
+    repository, so no tick inside a test resolves a URL a receipt names. With
+    nothing injected this is a production composition root, and the board gets
+    the production observer: read-only git against the executed worktree's own
+    remote. A board with no observer names the canonical_base gap in its request
+    and can never certify a PASS against it.
+    """
+    if injected is not None:
+        return injected
+    return getattr(switchboard_module, "observe_canonical_base_via_git", None)
+
+
+def _adjudicator_for(adjudicator_module: Any, injected: Any) -> Any:
+    """The independent Sentinel the bridge's board carries.
+
+    Same shape as ``_canonical_observer_for``, and the same reason: an injected
+    adjudicator wins, so a court can hand in a double that never opens a socket.
+    With nothing injected this is a production composition root and the board
+    gets the production adjudicator -- a loopback HTTP client to the organ,
+    which runs in its own process. Workers never imports the organ; the process
+    boundary is what makes "independent" true at runtime rather than asserted.
+
+    With no adjudicator at all, ``court.requested`` is unroutable and the board
+    deadletters its own court request. That was the T02 gap.
+    """
+    if injected is not None:
+        return injected
+    return getattr(adjudicator_module, "sentinel_court_adjudicator", lambda: None)()
 
 
 def _looks_head(value: Any) -> bool:
@@ -483,63 +519,242 @@ def pull_authoritative_mission(
     }
 
 
-def update_fr_evidence(
+# --------------------------------------------------------------------------- #
+# R02D: Workers -> Founder Runtime execution-outcome write-back.
+# FR owns mission state; the bridge reports sealed evidence and never raises on
+# a refused write (fail-closed = record the bind status, keep the dispatch).
+# Route + envelope: recipe-engine `POST /v1/missions/{id}/execution-outcomes`
+# (fr.execution_outcome.v1). Replay is safe by construction on the FR side.
+# --------------------------------------------------------------------------- #
+FR_EXECUTION_OUTCOME_SCHEMA = "fr.execution_outcome.v1"
+FR_OUTCOME_RECORDED = "FR_OUTCOME_RECORDED"
+FR_OUTCOME_ALREADY_KNOWN = "FR_OUTCOME_ALREADY_KNOWN"
+FR_OUTCOME_WRITEBACK_FAIL_CLOSED = "FR_OUTCOME_WRITEBACK_FAIL_CLOSED"
+FR_OUTCOME_WRITEBACK_NOT_CONFIGURED = "FR_OUTCOME_WRITEBACK_NOT_CONFIGURED"
+# FR 409 reason codes that mean "this evidence, or a later one, is already
+# known": nothing to retry, nothing lost.
+FR_OUTCOME_REPLAY_CODES = frozenset({
+    "OUTCOME_STALE", "IDEMPOTENCY_CONFLICT", "OUTCOME_OUT_OF_ORDER",
+})
+# The write path may wait on the FR service lock; never the 0.25 s probe budget.
+FR_OUTCOME_WRITE_TIMEOUT_S = 8.0
+#: fr.execution_outcome.v1 court outcomes (recipe_engine execution_outcome.COURT_OUTCOMES).
+FR_COURT_OUTCOMES = frozenset({"COURT_PASSED", "COURT_FAILED"})
+
+
+def execution_outcome_idempotency_key(job_id: str, outcome: str,
+                                      evidence_sha: str | None = None) -> str:
+    return f"execution_outcome:{job_id}:{outcome}:{evidence_sha or '-'}"
+
+
+def build_execution_outcome_envelope(
+    *,
     mission_id: str,
-    evidence: Mapping[str, Any],
+    mission_version: int,
+    work_spec_sha256: str,
+    job_id: str,
+    outcome: str,
+    dispatch_approval_id: str,
+    source_head: str,
+    source_repo: str = "NeuruhAI/neuruh-workers",
+    observed_at: str | None = None,
+    receipt_ref: str | None = None,
+    failure: Mapping[str, Any] | None = None,
+    court: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one fr.execution_outcome.v1 envelope from bridge facts.
+
+    SUCCEEDED binds the sealed dispatch receipt on disk verbatim
+    (`receipt_sha` = its PAYLOAD_HASH = content sha of the fields minus
+    PAYLOAD_HASH); FR re-derives and refuses any mismatch.
+
+    COURT_PASSED / COURT_FAILED bind the independent Sentinel verdict the board
+    ingested (court.passed|court.failed): ``court`` names the organ's court_id,
+    the verdict, the receipt it judged (receipt_sha) and the sealed record's
+    content sha (record_sha) -- the fields fr.execution_outcome.v1 requires
+    (recipe_engine execution_outcome._COURT_REQUIRED). Nothing is judged here.
+    """
+    envelope: dict[str, Any] = {
+        "schema": FR_EXECUTION_OUTCOME_SCHEMA,
+        "api_version": FR_API_VERSION,
+        "mission_id": mission_id,
+        "mission_version": int(mission_version),
+        "work_spec_sha256": work_spec_sha256,
+        "execution_id": job_id,
+        "outcome": outcome,
+        "authority_reference": (
+            f"{FR_API_VERSION}:approval:{dispatch_approval_id}"
+            f":work-spec:{work_spec_sha256}"
+        ),
+        "observed_at": observed_at or datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "source": {
+            "role": DISPATCH_SOURCE_ROLE,
+            "component": DISPATCH_SOURCE_COMPONENT,
+            "repo": source_repo,
+            "head": source_head,
+        },
+    }
+    if outcome == "SUCCEEDED":
+        if not receipt_ref:
+            raise ValueError("a SUCCEEDED outcome requires the sealed receipt path")
+        parsed = parse_prime_receipt(receipt_ref)
+        envelope["receipt"] = {
+            "schema": FR_DISPATCH_RECEIPT_SCHEMA,
+            "fields": dict(parsed.fields),
+            "receipt_sha": parsed.fields.get("PAYLOAD_HASH") or parsed.content_sha,
+            "receipt_ref": parsed.path,
+        }
+    elif outcome == "FAILED" and failure:
+        envelope["failure"] = {
+            "error_class": str(failure.get("error_class") or "")[:128],
+            "detail": str(failure.get("detail") or "")[:2000],
+        }
+    elif outcome in FR_COURT_OUTCOMES:
+        if not isinstance(court, Mapping):
+            raise ValueError(f"a {outcome} outcome requires the ingested court verdict")
+        verdict = str(court.get("verdict") or "")
+        expected = "PASS" if outcome == "COURT_PASSED" else "FAIL"
+        if verdict != expected:
+            raise ValueError(f"{outcome} requires verdict {expected}, got {verdict!r}")
+        court_id = str(court.get("court_id") or "")
+        receipt_sha = str(court.get("receipt_sha") or "").lower()
+        record_sha = str(court.get("record_sha") or "").lower()
+        if not (court_id.startswith("court-") and len(court_id) == 30):
+            raise ValueError("court outcome requires the organ's court_id")
+        if not (_looks_hex64(receipt_sha) and _looks_hex64(record_sha)):
+            raise ValueError("court outcome requires 64-hex receipt_sha and record_sha")
+        if court.get("independent") is not True or str(court.get("source_role") or "").upper() != "SENTINEL":
+            raise ValueError("court outcome requires an independent SENTINEL record")
+        bound: dict[str, Any] = {
+            "court_id": court_id, "verdict": verdict, "receipt_sha": receipt_sha,
+            "record_sha": record_sha, "independent": True, "source_role": "SENTINEL",
+        }
+        head = str(court.get("source_head") or "").lower()
+        if _looks_head(head):
+            bound["source_head"] = head
+        if isinstance(court.get("findings"), list):
+            bound["findings"] = [str(f)[:500] for f in court["findings"][:64]]
+        if court.get("court_ref"):
+            bound["court_ref"] = str(court["court_ref"])[:1024]
+        envelope["court"] = bound
+    return envelope
+
+
+def _http_post_json_status(
+    url: str,
+    payload: Mapping[str, Any],
+    *,
+    timeout_s: float,
+    opener: HttpOpen | None,
+    headers: Mapping[str, str],
+) -> dict[str, Any]:
+    """POST and keep the HTTP status/body of a refusal (4xx/5xx) instead of
+    collapsing it into an exception name — the FR reason code is the evidence."""
+    body = canonical_json(dict(payload)).encode("utf-8")
+    merged = {"Content-Type": "application/json", "Accept": "application/json"}
+    merged.update(dict(headers or {}))
+    request = urllib.request.Request(url, data=body, method="POST", headers=merged)
+    open_fn = opener or urllib.request.urlopen
+    try:
+        with open_fn(request, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+            status = int(getattr(resp, "status", 200))
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        try:
+            raw = exc.read().decode("utf-8")
+        except Exception:  # noqa: BLE001
+            raw = ""
+    except Exception as exc:  # noqa: BLE001 — fail closed from the attempt
+        return {"attempted": True, "url": url, "ok": False, "status": None,
+                "error": type(exc).__name__, "data": {}}
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return {"attempted": True, "url": url, "ok": 200 <= status < 300,
+            "status": status, "error": None, "data": data}
+
+
+def _fr_error_code(data: Mapping[str, Any]) -> str | None:
+    for key in ("code", "reason_code", "error_code"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    error = data.get("error")
+    if isinstance(error, Mapping):
+        for key in ("code", "reason_code"):
+            value = error.get(key)
+            if isinstance(value, str) and value:
+                return value
+    detail = data.get("detail")
+    if isinstance(detail, Mapping):
+        for key in ("code", "reason_code"):
+            value = detail.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def report_execution_outcome(
+    mission_id: str,
+    body: Mapping[str, Any],
     *,
     opener: HttpOpen | None = None,
     token: str | None = None,
-    timeout_s: float = 0.25,
+    timeout_s: float = FR_OUTCOME_WRITE_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Attempt FR state/evidence update. FR owns persistence; write fail-closed.
+    """Report one sealed execution outcome to the Founder Runtime.
 
-    fr-api-v1 exposes GET /v1/missions/{id}/receipts and has no workers evidence
-    write. This call attempts the update and records the organ's refusal.
+    Returns ``{attempted, ok, status, code, bind_status, outcome, execution_id,
+    idempotency_key, url, data}``. Never raises: a refused write is recorded as
+    FR_OUTCOME_WRITEBACK_FAIL_CLOSED and the caller keeps its dispatch.
     """
-    health = bind_founder_runtime(opener=opener, timeout_s=timeout_s)
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    outcome = str(body.get("outcome") or "")
+    job_id = str(body.get("execution_id") or "")
+    receipt = body.get("receipt") or {}
+    court = body.get("court") or {}
+    evidence_sha = (
+        (receipt.get("receipt_sha") if isinstance(receipt, Mapping) else None)
+        or (court.get("record_sha") if isinstance(court, Mapping) else None)
+    )
+    idem = execution_outcome_idempotency_key(job_id, outcome, evidence_sha)
     quoted = urllib.parse.quote(mission_id, safe="")
-    read = http_get_json(
-        f"{FR_MISSIONS_URL}/{quoted}",
-        timeout_s=timeout_s,
-        opener=opener,
-        headers=headers,
-    )
-    write = http_post_json(
-        f"{FR_MISSIONS_URL}/{quoted}/evidence",
-        {
-            "api_version": FR_API_VERSION,
-            "mission_id": mission_id,
-            "evidence": dict(evidence),
-            "note": "workers dispatch-bridge evidence; FR remains mission-state authority",
-        },
-        timeout_s=timeout_s,
-        opener=opener,
-        headers=headers,
-    )
-    return {
-        "attempted": True,
-        "mission_id": mission_id,
-        "fr_health": health,
-        "fr_read": {
-            "attempted": read["attempted"],
-            "ok": read["ok"],
-            "error": read.get("error"),
-        },
-        "fr_write": {
-            "attempted": write["attempted"],
-            "ok": write["ok"],
-            "error": write.get("error"),
-            "url": write["url"],
-        },
-        "persisted_locally": False,
-        "bind_status": (
-            "FR_EVIDENCE_UPDATED" if write.get("ok")
-            else "FR_EVIDENCE_UPDATE_FAIL_CLOSED"
-        ),
+    url = f"{FR_MISSIONS_URL}/{quoted}/execution-outcomes"
+    base = {
+        "attempted": False, "ok": False, "status": None, "code": None,
+        "outcome": outcome, "execution_id": job_id,
+        "idempotency_key": idem, "url": url, "data": {},
         "owner": "NeuruhAI/recipe-engine Founder Runtime",
+    }
+    if not token:
+        return {**base, "bind_status": FR_OUTCOME_WRITEBACK_NOT_CONFIGURED,
+                "error": "FR_API_OPERATOR_TOKEN_REQUIRED"}
+    write = _http_post_json_status(
+        url, body, timeout_s=timeout_s, opener=opener,
+        headers={"Authorization": f"Bearer {token}", "Idempotency-Key": idem},
+    )
+    data = write.get("data") or {}
+    code = _fr_error_code(data)
+    if write.get("ok"):
+        replay = data.get("idempotent_replay") is True or data.get("applied") is False
+        bind_status = FR_OUTCOME_ALREADY_KNOWN if replay else FR_OUTCOME_RECORDED
+    elif write.get("status") == 409 and code in FR_OUTCOME_REPLAY_CODES:
+        bind_status = FR_OUTCOME_ALREADY_KNOWN
+    else:
+        bind_status = FR_OUTCOME_WRITEBACK_FAIL_CLOSED
+    return {
+        **base,
+        "attempted": True,
+        "ok": bool(write.get("ok")),
+        "status": write.get("status"),
+        "code": code,
+        "error": write.get("error"),
+        "bind_status": bind_status,
+        "data": data,
     }
 
 
@@ -805,10 +1020,32 @@ def emit_receipt_sealed_and_switcharoo(
     receipts_dir: str | None = None,
     switchboard_root: str | None = None,
     code_custody_required: bool = False,
+    canonical_observer: Callable[[str, str, str], tuple[str, str]] | None = None,
+    adjudicator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    authority_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+    execution_ledger_resolver: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
-    """Hand a receipted result to live SWITCHAROO. Do not clone nrh.event.v1."""
+    """Hand a receipted result to live SWITCHAROO. Do not clone nrh.event.v1.
+
+    ``authority_resolver`` and ``execution_ledger_resolver`` are the two facts the
+    board cannot know on its own and the independent court will not PASS without
+    (sentinel_court.verify FR_REQUIRED_FACTS: authority_record, execution_job,
+    job_succeeded_sha): the Governance record that allowed this mission and the
+    dispatch bridge's execution ledger that ran this job. See
+    ``execution_ledger_resolver_for`` / ``governance_authority_resolver_for``.
+    Absent means absent: the request names the gap and the organ fails closed.
+
+    ``canonical_observer`` is what the board reads the canonical base with; see
+    ``_canonical_observer_for`` for the production default and why a court must
+    inject its own.
+
+    ``adjudicator`` is the independent Sentinel the board carries its
+    ``court.requested`` to; see ``_adjudicator_for``. Without one the request is
+    unroutable and the board deadletters its own court.
+    """
     events = try_import(EVENTS_MODULE)
     switchboard = try_import(SWITCHBOARD_MODULE)
+    adjudicator_module = try_import(ADJUDICATOR_MODULE)
     honey = honey_pot_bind()
     absent = {
         "bind_status": "SWITCHBOARD_ABSENT",
@@ -934,6 +1171,10 @@ def emit_receipt_sealed_and_switcharoo(
             switchboard_root,
             receipts_dir=receipts_dir,
             known_missions=frozenset({mission_id}),
+            canonical_observer=_canonical_observer_for(switchboard, canonical_observer),
+            adjudicator=_adjudicator_for(adjudicator_module, adjudicator),
+            authority_resolver=authority_resolver,
+            execution_ledger_resolver=execution_ledger_resolver,
         )
         report = board.tick()
         sealed_events = [
@@ -1066,6 +1307,91 @@ def emit_receipt_sealed_and_switcharoo(
 
 # Back-compat name used by older call sites on this same PR.
 emit_receipt_sealed_and_court_request = emit_receipt_sealed_and_switcharoo
+
+
+#: Where Governance writes its hash-chained authorization records. The same
+#: name the governance organ itself is configured with (~/.neuruh/env/governance.env),
+#: so one path is named once for the whole organism.
+GOVERNANCE_AUTHORIZE_RECEIPTS_LOG_ENV = "GOVERNANCE_AUTHORIZE_RECEIPTS_LOG"
+
+
+def execution_ledger_resolver_for(queue: JobQueue) -> Callable[[str], str | None]:
+    """The dispatch bridge's own execution ledger, for a job it actually holds.
+
+    This is the ledger the bridge enqueued, ran and sealed the job in -- the
+    ``job.enqueued`` .. ``job.succeeded`` rows the court binds ``execution_job``
+    and ``job_succeeded_sha`` to. A job the ledger does not know resolves to None
+    and the board names the gap; nothing is looked up anywhere else.
+    """
+    def resolve(job_id: str) -> str | None:
+        if not job_id:
+            return None
+        try:
+            if not queue.ledger.receipts(job_id):
+                return None
+        except Exception:  # noqa: BLE001 -- an unreadable ledger is a gap, not a binding
+            return None
+        return os.path.abspath(queue.ledger.path)
+    return resolve
+
+
+def governance_authority_resolver_for(
+    ledger_path: str | None,
+) -> Callable[[str], Mapping[str, Any] | None] | None:
+    """The Governance authorization record a mission's dispatch rests on.
+
+    Reads the organ's own append-only ``authorize-receipts.jsonl`` (never
+    written here) and names the LAST ``allow`` authorization whose target is
+    this mission, by ``authorization_id:entry_hash`` and by the line range from
+    line 1 through that record, so the independent court verifies the hash chain
+    from its start and the digest still reproduces after Governance appends. No
+    record means no binding: the board names the gap and the court fails closed.
+    None when no ledger path is configured -- an unwired composition root stays
+    an unwired composition root, visibly.
+    """
+    if not ledger_path:
+        return None
+    ledger_ref = os.path.abspath(os.path.expanduser(str(ledger_path)))
+
+    def resolve(mission_id: str) -> Mapping[str, Any] | None:
+        if not mission_id or not os.path.isfile(ledger_ref):
+            return None
+        try:
+            with open(ledger_ref, "rb") as handle:
+                lines = split_lines_exact(handle.read())
+        except OSError:
+            return None
+        found: Mapping[str, Any] | None = None
+        for lineno, raw in enumerate(lines, start=1):
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(row, Mapping):
+                continue
+            target = row.get("target") if isinstance(row.get("target"), Mapping) else {}
+            if (
+                row.get("kind") == "governance_authorization"
+                and str(row.get("decision") or "") == "allow"
+                and target.get("type") == "mission"
+                and target.get("id") == mission_id
+                and _looks_hex64(row.get("entry_hash"))
+                and row.get("authorization_id")
+            ):
+                found = {
+                    "authorization_id": str(row["authorization_id"]),
+                    "entry_hash": str(row["entry_hash"]).lower(),
+                    "ledger_ref": ledger_ref,
+                    "line_start": 1,
+                    "line_end": lineno,
+                }
+        return found
+    return resolve
+
+
+def _looks_hex64(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        c in "0123456789abcdef" for c in value.lower())
 
 
 def job_succeeded_sha(queue: JobQueue, job_id: str) -> str | None:

@@ -100,6 +100,9 @@ class ReceiptType(str, Enum):
     PROMOTION_VERIFIED = "promotion.verified"
     PROMOTION_REFUSED = "promotion.refused"
     DEPLOY_REQUESTED = "deploy.requested"
+    # Mission continuation (parent/child) — appended on the PARENT job.
+    CHILD_DISPATCHED = "child.dispatched"
+    CHILD_RESULT_INGESTED = "child.result.ingested"
 
 
 # --------------------------------------------------------------------------- #

@@ -34,16 +34,20 @@ from .definitions import WorkflowCatalog
 from .organ_consumers import (
     FR_API_VERSION,
     FR_DISPATCHABLE_STATES,
+    GOVERNANCE_AUTHORIZE_RECEIPTS_LOG_ENV,
     HttpOpen,
     bind_founder_runtime,
     bind_iar_rf,
     call_gsa,
     emit_receipt_sealed_and_switcharoo,
+    execution_ledger_resolver_for,
+    governance_authority_resolver_for,
     job_succeeded_sha,
     pull_authoritative_mission,
     resolve_dispatch_source_identity,
+    build_execution_outcome_envelope,
+    report_execution_outcome,
     resume_parent_from_receipts,
-    update_fr_evidence,
 )
 from .queue import JobQueue
 from .runner import WorkflowRunner
@@ -400,6 +404,9 @@ class RuntimeResult:
     honey_pot: Mapping[str, Any] | None = None
     fr_bind: Mapping[str, Any] | None = None
     fr_evidence_update: Mapping[str, Any] | None = None
+    # R02D: per-phase Founder Runtime write-back results (DISPATCHED / SUCCEEDED /
+    # FAILED). FR owns mission state; a refused write is recorded, never raised.
+    fr_outcome_writeback: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -501,6 +508,11 @@ class DispatchBridge:
         http_open: HttpOpen | None = None,
         fr_token: str | None = None,
         fr_timeout_s: float = 0.25,
+        canonical_observer: Callable[[str, str, str], tuple[str, str]] | None = None,
+        adjudicator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        authority_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        execution_ledger_resolver: Callable[[str], str | None] | None = None,
+        governance_authorize_ledger: str | None = None,
     ) -> None:
         self.queue = queue
         self.catalog = catalog
@@ -513,6 +525,43 @@ class DispatchBridge:
         self.http_open = http_open
         self.fr_token = fr_token
         self.fr_timeout_s = fr_timeout_s
+        # How the bridge's Switchboard reads the canonical base. None means the
+        # production observer (read-only git against the worktree's own remote);
+        # a court injects an offline one so no tick here reaches a network host.
+        self.canonical_observer = canonical_observer
+        # The independent Sentinel the bridge's Switchboard carries court.requested
+        # to. None means the production adjudicator (organ_consumers._adjudicator_for:
+        # the loopback HTTP client to the organ at NEURUH_SENTINEL_COURT_URL /
+        # 127.0.0.1:18731). A court injects its own so no unit tick here reaches a
+        # LIVE organ -- observed 2026-09-14: with the organ up and routed, the
+        # idempotency court's second dispatch came back BLOCKED
+        # (SENTINEL_ALREADY_COURTED_FAIL) on a verdict the live organ sealed.
+        self.adjudicator = adjudicator
+        # The two facts the bridge's Switchboard cannot know on its own, and the
+        # independent court will not PASS without (FR_REQUIRED_FACTS: execution_job,
+        # job_succeeded_sha, authority_record). The execution ledger IS this bridge's
+        # own queue ledger -- the rows it enqueued, ran and sealed the job in -- so
+        # the production default names exactly that file. The Governance record
+        # lives in the governance organ's append-only authorize-receipts log; its
+        # path is named by the composition root (``governance_authorize_ledger``)
+        # or by the organism-wide GOVERNANCE_AUTHORIZE_RECEIPTS_LOG variable, and
+        # with neither the request names the gap and the court fails closed --
+        # observed 2026-09-14: the live organ sealed FAIL INSUFFICIENT_EVIDENCE
+        # "missing authority_record, execution_job, job_succeeded_sha" on a
+        # request that carried only the receipt and the Switchboard chain.
+        self.execution_ledger_resolver = (
+            execution_ledger_resolver
+            if execution_ledger_resolver is not None
+            else execution_ledger_resolver_for(queue)
+        )
+        self.authority_resolver = (
+            authority_resolver
+            if authority_resolver is not None
+            else governance_authority_resolver_for(
+                governance_authorize_ledger
+                or os.environ.get(GOVERNANCE_AUTHORIZE_RECEIPTS_LOG_ENV)
+                or None)
+        )
         self.last_switchboard = None
 
     def dispatch(
@@ -795,10 +844,37 @@ class DispatchBridge:
             dedupe_key=dedupe_key,
         )
         state = self.queue.load(job_id)
+        writeback: dict[str, Any] = {}
+
+        def _report(outcome: str, **extra: Any) -> None:
+            # R02D write-back. Never raises; FR decides replay/refusal.
+            try:
+                envelope = build_execution_outcome_envelope(
+                    mission_id=mission.mission_id,
+                    mission_version=mission.mission_version,
+                    work_spec_sha256=mission.work_spec_sha256,
+                    job_id=job_id,
+                    outcome=outcome,
+                    dispatch_approval_id=mission.dispatch_approval_id,
+                    source_head=verified_source.head,
+                    **extra,
+                )
+            except Exception as exc:  # noqa: BLE001 — evidence unbuildable = fail closed
+                writeback[outcome] = {
+                    "attempted": False, "ok": False, "status": None, "code": None,
+                    "outcome": outcome, "execution_id": job_id,
+                    "bind_status": "FR_OUTCOME_WRITEBACK_FAIL_CLOSED",
+                    "error": f"{type(exc).__name__}: {exc}"[:300],
+                }
+                return
+            writeback[outcome] = report_execution_outcome(
+                mission.mission_id, envelope,
+                opener=self.http_open, token=self.fr_token)
 
         if state.status == JobStatus.SUCCEEDED:
             status = RuntimeStatus.ALREADY_SUCCEEDED
         elif auto_execute_read_only:
+            _report("DISPATCHED")
             state = self.runner.execute(job_id)
             if state.status == JobStatus.SUCCEEDED:
                 status = RuntimeStatus.SUCCEEDED
@@ -806,8 +882,14 @@ class DispatchBridge:
                 status = RuntimeStatus.APPROVAL_REQUIRED
             else:
                 status = RuntimeStatus.BLOCKED
+            if state.status == JobStatus.FAILED:
+                _report("FAILED", failure={
+                    "error_class": "WORKERS_JOB_FAILED",
+                    "detail": f"job {job_id} ended {state.status.value}",
+                })
         else:
             status = RuntimeStatus.QUEUED
+            _report("DISPATCHED")
 
         chain = self.queue.ledger.verify()
         sealed = None
@@ -838,6 +920,10 @@ class DispatchBridge:
                 receipts_dir=self.receipts_dir,
                 switchboard_root=self.switchboard_root,
                 code_custody_required=mission.code_custody_required,
+                canonical_observer=self.canonical_observer,
+                adjudicator=self.adjudicator,
+                authority_resolver=self.authority_resolver,
+                execution_ledger_resolver=self.execution_ledger_resolver,
             )
             sealed = emission["sealed"]
             court = emission["court_request"]
@@ -853,6 +939,14 @@ class DispatchBridge:
                 and isinstance(switchboard_emit, Mapping)
                 and switchboard_emit.get("consumed") is True
             )
+            if emission_complete:
+                # SUCCEEDED is reported from the sealed receipt itself, NOT gated
+                # on a Sentinel verdict: the court's outcome is its own write-back
+                # (Switchboard consumers), and FR shows court PENDING until then.
+                receipt_payload = sealed.get("payload_ref_or_payload") or {}
+                _report("SUCCEEDED", receipt_ref=(
+                    receipt_payload.get("receipt_ref")
+                    or os.path.join(self.receipts_dir or "", f"{job_id}.txt")))
             if not emission_complete:
                 status = RuntimeStatus.BLOCKED
             elif sentinel and sentinel.get("verdict") == "FAIL":
@@ -866,19 +960,6 @@ class DispatchBridge:
                         child_job_id=job_id,
                     )
                     chain = self.queue.ledger.verify()
-                fr_update = update_fr_evidence(
-                    mission.mission_id,
-                    {
-                        "job_id": job_id,
-                        "ledger_tail_sha": chain["tail_sha"],
-                        "job_status": state.status.value,
-                        "parent_resume": parent_resume,
-                        "switchboard_bind": (switchboard_emit or {}).get("bind_status"),
-                        "sentinel_bind": (sentinel or {}).get("bind_status"),
-                    },
-                    opener=self.http_open,
-                    token=self.fr_token,
-                )
         elif mission.parent_mission_id:
             parent_resume = {
                 "parent_mission_id": mission.parent_mission_id,
@@ -910,6 +991,7 @@ class DispatchBridge:
             honey_pot=honey,
             fr_bind=fr_bind,
             fr_evidence_update=fr_update,
+            fr_outcome_writeback=writeback or None,
             note=(
                 "FR ticket dispatched, independently courted, and sealed"
                 if emission_complete and sentinel and sentinel.get("verdict") == "PASS"

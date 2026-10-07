@@ -10,6 +10,7 @@ deterministic job IDs.  Persistence is JSONL (ledger) + a cursor file.
 Loopback/local file observation only; no public listener.
 """
 from __future__ import annotations
+import shutil
 
 import fcntl
 import functools
@@ -17,6 +18,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
@@ -31,7 +33,7 @@ from .events import (
     build_envelope,
     validate_envelope,
 )
-from .ledger import Clock, ExecutionLedger, utc_clock
+from .ledger import Clock, ExecutionLedger, split_lines_exact, utc_clock
 from .prime_receipts import (
     FR_DISPATCH_RECEIPT_SCHEMA,
     contains_secret_shape,
@@ -69,10 +71,70 @@ T07_AXON_PR_URL = "https://github.com/NeuruhAI/neuruh-axon/pull/4"
 T07_AXON_BRANCH = "feat/grok-sovereign-mcp-v4-20260827"
 
 DEFAULT_MISSIONS = frozenset({T07_MISSION})
+#: Event types whose mission_id names a mission this board is already carrying.
+#: A receipt the bridge sealed here, and the court it asked for, name the mission
+#: the board's consumers must be in scope for.
+_MISSION_BEARING_EVENTS = frozenset({
+    "receipt.sealed", "court.requested", "court.passed", "court.failed",
+})
+
+
+def missions_on_ledger(root: str) -> frozenset[str]:
+    """The missions this board's own events ledger already carries.
+
+    The consumer scope of a production board is not a constant: the dispatch
+    bridge seals receipts for whatever missions the Founder Runtime dispatched,
+    into THIS root, and asks for their courts here. A service board scoped to
+    DEFAULT_MISSIONS alone deadlettered every one of them as "event mission
+    outside consumer scope" (observed 2026-09-04 msn_4ab91616… and 2026-09-14
+    msn_2d6e71c5…: the court the bridge asked for was never carried). Nothing is
+    invented: only missions already named by a hash-chained event on this ledger.
+    """
+    found: set[str] = set(DEFAULT_MISSIONS)
+    path = os.path.join(os.path.abspath(root), EVENTS_NAME)
+    if not os.path.isfile(path):
+        return frozenset(found)
+    try:
+        receipts = ExecutionLedger(path).receipts(EVENT_JOB)
+    except Exception:  # noqa: BLE001 -- an unreadable ledger widens nothing
+        return frozenset(found)
+    for receipt in receipts:
+        envelope = receipt.payload if isinstance(receipt.payload, Mapping) else {}
+        if envelope.get("event_type") in _MISSION_BEARING_EVENTS:
+            mission = envelope.get("mission_id")
+            if isinstance(mission, str) and mission:
+                found.add(mission)
+    return frozenset(found)
 
 # First seam closes the clipboard.  Court PASS is never derived here.
 HUMAN_CLIPBOARD_REQUIRED = "NO"
 INDEPENDENT_COURT_KIND = "independent_sentinel_court"
+#: The base a board names when it could not observe one. The organ's packet
+#: gate REQUIRES canonical_sha, so omitting the key made the request
+#: unparseable and the court deadlettered on MAX_RETRIES instead of failing
+#: closed on the gap. Naming the unobserved base explicitly lets the organ
+#: refuse it on the evidence, and lets this board refuse a PASS against it.
+_UNOBSERVED_BASE = "0" * 40
+# The consumer that carries court.requested to the independent Sentinel. It is
+# registered only when an adjudicator is injected; workers never imports the organ.
+ADJUDICATE_CONSUMER_ID = "switchboard.adjudicate-on-court-requested.v1"
+COURTS_DIR = "courts"
+DEFAULT_CANONICAL_BASE_REF = "refs/heads/main"
+GIT = os.environ.get("NEURUH_GIT") or shutil.which("git") or "git"
+# Only these relations may stand under a PASS (mirrors the organ's VERIFIED_RELATIONS).
+_VERIFIED_RELATIONS = frozenset({
+    "candidate_is_canonical_base",
+    "candidate_descends_from_canonical_base",
+})
+# Evidence kinds the organ accepts (A04 §4). The board names only what it can bind.
+_KIND_EVENTS = "switchboard_events_jsonl"
+_KIND_EXECUTION_LEDGER = "workers_execution_ledger_jsonl"
+_KIND_RECEIPT = "prime_receipt_txt"
+_KIND_GOVERNANCE = "governance_authorize_receipts_jsonl"
+# A FAIL whose only blocking finding is that the model could not be reached is not
+# a judgement of the candidate. It stays open (retry, then deadletter) rather than
+# becoming a false terminal court.failed.
+_ENVIRONMENTAL_ONLY = frozenset({"MODEL_UNAVAILABLE"})
 _FAKE_EVIDENCE_KINDS = frozenset({
     "reconstruction",
     "injected",
@@ -84,6 +146,22 @@ _FAKE_EVIDENCE_KINDS = frozenset({
 
 class SwitchboardError(DefinitionError):
     code = "SWITCHBOARD_REFUSED"
+
+
+class AdjudicatorUnavailable(SwitchboardError):
+    """The independent Sentinel could not be reached, so no court happened.
+
+    This is emphatically NOT a verdict. It is raised by an adjudicator adapter
+    (see neuruh_workers.adjudicator_http) when the organ is down, times out, or
+    answers with a non-2xx, and the board treats it as a VISIBLE blocked state:
+    the court stays open, the cause is named on the tick report and in the
+    consumer lease, and no retry budget is burned toward a MAX_RETRIES
+    deadletter. Burning that budget is precisely how the live T02 court
+    disappeared -- an unreachable organ became an anonymous deadletter that read
+    like a judged candidate. An absent court must look absent.
+    """
+
+    code = "SENTINEL_COURT_UNAVAILABLE"
 
 
 @dataclass
@@ -103,6 +181,10 @@ class TickReport:
     acked: list[str] = field(default_factory=list)
     deadlettered: list[str] = field(default_factory=list)
     recovered: list[str] = field(default_factory=list)
+    #: Events whose consumer is blocked on an unreachable dependency. Open, not
+    #: judged, not deadlettered -- and named, so a stalled seam is legible from
+    #: `run_switchboard.py tick|status` instead of looking like quiet success.
+    blocked: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _atomic_write(path: str, text: str) -> None:
@@ -142,6 +224,11 @@ class Switchboard:
         bind_host: str = "127.0.0.1",
         git_custodian: Any = None,
         promotion_executor: Any = None,
+        adjudicator: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        authority_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        execution_ledger_resolver: Callable[[str], str | None] | None = None,
+        canonical_base_ref: str = DEFAULT_CANONICAL_BASE_REF,
+        canonical_observer: Callable[[str, str, str], tuple[str, str]] | None = None,
     ):
         if bind_host not in ("127.0.0.1", "localhost", "::1"):
             raise SwitchboardError(
@@ -157,6 +244,21 @@ class Switchboard:
         self.fail_handler = fail_handler
         self.git_custodian = git_custodian
         self.promotion_executor = promotion_executor
+        # Injected, never imported: the independent Sentinel, and the two facts the
+        # board cannot know on its own (the Governance record for a mission, and the
+        # dispatch bridge's execution ledger for a job). Absent means absent -- the
+        # request then names a gap instead of inventing a binding.
+        self.adjudicator = adjudicator
+        self.authority_resolver = authority_resolver
+        self.execution_ledger_resolver = execution_ledger_resolver
+        self.canonical_base_ref = canonical_base_ref
+        # Observing the canonical base means reading a remote. That is injected,
+        # never implied: with no observer the board names the gap, the organ fails
+        # closed on it, and _require_observed_relation refuses every PASS against
+        # it. Both production composition roots inject observe_canonical_base_via_git:
+        # scripts/run_switchboard.py (_board) and the dispatch bridge
+        # (organ_consumers.emit_receipt_sealed_and_switcharoo).
+        self.canonical_observer = canonical_observer
         self.event_ledger = ExecutionLedger(
             os.path.join(self.root, EVENTS_NAME), clock=self._clock)
         self.job_ledger = ExecutionLedger(
@@ -178,6 +280,9 @@ class Switchboard:
             ConsumerSpec("switchboard.remediate-on-court-failed.v1",
                          EventType.COURT_FAILED, self.known_missions),
         ]
+        if adjudicator is not None:
+            consumers.append(ConsumerSpec(
+                ADJUDICATE_CONSUMER_ID, EventType.COURT_REQUESTED, self.known_missions))
         if git_custodian is not None:
             consumers.append(ConsumerSpec(
                 "git-custodian.consume-push-requested.v1",
@@ -268,6 +373,11 @@ class Switchboard:
             bind_host=self.bind_host,
             git_custodian=self.git_custodian,
             promotion_executor=self.promotion_executor,
+            adjudicator=self.adjudicator,
+            authority_resolver=self.authority_resolver,
+            execution_ledger_resolver=self.execution_ledger_resolver,
+            canonical_base_ref=self.canonical_base_ref,
+            canonical_observer=self.canonical_observer,
         )
 
     def events(self, event_type: str | EventType | None = None) -> list[dict]:
@@ -295,7 +405,11 @@ class Switchboard:
         return ids
 
     @_synchronized
-    def record_court_outcome(
+    def record_court_outcome(self, **kwargs) -> dict[str, Any]:
+        """Ingest Sentinel's independent verdict.  Switchboard does not PASS."""
+        return self._record_court_outcome_locked(**kwargs)
+
+    def _record_court_outcome_locked(
         self,
         *,
         passed: bool,
@@ -601,7 +715,6 @@ class Switchboard:
             "receipt_ref": receipt_ref,
             "receipt_sha": receipt_payload.get("receipt_sha"),
             "candidate_sha": source_head,
-            "canonical_sha": source_head,
             "plan_id": plan_id,
             "task_id": task_id,
             "correlation_id": correlation_id,
@@ -615,7 +728,17 @@ class Switchboard:
             if record.get(field) != value:
                 raise SwitchboardError(
                     f"Sentinel evidence {field} is not bound to the court request")
+        # The organ seals verdicts this board does not ingest directly
+        # (PASS_WITH_EXCEPTIONS). Where it projected one, the PROJECTION is what
+        # the outcome must agree with -- it is the organ's own answer to
+        # "PASS or FAIL", and re-deriving that answer here is exactly the
+        # divergence this seam removed. A record sealed without a projection --
+        # the offline record-court path, and every record already on a live
+        # ledger -- is still compared on its raw verdict, unchanged.
+        ingest = record.get("switchboard_ingest")
         verdict = str(record.get("verdict") or "")
+        if isinstance(ingest, Mapping) and ingest.get("ingest_verdict"):
+            verdict = str(ingest["ingest_verdict"])
         if verdict != ("PASS" if passed else "FAIL"):
             raise SwitchboardError("Sentinel evidence verdict differs from outcome")
         court_id = record.get("court_id")
@@ -638,6 +761,10 @@ class Switchboard:
         ):
             raise SwitchboardError(
                 "Sentinel evidence findings and observed digest are malformed")
+        # Binding runs for EVERY verdict; only the relation and authority are
+        # PASS-only. An unbound terminal FAIL forecloses the correct verdict just
+        # as surely as an unearned PASS grants one.
+        self._require_request_binding(record, court=court, passed=passed)
         if passed:
             if (
                 record["findings"]
@@ -646,6 +773,7 @@ class Switchboard:
                 or record.get("base_relation") == "unverified"
             ):
                 raise SwitchboardError("Sentinel PASS carries findings or exceptions")
+            self._require_observed_relation(record, court=court, source_head=source_head)
             iar = record.get("iar_provenance")
             binding = iar.get("binding") if isinstance(iar, Mapping) else None
             if (
@@ -887,6 +1015,16 @@ class Switchboard:
             (r.seq, dict(r.payload))
             for r in self.event_ledger.receipts(EVENT_JOB)
         ]
+        # Missions this ledger already carries. Consumer cursors live in the shared
+        # root, so a board scoped narrower than the ledger (the dispatch bridge seals
+        # through a board scoped to ONE mission) must not deadletter or ack past an
+        # event that belongs to a mission the ledger carries: the board that carries
+        # it has to be able to deliver it.
+        carried = frozenset(
+            envelope.get("mission_id") for _seq, envelope in all_events
+            if envelope.get("event_type") in _MISSION_BEARING_EVENTS
+            and isinstance(envelope.get("mission_id"), str) and envelope.get("mission_id")
+        )
         for consumer in self.consumers:
             state = self._consumer_state(consumer.consumer_id)
             lease = state.get("lease")
@@ -905,6 +1043,15 @@ class Switchboard:
                 if envelope.get("event_type") != consumer.event_type.value:
                     continue
                 mission = envelope.get("mission_id")
+                if (
+                    consumer.mission_scope is not None
+                    and mission not in consumer.mission_scope
+                    and mission in carried
+                ):
+                    # Not this board's mission, but this ledger's: leave it (and
+                    # everything after it for this consumer) to the board that
+                    # carries it. Never deadletter it, never advance the cursor.
+                    break
                 if consumer.mission_scope is not None and mission not in consumer.mission_scope:
                     self._deadletter_envelope(
                         envelope, DeadletterReason.UNKNOWN_MISSION,
@@ -952,6 +1099,24 @@ class Switchboard:
             report.acked.append(envelope["event_id"])
         except _CrashSimulated:
             raise
+        except AdjudicatorUnavailable as exc:
+            # No court happened. Keep it open and make the block visible: do NOT
+            # advance attempt_count, because three quiet retries against a dead
+            # organ would terminate a court that was never heard, under
+            # MAX_RETRIES -- a reason that names the board's patience rather than
+            # the actual cause. The lease stays in RETRY, so the next tick after
+            # the organ returns picks the very same event back up.
+            lease["state"] = AckState.RETRY.value
+            lease["last_error"] = redact_secrets(str(exc))
+            state["lease"] = lease
+            report.blocked.append({
+                "event_id": envelope["event_id"],
+                "event_type": envelope["event_type"],
+                "consumer_id": consumer.consumer_id,
+                "reason": AdjudicatorUnavailable.code,
+                "detail": redact_secrets(str(exc)),
+                "attempt": attempt,
+            })
         except Exception as exc:  # noqa: BLE001 — receipted, never swallowed
             if attempt >= consumer.max_attempts:
                 self._deadletter_envelope(
@@ -980,7 +1145,9 @@ class Switchboard:
         if event_type is EventType.RECEIPT_REJECTED:
             return self._unroutable(consumer, event_type)
         if event_type is EventType.COURT_REQUESTED:
-            return self._unroutable(consumer, event_type)
+            if self.adjudicator is None:
+                return self._unroutable(consumer, event_type)
+            return self._on_court_requested(envelope)
         if event_type is EventType.COURT_STARTED:
             return self._unroutable(consumer, event_type)
         if event_type is EventType.CANDIDATE_PUSH_REQUESTED:
@@ -1053,6 +1220,7 @@ class Switchboard:
             "source_head": payload["head"],
             "required_invariants": list(payload["required_invariants"]),
             "authority_ref": envelope["authority_ref"],
+            "bindings": self._court_bindings(envelope),
         }
         dedupe = envelope["idempotency_key"]
         wf = self.catalog.get(SENTINEL_WORKFLOW)
@@ -1084,6 +1252,7 @@ class Switchboard:
             "evidence_refs": evidence_refs,
             "evidence_sha256": evidence_sha256,
         }
+        court_payload.update(self._court_bindings(envelope))
         self._emit(
             EventType.COURT_REQUESTED,
             mission_id=envelope["mission_id"],
@@ -1093,13 +1262,363 @@ class Switchboard:
             causation_id=envelope["event_id"],
             source_role=SOURCE_ROLE,
             source_component=SOURCE_COMPONENT,
-            source_repo=SOURCE_REPO,
+            # The repository the CANDIDATE lives in, as the sealed receipt names
+            # it -- the same fact source_head already comes from. This board's own
+            # slug here made the request disagree with its receipt whenever the
+            # receipt named another repository: the organ then fails the court
+            # SOURCE_REPO_MISMATCH, and the outcome verifier below refuses the
+            # verdict ("source_repo differs from its sealed receipt") because the
+            # consumer carries the request's source_repo. Observed 2026-09-14 by
+            # the organ's own consumer harness (sentinel_court/e2e.py).
+            source_repo=envelope["source_repo"],
             source_head=envelope["source_head"],
             authority_ref=envelope["authority_ref"],
             payload=court_payload,
             idempotency_key=f"court.requested|{payload['receipt_sha']}",
         )
         return enqueued
+
+    # -- court bindings (A04 §6): what the organ needs, named from immutable facts -- #
+
+    def _court_bindings(self, sealed: Mapping[str, Any]) -> dict[str, Any]:
+        """Everything the independent Sentinel needs to retrieve and verify the
+        evidence for this receipt, derived from facts the board already holds or
+        can observe. Nothing here is invented: when a fact is unavailable the
+        request names the gap, and the organ fails closed on it."""
+        payload = sealed.get("payload_ref_or_payload") or {}
+        gaps: list[str] = []
+        refs: list[dict[str, Any]] = []
+        out: dict[str, Any] = {}
+
+        # The receipt, under its declared kind only.
+        receipt_ref = str(payload.get("receipt_ref") or "")
+        if receipt_ref and os.path.isfile(receipt_ref):
+            refs.append(self._typed_ref(_KIND_RECEIPT, receipt_ref))
+        else:
+            gaps.append("receipt")
+        out["receipt_sha"] = payload.get("receipt_sha")
+
+        # The causal chain, up to and including the sealed line: final at emission,
+        # so the digest it carries still reproduces after this request is appended.
+        sealed_seq = next(
+            (r.seq for r in self.event_ledger.receipts(EVENT_JOB)
+             if (r.payload or {}).get("event_id") == sealed.get("event_id")), 0)
+        events_path = os.path.join(self.root, EVENTS_NAME)
+        if sealed_seq and os.path.isfile(events_path):
+            refs.append(self._typed_ref(_KIND_EVENTS, events_path, line_start=1, line_end=sealed_seq))
+        else:
+            gaps.append("causal_chain")
+
+        # The dispatch bridge's execution ledger for this job (injected resolver).
+        task_id = str(sealed.get("task_id") or "")
+        out["task_id"] = task_id
+        ledger_path = None
+        if self.execution_ledger_resolver is not None and task_id:
+            try:
+                ledger_path = self.execution_ledger_resolver(task_id)
+            except Exception:  # noqa: BLE001 -- a resolver fault is a gap, not a binding
+                ledger_path = None
+        # Named only up to and including the job.succeeded row: final at emission,
+        # so the digest still reproduces after the bridge appends to the same
+        # ledger (a replay writes job.enqueue_deduplicated before the court runs),
+        # and anchored at line 1, which is the only range the organ verifies
+        # (sentinel_court.verify: RANGE_NOT_ANCHORED otherwise).
+        succeeded_line = 0
+        if ledger_path and os.path.isfile(str(ledger_path)):
+            succeeded_line = self._job_succeeded_line(str(ledger_path), task_id)
+        if succeeded_line:
+            refs.append(self._typed_ref(
+                _KIND_EXECUTION_LEDGER, str(ledger_path), line_start=1, line_end=succeeded_line))
+        else:
+            gaps.append("execution_ledger")
+
+        # The Governance record this dispatch's authority rests on (injected resolver).
+        mission_id = str(sealed.get("mission_id") or "")
+        authority = None
+        if self.authority_resolver is not None and mission_id:
+            try:
+                authority = self.authority_resolver(mission_id)
+            except Exception:  # noqa: BLE001
+                authority = None
+        ledger_ref = str((authority or {}).get("ledger_ref") or "")
+        if (isinstance(authority, Mapping) and authority.get("authorization_id")
+                and authority.get("entry_hash") and os.path.isfile(ledger_ref)):
+            out["authority_record_ref"] = f"{authority['authorization_id']}:{authority['entry_hash']}"
+            refs.append(self._typed_ref(
+                _KIND_GOVERNANCE, ledger_ref,
+                line_start=int(authority.get("line_start") or 0),
+                line_end=int(authority.get("line_end") or 0)))
+        else:
+            gaps.append("authority_record")
+
+        # Work spec: only the FR authority form carries one.
+        authority_ref = str(sealed.get("authority_ref") or "")
+        if ":work-spec:" in authority_ref:
+            out["work_spec_sha256"] = authority_ref.rsplit(":work-spec:", 1)[1]
+
+        # The candidate is the sealed head; the tree it ran in is where the organ
+        # observes it.
+        out["candidate_sha"] = str(sealed.get("source_head") or "").lower()
+        worktree = str(payload.get("worktree") or "")
+        if worktree and os.path.isabs(worktree) and os.path.isdir(worktree):
+            out["source_repo_path"] = worktree
+        else:
+            gaps.append("source_repo_path")
+
+        # The canonical base is OBSERVED on the worktree's remote. Declared here,
+        # re-observed by the organ, never trusted from either side alone.
+        repo_url, observed = "", ""
+        if self.canonical_observer is not None and worktree:
+            try:
+                repo_url, observed = self.canonical_observer(
+                    worktree, str(payload.get("remote") or "origin"), self.canonical_base_ref)
+            except Exception:  # noqa: BLE001 -- an observer fault is a gap, not a base
+                repo_url, observed = "", ""
+        out["canonical_base_ref"] = self.canonical_base_ref
+        if repo_url:
+            out["canonical_repo"] = repo_url
+        if observed:
+            out["canonical_sha"] = observed
+            out["canonical_base_observed"] = True
+        else:
+            # Name the gap AND a parseable base: the organ requires canonical_sha,
+            # so an omitted key is not a fail-closed gap, it is an unreadable packet.
+            out["canonical_sha"] = _UNOBSERVED_BASE
+            out["canonical_base_observed"] = False
+            gaps.append("canonical_base")
+
+        out["evidence_refs"] = refs
+        out["evidence_sha256"] = _aggregate_evidence_sha256([r["sha256"] for r in refs])
+        out["binding_gaps"] = gaps
+        return out
+
+    @staticmethod
+    def _job_succeeded_line(path: str, task_id: str) -> int:
+        """1-based line of the job.succeeded row for ``task_id`` in a Workers ledger,
+        0 when there is none. The ledger is one JSON receipt per line; lines are
+        counted exactly as the organ counts them when it retrieves a range."""
+        if not task_id:
+            return 0
+        try:
+            with open(path, "rb") as handle:
+                lines = split_lines_exact(handle.read())
+        except OSError:
+            return 0
+        found = 0
+        for lineno, raw in enumerate(lines, start=1):
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if (isinstance(row, Mapping) and row.get("job_id") == task_id
+                    and row.get("receipt_type") == ReceiptType.JOB_SUCCEEDED.value):
+                found = lineno
+        return found
+
+    @staticmethod
+    def _typed_ref(kind: str, path: str, *, line_start: int = 0, line_end: int = 0) -> dict[str, Any]:
+        with open(path, "rb") as handle:
+            body = handle.read()
+        entry: dict[str, Any] = {"kind": kind, "ref": os.path.abspath(path)}
+        if line_start or line_end:
+            # Split on b"\n" ONLY, as the organ does when it re-hashes the range
+            # (sentinel_court.retrieve.split_lines_exact); bytes.splitlines also
+            # splits on U+2028/U+2029 and \x1c-\x1e, which a Governance line can
+            # carry raw, and the two sides would then hash different bytes.
+            lines = split_lines_exact(body)
+            if line_start < 1 or line_end < line_start or line_end > len(lines):
+                raise SwitchboardError(
+                    f"evidence line range {line_start}..{line_end} is outside {path}")
+            body = b"".join(lines[line_start - 1:line_end])
+            entry["line_start"], entry["line_end"] = line_start, line_end
+        entry["sha256"] = hashlib.sha256(body).hexdigest()
+        return entry
+
+    # -- court.requested consumer (A04 §12) ----------------------------------- #
+
+    def _on_court_requested(self, envelope: dict) -> str | None:
+        """Carry the request to the independent Sentinel and ingest what it seals.
+
+        The packet IS the event. No field is added, chosen, or assembled here; if
+        the request did not name something, the organ does not get it, and fails
+        closed on the gap. The board writes the sealed record it receives beside
+        its own ledgers and ingests the verdict through the same verifier every
+        other outcome goes through.
+        """
+        court = envelope.get("payload_ref_or_payload") or {}
+        record = self.adjudicator(json.loads(json.dumps(envelope)))
+        if not isinstance(record, Mapping):
+            raise SwitchboardError("adjudicator returned no sealed record")
+        if (record.get("kind") != INDEPENDENT_COURT_KIND
+                or str(record.get("source_role") or "").upper() != "SENTINEL"
+                or record.get("independent") is not True):
+            raise SwitchboardError("adjudicator record is not an independent Sentinel court")
+        court_id = str(record.get("court_id") or "")
+        if not court_id.startswith("court-") or len(court_id) != 30:
+            raise SwitchboardError("adjudicator record has no court_id")
+        verdict = str(record.get("verdict") or "")
+        if verdict not in {"PASS", "PASS_WITH_EXCEPTIONS", "FAIL"}:
+            raise SwitchboardError("adjudicator record verdict is not PASS|PASS_WITH_EXCEPTIONS|FAIL")
+        findings = [f for f in (record.get("findings") or []) if isinstance(f, Mapping)]
+        blocking = {str(f.get("code")) for f in findings if f.get("severity", "blocking") == "blocking"}
+        if verdict == "FAIL" and blocking and blocking <= _ENVIRONMENTAL_ONLY:
+            # The organ was reached but its model was not. Same shape as an
+            # unreachable organ: a block, not a judgement. Raised as
+            # AdjudicatorUnavailable so the court genuinely stays open and says
+            # why -- the plain SwitchboardError this used to raise burned the
+            # retry budget and terminated under MAX_RETRIES, which is the
+            # opposite of the sentence above it.
+            raise AdjudicatorUnavailable(
+                "Sentinel could not reach its model; the court stays open rather than "
+                "recording a verdict the candidate did not earn")
+        # PROJECTION OWNERSHIP (ruled 2026-09-09): the organ owns the PASS|FAIL
+        # projection (sentinel_court.project.project_for_switchboard_ingest) and
+        # ships it on the wire beside the record. The board reads that answer; it
+        # does not re-derive one. Two implementations of this mapping is exactly
+        # how a PASS carrying exceptions came to be scored one way inside the
+        # organ and another way here.
+        ingest = record.get("switchboard_ingest")
+        if not isinstance(ingest, Mapping):
+            raise SwitchboardError(
+                "adjudicator record carries no switchboard_ingest projection; the "
+                "PASS|FAIL projection is owned by the Sentinel organ and must arrive "
+                "with the record it projects")
+        passed = ingest.get("switchboard_passed")
+        if not isinstance(passed, bool):
+            raise SwitchboardError(
+                "switchboard_ingest.switchboard_passed is not a boolean; the board "
+                "does not infer a verdict the organ did not project")
+
+        courts_dir = os.path.join(self.root, COURTS_DIR)
+        os.makedirs(courts_dir, exist_ok=True)
+        ref = os.path.join(courts_dir, f"{court_id}.json")
+        sealed = dict(record)
+        sealed["ref"] = ref
+        text = json.dumps(sealed, sort_keys=True, indent=2) + "\n"
+        # The record must be on disk before the verdict is ingested: the outcome
+        # verifier requires an existing absolute file ref. What must NOT happen is
+        # the old byte-for-byte refusal -- the organ re-adjudicates on redelivery
+        # when it holds no ledger, and court_id_for deliberately excludes
+        # sealed_at, so a re-seal differing only in its timestamp used to wedge the
+        # court forever: attempt 1 failed at ingest, every later attempt died on
+        # the comparison, and the receipt deadlettered with no verdict at all.
+        # Only a genuinely different VERDICT for the same court_id is a conflict.
+        if os.path.exists(ref):
+            try:
+                with open(ref, "r", encoding="utf-8") as handle:
+                    prior = json.load(handle)
+            except (OSError, ValueError):
+                prior = {}
+            identity = ("verdict", "evidence_sha256", "observed_sha", "canonical_sha", "base_relation")
+            if any(prior.get(key) != sealed.get(key) for key in identity):
+                raise SwitchboardError(f"court {court_id} was already sealed with a different verdict")
+        _atomic_write(ref, text)
+
+        self._record_court_outcome_locked(
+            passed=passed,
+            court_job_id=str(court.get("court_job_id") or ""),
+            mission_id=envelope["mission_id"],
+            plan_id=envelope["plan_id"],
+            task_id=envelope["task_id"],
+            correlation_id=envelope["correlation_id"],
+            causation_id=envelope["event_id"],
+            source_head=envelope["source_head"],
+            authority_ref=envelope["authority_ref"],
+            source_repo=envelope["source_repo"],
+            receipt_ref=str(court.get("receipt_ref") or ""),
+            evidence={"kind": INDEPENDENT_COURT_KIND, "source_role": "SENTINEL",
+                      "independent": True, "ref": ref},
+            verdict_note=("independent Sentinel verdict carried by the court.requested "
+                          "consumer; Switchboard did not judge"),
+        )
+
+        return None
+
+    def _require_request_binding(self, record: Mapping[str, Any], *, court: Mapping[str, Any],
+                                 passed: bool) -> None:
+        """Every verdict must answer the question this court actually asked.
+
+        This runs for PASS and FAIL alike. A terminal FAIL is as consequential as a
+        PASS -- it is the one outcome for this causation_id forever, and a later
+        correct verdict is refused and deadlettered -- so a FAIL that judged other
+        evidence may not be ingested either. Absence is fatal rather than
+        permissive: a request that named no evidence digest can corroborate
+        nothing, so nothing may be recorded against it.
+        """
+        payload = court.get("payload_ref_or_payload") or {}
+        requested = str(payload.get("evidence_sha256") or "")
+        if requested and str(record.get("evidence_sha256") or "") != requested:
+            raise SwitchboardError(
+                "Sentinel verdict evidence_sha256 differs from the evidence the court requested")
+        declared = str(payload.get("canonical_sha") or "").lower()
+        canonical = str(record.get("canonical_sha") or "").lower()
+        # _UNOBSERVED_BASE is the board saying "I read no base", not a rival claim,
+        # so it cannot contradict the record. A PASS against it is refused outright
+        # in _require_observed_relation, which is where that belongs.
+        if declared and declared != _UNOBSERVED_BASE and canonical and canonical != declared:
+            raise SwitchboardError("Sentinel verdict judged a different canonical base than was requested")
+        if passed:
+            # Only a PASS must be positively bound: the organ's honest NO_EVIDENCE
+            # FAIL legitimately binds nothing and carries no observed digest.
+            # observed_sha is already required to be 64-hex on EVERY record by
+            # _require_independent_court_evidence; only boundness is PASS-specific.
+            if not record.get("evidence_refs"):
+                raise SwitchboardError("Sentinel PASS names no bound evidence")
+        elif not (record.get("findings") or record.get("exceptions")
+                  or record.get("required_repairs")):
+            raise SwitchboardError("Sentinel FAIL names no finding, exception or repair")
+
+    def _require_observed_relation(self, record: Mapping[str, Any], *, court: Mapping[str, Any],
+                                   source_head: str) -> None:
+        """A PASS may rest only on a base THIS board observed.
+
+        canonical_sha equal to the head is not a relation; it is two copies of one
+        string. Nor is the record's own `canonical_base_observed_on_remote` the
+        relation: that flag is the judged party's self-report, and a record that
+        merely sets it to true must not thereby certify itself. The board grants a
+        PASS only when its own request carried a base it read off the remote, and
+        the record agrees with that base -- so a board with no canonical observer
+        can never certify a PASS, which is the fail-closed answer. That last clause
+        is enforced here, not merely described: a request that named the
+        canonical_base gap or declared the unobserved sentinel refuses every PASS.
+        """
+        payload = court.get("payload_ref_or_payload") or {}
+        binding = record.get("base_binding") if isinstance(record.get("base_binding"), Mapping) else {}
+        relation = str(record.get("base_relation") or "")
+        canonical = str(record.get("canonical_sha") or "").lower()
+        observed_base = str(binding.get("observed_base_sha") or "").lower()
+        declared = str(payload.get("canonical_sha") or "").lower()
+        gaps = [str(gap) for gap in (payload.get("binding_gaps") or [])]
+        remote_observed = binding.get("canonical_base_observed_on_remote") is True
+        if relation not in _VERIFIED_RELATIONS:
+            raise SwitchboardError(f"Sentinel PASS relation {relation!r} is not a verified relation")
+        # The board's own observation is the only ground a PASS may stand on. A
+        # request that named the canonical_base gap, or declared the unobserved
+        # sentinel, or carries no 40-hex base at all, read nothing off the remote
+        # -- and no record can supply what this board did not read, however
+        # coherent it is. Each clause stands alone: a gap named beside a base is a
+        # contradiction, and the sentinel without a gap is still no observation.
+        if "canonical_base" in gaps or declared == _UNOBSERVED_BASE or not _looks_head(declared):
+            raise SwitchboardError(
+                "Sentinel PASS rests on a canonical base this board never observed")
+        # A record that CLAIMS observation must show it. Without this, the whole
+        # proof of an observed base was one boolean the judged party set itself:
+        # `canonical_base_observed_on_remote: true` with no observed sha at all was
+        # enough to carry a PASS whose canonical_sha equalled the candidate -- the
+        # 2026-09-04 shape exactly.
+        if remote_observed and not _looks_head(observed_base):
+            raise SwitchboardError(
+                "Sentinel PASS claims an observed canonical base but names no observed sha")
+        if canonical == source_head and not remote_observed:
+            raise SwitchboardError(
+                "Sentinel PASS asserts the candidate is its own canonical base without "
+                "an observed remote ref; equality by construction is not a relation")
+        if remote_observed and observed_base and canonical != observed_base:
+            raise SwitchboardError("Sentinel PASS canonical_sha is not the base it observed")
+        # `declared` is now known to be a base this board read; the record must
+        # have judged exactly that one.
+        if canonical != declared:
+            raise SwitchboardError("Sentinel PASS judged a different canonical base than was requested")
 
     def _on_court_passed(self, envelope: dict) -> str | None:
         if envelope.get("authority_ref") in {"", "unsigned", "none"}:
@@ -1130,6 +1649,20 @@ class Switchboard:
         court = envelope["payload_ref_or_payload"]
         if src.get("code_custody_required") is not True:
             return None
+        candidate = src.get("candidate") if isinstance(src.get("candidate"), Mapping) else None
+        evidence = court.get("evidence") if isinstance(court.get("evidence"), Mapping) else {}
+        if (
+            candidate is not None
+            and evidence.get("kind") == INDEPENDENT_COURT_KIND
+            and isinstance(evidence.get("ref"), str) and evidence["ref"]
+            and isinstance(evidence.get("record_sha"), str) and len(evidence["record_sha"]) == 64
+        ):
+            # The producer named its candidate before any court existed, so it
+            # cannot name the court. The board ingested the sealed Sentinel
+            # record that judged it; custody is bound to exactly that record.
+            candidate = {**candidate,
+                         "court_receipt_ref": evidence["ref"],
+                         "court_receipt_hash": evidence["record_sha"]}
         params = {
             "mission_id": envelope["mission_id"],
             "task_id": envelope["task_id"],
@@ -1138,15 +1671,16 @@ class Switchboard:
             "branch": src.get("branch", ""),
             "head": src.get("head", envelope["source_head"]),
             "remote": src.get("remote", "origin"),
-            "court_receipt": court.get("court_job_id", envelope["causation_id"]),
+            "court_receipt": (candidate or {}).get("court_receipt_ref")
+            or court.get("court_job_id", envelope["causation_id"]),
             "authority_ref": envelope["authority_ref"],
             "idempotency_key": f"candidate.push.requested|{src.get('receipt_sha')}",
             "expected_pr": src.get("expected_pr") or None,
             "expected_pr_url": src.get("expected_pr_url") or None,
             "expected_pr_draft": src.get("expected_pr_draft") or None,
         }
-        if src.get("candidate") is not None:
-            params["candidate"] = src["candidate"]
+        if candidate is not None:
+            params["candidate"] = dict(candidate)
         if params["expected_pr"] == "":
             params["expected_pr"] = None
         wf = self.catalog.get(HONEY_POT_WORKFLOW)
@@ -1304,6 +1838,52 @@ class Switchboard:
             source_head=str(envelope.get("source_head", "0" * 40)),
             authority_ref=str(envelope.get("authority_ref", "deadletter")),
         )
+
+
+def _aggregate_evidence_sha256(item_shas) -> str:
+    """One digest over the set of per-item digests; order-independent (matches the organ)."""
+    return hashlib.sha256(
+        json.dumps(sorted(str(s) for s in item_shas), separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def observe_canonical_base_via_git(worktree: str, remote: str, base_ref: str) -> tuple[str, str]:
+    """Default canonical observer: (canonical_repo, observed sha) via read-only git.
+
+    The remote is the one the executed worktree itself calls canonical; the sha is
+    what that remote's ref points at right now. Empty sha means: not observed.
+    This reads a remote, so it is injected into the Switchboard rather than
+    assumed -- a unit test must never reach a network from inside a tick."""
+    if not worktree or not os.path.isdir(worktree):
+        return "", ""
+    # The artefact under judgement names a remote NAME, never a URL. A receipt
+    # carrying `REMOTE=origin https://elsewhere/x` would otherwise choose both the
+    # repository this court calls canonical and the host this tick reaches.
+    tokens = remote.split()
+    if len(tokens) != 1:
+        return "", ""
+    rc, out = _git_read(["-C", worktree, "remote", "get-url", tokens[0]])
+    url = out.strip() if rc == 0 else ""
+    if not url:
+        return "", ""
+    rc, out = _git_read(["ls-remote", "--", url, base_ref])
+    if rc != 0:
+        return url, ""
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2 and parts[1] == base_ref and _looks_head(parts[0].lower()):
+            return url, parts[0].lower()
+    return url, ""
+
+
+def _git_read(args: list[str], *, timeout: int = 30) -> tuple[int, str]:
+    """Read-only git; no prompts, no locks, no writes."""
+    try:
+        proc = subprocess.run(
+            [GIT, "--no-optional-locks", *args], capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
+        return proc.returncode, proc.stdout
+    except (OSError, subprocess.SubprocessError):
+        return 127, ""
 
 
 def _looks_head(value: Any) -> bool:
