@@ -1,0 +1,26 @@
+name: SWITCHAROO first seam court
+
+on:
+  push:
+    branches:
+      - cursor/switcharoo-first-seam-64fc
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  court:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Full unittest court
+        run: python3 -m unittest discover -s tests -t .
+      - name: Secret scan
+        run: python3 scripts/secret_scan.py

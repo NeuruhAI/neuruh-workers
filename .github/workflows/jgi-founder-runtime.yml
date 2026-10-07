@@ -1,0 +1,63 @@
+name: JGI dispatch-bridge court
+
+on:
+  push:
+    branches:
+      - feature/jgi-founder-runtime-v0-20260901
+    paths:
+      - 'neuruh_workers/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'JGI_DISPATCH_BRIDGE.md'
+      - 'JGI_FOUNDER_RUNTIME_V0.md'
+      - 'docs/receipts/**'
+      - '.github/workflows/jgi-founder-runtime.yml'
+  pull_request:
+    paths:
+      - 'neuruh_workers/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'JGI_DISPATCH_BRIDGE.md'
+      - 'JGI_FOUNDER_RUNTIME_V0.md'
+      - 'docs/receipts/**'
+      - '.github/workflows/jgi-founder-runtime.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Full unittest discovery
+        run: python3 -m unittest discover -s tests -t .
+      - name: Secret scan
+        run: python3 scripts/secret_scan.py
+      # The demo used to build its own DispatchTicket, which meant CI proved a
+      # dispatch that no Founder Runtime had ever approved.  It now requires a real
+      # authenticated mission, so the honest unattended check is that it REFUSES
+      # rather than that it succeeds.
+      - name: Dispatch-bridge refuses to run without FR authority
+        env:
+          FR_API_OPERATOR_TOKEN: ""
+        run: |
+          tmpdir="$(mktemp -d)"
+          set +e
+          python3 scripts/run_jgi_demo.py \
+            --ledger "$tmpdir/jgi-demo.jsonl" \
+            --mission-id msn_ci_unauthorised >"$tmpdir/out" 2>"$tmpdir/err"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "demo dispatched without Founder Runtime authority" >&2
+            cat "$tmpdir/out" "$tmpdir/err" >&2
+            exit 1
+          fi
+          grep -q "FR_API_OPERATOR_TOKEN is required" "$tmpdir/err"
+          test ! -s "$tmpdir/jgi-demo.jsonl" 2>/dev/null || {
+            echo "refused dispatch still wrote a ledger" >&2; exit 1; }
+          echo "DEMO_WITHOUT_AUTHORITY=REFUSED"
